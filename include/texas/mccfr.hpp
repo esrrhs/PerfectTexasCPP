@@ -87,6 +87,9 @@ struct InfoSetData {
 // 写死进了文件，所以解释旧文件时必须用当时的值。
 constexpr int kV4Actions = 6;
 constexpr int kV4Sizes = 3;
+// v5 的记录长度已经是自描述的，但文件头里的动作数组还是按当时的 kMaxSizes = 4 定长。
+// 于是"记录能跨 build 读、文件头不能"——查这个的时候差点被一个 +7.7 筹码/手的假结论骗过去。
+constexpr int kV5Sizes = 4;
 
 // 信息集键 -> InfoSetData 的平坦哈希表（线性探测）
 class InfoSetTable {
@@ -383,9 +386,13 @@ public:
         //
         // 版本 5 把每条记录的长度从 kMaxActions 改成 n。v4 写的是固定 6 个数，
         // 于是 kMaxActions 一改，所有旧文件都会被**错位**解读（不是读不出来，是读成
-        // 别的信息集的数据）——这正是"静默比报错更糟"的那种改动。记录长度自描述之后，
-        // 动作数上限就不再和文件格式绑在一起了。
-        const std::uint32_t ver = 5;
+        // 别的信息集的数据）——这正是"静默比报错更糟"的那种改动。
+        //
+        // 版本 6 把文件头也改成自描述的：先写档数，再写那么多尺寸。v5 只修了记录、
+        // 漏了文件头，于是换个编译期上限读同一个文件，尺寸数组会多读/少读几个 int，
+        // 后面全部错位——和 v4 的毛病一模一样，只是换了个位置。实测中它表现为
+        // "换一个 build 对打能赢 7.7 筹码/手"，看起来像重大发现，其实是读串了。
+        const std::uint32_t ver = 6;
         const std::uint64_t cnt = static_cast<std::uint64_t>(isets_.size());
         const std::uint64_t iters = static_cast<std::uint64_t>(iter_);
         const std::int32_t buckets = abstraction_.buckets;
@@ -399,12 +406,13 @@ public:
         std::fwrite(&iters, sizeof(iters), 1, f);
         std::fwrite(&buckets, sizeof(buckets), 1, f);
         std::fwrite(&sized, sizeof(sized), 1, f);
-        std::fwrite(abstraction_.actionSpace.preflopMul1000, sizeof(int), ActionSpace::kMaxSizes,
-                    f);
+        // v6 起文件头自描述：档数在前，尺寸数组只写实际用到的那么多
         std::fwrite(&abstraction_.actionSpace.preflopCount, sizeof(int), 1, f);
-        std::fwrite(abstraction_.actionSpace.postflopFrac1000, sizeof(int),
-                    ActionSpace::kMaxSizes, f);
+        std::fwrite(abstraction_.actionSpace.preflopMul1000, sizeof(int),
+                    static_cast<std::size_t>(abstraction_.actionSpace.preflopCount), f);
         std::fwrite(&abstraction_.actionSpace.postflopCount, sizeof(int), 1, f);
+        std::fwrite(abstraction_.actionSpace.postflopFrac1000, sizeof(int),
+                    static_cast<std::size_t>(abstraction_.actionSpace.postflopCount), f);
         std::fwrite(&allin, sizeof(allin), 1, f);
         isets_.forEach([f](std::uint64_t key, const InfoSetData& is) {
             const std::uint32_t n = static_cast<std::uint32_t>(is.n);
@@ -429,7 +437,7 @@ public:
             std::fclose(f);
             return false;
         }
-        if (std::fread(&ver, sizeof(ver), 1, f) != 1 || (ver != 4 && ver != 5)) {
+        if (std::fread(&ver, sizeof(ver), 1, f) != 1 || ver < 4 || ver > 6) {
             std::fclose(f);
             return false;
         }
@@ -454,26 +462,58 @@ public:
             std::fclose(f);
             return false;
         }
-        // v4 的动作数组只有 kV4Sizes 长（那时 kMaxSizes = 3）。按现在的 kMaxSizes
-        // 去读会把后面的字段一起吞掉，所以长度也跟着版本走。
-        const int sizes = (ver == 4) ? kV4Sizes : ActionSpace::kMaxSizes;
-        if (std::fread(space.preflopMul1000, sizeof(int), static_cast<std::size_t>(sizes), f) !=
-            static_cast<std::size_t>(sizes)) {
-            std::fclose(f);
-            return false;
-        }
-        if (std::fread(&space.preflopCount, sizeof(int), 1, f) != 1) {
-            std::fclose(f);
-            return false;
-        }
-        if (std::fread(space.postflopFrac1000, sizeof(int), static_cast<std::size_t>(sizes), f) !=
-            static_cast<std::size_t>(sizes)) {
-            std::fclose(f);
-            return false;
-        }
-        if (std::fread(&space.postflopCount, sizeof(int), 1, f) != 1) {
-            std::fclose(f);
-            return false;
+        // 三种文件头布局：
+        //   v4/v5  动作数组在前、档数在后，数组长度是**当时**的 kMaxSizes
+        //   v6     档数在前、数组长度 = 档数（自描述）
+        if (ver <= 5) {
+            const int fixed = (ver == 4) ? kV4Sizes : kV5Sizes;
+            if (std::fread(space.preflopMul1000, sizeof(int), static_cast<std::size_t>(fixed), f) !=
+                static_cast<std::size_t>(fixed)) {
+                std::fclose(f);
+                return false;
+            }
+            if (std::fread(&space.preflopCount, sizeof(int), 1, f) != 1) {
+                std::fclose(f);
+                return false;
+            }
+            if (std::fread(space.postflopFrac1000, sizeof(int), static_cast<std::size_t>(fixed),
+                           f) != static_cast<std::size_t>(fixed)) {
+                std::fclose(f);
+                return false;
+            }
+            if (std::fread(&space.postflopCount, sizeof(int), 1, f) != 1) {
+                std::fclose(f);
+                return false;
+            }
+        } else {
+            if (std::fread(&space.preflopCount, sizeof(int), 1, f) != 1) {
+                std::fclose(f);
+                return false;
+            }
+            if (space.preflopCount < 0 || space.preflopCount > ActionSpace::kMaxSizes) {
+                std::fclose(f);
+                return false;
+            }
+            if (std::fread(space.preflopMul1000, sizeof(int),
+                           static_cast<std::size_t>(space.preflopCount), f) !=
+                static_cast<std::size_t>(space.preflopCount)) {
+                std::fclose(f);
+                return false;
+            }
+            if (std::fread(&space.postflopCount, sizeof(int), 1, f) != 1) {
+                std::fclose(f);
+                return false;
+            }
+            if (space.postflopCount < 0 || space.postflopCount > ActionSpace::kMaxSizes) {
+                std::fclose(f);
+                return false;
+            }
+            if (std::fread(space.postflopFrac1000, sizeof(int),
+                           static_cast<std::size_t>(space.postflopCount), f) !=
+                static_cast<std::size_t>(space.postflopCount)) {
+                std::fclose(f);
+                return false;
+            }
         }
         if (std::fread(&allin, sizeof(allin), 1, f) != 1) {
             std::fclose(f);

@@ -37,21 +37,20 @@ struct Move {
 // 早先尺寸是写死在 actions() 里的，于是"哪种加注尺寸更好"这件事根本测不了——
 // 一套二进制只能用一套动作集。做成参数之后可以训练多套动作集并互相对打。
 //
-// 上限由 kMaxActions 决定：弃牌 + 跟注占 2 个，all-in 占 1 个，最多剩 4 档尺寸。
-// 翻前 4 档需要 7 个动作（有弃牌），翻后 4 档只需要 6 个（没有弃牌），所以 7 是
-// "每街都能给 4 档"的最小上限。
+// 上限由 kMaxActions 决定：弃牌 + 跟注占 2 个，all-in 占 1 个，剩下的给尺寸。
+// 翻前 5 档需要 8 个动作（弃 + 跟 + 5 档 + all-in），翻后 4 档只需要 6 个（没有弃牌）。
 struct ActionSpace {
-    static constexpr int kMaxSizes = 4;
+    static constexpr int kMaxSizes = 5;
 
     // 翻牌前：加注到 (当前最大本街投入 × mul1000 / 1000)。
     // 默认 {2500, 4000} = 2.5 倍 / 4 倍，与早期的 maxRC + (maxRC*3)/2、maxRC*4
     // 逐位等价（对奇数 maxRC 也相等：x + floor(1.5x) == floor(2.5x)）。
-    int preflopMul1000[kMaxSizes] = {2500, 4000, 2500, 2500};
+    int preflopMul1000[kMaxSizes] = {2500, 4000, 2500, 2500, 2500};
     int preflopCount = 2;
 
     // 翻牌后：加注到 (当前最大 + 底池 × frac1000 / 1000)。
     // 默认 {500, 1000} = 半池 / 一池。
-    int postflopFrac1000[kMaxSizes] = {500, 1000, 500, 500};
+    int postflopFrac1000[kMaxSizes] = {500, 1000, 500, 500, 500};
     int postflopCount = 2;
 
     // all-in 单独算一个动作，避免被比例尺寸吞掉
@@ -156,6 +155,23 @@ inline const std::vector<ActionPreset>& actionPresets() {
             s.postflopFrac1000[2] = 2000;
             t.push_back({"sharp", s});
         }
+        // 翻前第 5 档。沙盒里对 sharp 实测 +0.91 +- 0.23，和"第 4 档值 +0.83"同量级，
+        // 也就是说这个方向还没饱和。代价是信息集 179 万 → 300 万、每轮 30 秒 → 44 秒、
+        // 模型 95 MB → 150 MB，所以它不进默认，默认仍是 sharp。
+        {
+            ActionSpace s;
+            s.preflopCount = 5;
+            s.preflopMul1000[0] = 2250;
+            s.preflopMul1000[1] = 2500;
+            s.preflopMul1000[2] = 3000;
+            s.preflopMul1000[3] = 4000;
+            s.preflopMul1000[4] = 5000;
+            s.postflopCount = 3;
+            s.postflopFrac1000[0] = 500;
+            s.postflopFrac1000[1] = 1000;
+            s.postflopFrac1000[2] = 2000;
+            t.push_back({"sharpest", s});
+        }
         return t;
     }();
     return table;
@@ -188,7 +204,7 @@ struct HoldemGame {
     static constexpr int kBigBlind = 2;
     static constexpr int kBuyIn = 200;    // 100BB
     static constexpr int kMaxRaises = 3;  // 每条街最多 3 次加注（够打到 4-bet）
-    static constexpr int kMaxActions = 7;
+    static constexpr int kMaxActions = 8;
 
     struct State {
         int numPlayers = 2;

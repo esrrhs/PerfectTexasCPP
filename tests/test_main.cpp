@@ -433,13 +433,14 @@ void testHoldemActionSpace() {
         CHECK(mv[4].amount == 12);
         CHECK(mv[5].amount == BUY);
 
-        // 4 档才会填满 kMaxActions（弃 + 跟 + 4 档 + allin）
-        texas::ActionSpace four;
-        four.preflopCount = 4;
-        four.preflopMul1000[2] = 6000;
-        four.preflopMul1000[3] = 9000;
-        const int n4 = texas::HoldemGame::actions(s, mv, NA, four);
-        CHECK(n4 == NA);
+        // 5 档才会填满 kMaxActions（弃 + 跟 + 5 档 + allin）
+        texas::ActionSpace five;
+        five.preflopCount = 5;
+        five.preflopMul1000[2] = 6000;
+        five.preflopMul1000[3] = 9000;
+        five.preflopMul1000[4] = 12000;
+        const int n5 = texas::HoldemGame::actions(s, mv, NA, five);
+        CHECK(n5 == NA);
         CHECK(mv[NA - 1].amount == BUY);  // all-in 在最后一位
     }
 
@@ -627,7 +628,7 @@ void testHoldemSaveV4Compat() {
             CHECK(std::fread(&magic, sizeof(magic), 1, f) == 1);
             CHECK(std::fread(&ver, sizeof(ver), 1, f) == 1);
             CHECK(magic == 0x54434652u);
-            CHECK(ver == 5);
+            CHECK(ver == 6);
             std::fclose(f);
         }
     }
