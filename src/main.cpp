@@ -313,7 +313,7 @@ int cmdEval(int argc, char** argv) {
 // 打印某个具体局面上各动作的平均策略概率。用来看"学到的策略像不像会打牌"，
 // 但注意：策略形状不是判据，对打胜率才是（见 README）。
 void probeOne(const texas::nn::Actor& actor, const char* label, const texas::HUState& st) {
-    texas::LegalMove lm[16];
+    texas::LegalMove lm[texas::kNumActions];
     const int n = texas::legalMoves(st, lm);
     if (n <= 0) {
         std::printf("  %-28s (无合法动作)\n", label);
@@ -352,8 +352,8 @@ void probeOne(const texas::nn::Actor& actor, const char* label, const texas::HUS
         const texas::Move& mv = lm[i].mv;
         if (lm[i].slot == texas::kSlotFold) std::snprintf(buf, sizeof buf, "fold");
         else if (lm[i].slot == texas::kSlotCheckCall) std::snprintf(buf, sizeof buf, "call");
-        else if (lm[i].slot == texas::kSlotAllIn) std::snprintf(buf, sizeof buf, "jam%d", int(mv.to));
-        else std::snprintf(buf, sizeof buf, "r%d", int(mv.to));
+        else if (lm[i].slot == texas::kSlotAllIn) std::snprintf(buf, sizeof buf, "jam");
+        else std::snprintf(buf, sizeof buf, "b%d-%d", int(mv.to), lm[i].toHi);
         std::printf(" %s=%.2f", buf, probs[lm[i].slot]);
     }
     std::printf("\n");

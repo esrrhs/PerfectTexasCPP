@@ -15,15 +15,51 @@ namespace {
 
 int g_defaultMaxRaises = kNoRaiseCap;
 
-int ladderTo(const HUState& s, int i) {
+// 把合法加注区间 [lo, hi) 切成至多 kMaxSizes 个**连续的带**，返回端点数。
+//
+// 端点不按等距切，而是取扑克里的常用尺寸当分界（翻前 = 上次加注额的倍数、
+// 翻后 = 底池比例），最后再补一个宽到全下前一档的尾带。这样：
+//   * 常用尺寸附近带很窄 -> 落点精度高；
+//   * 尾带覆盖 [最后一个锚点, 全下) -> 任何大注金额照样打得出来。
+// 于是"金额没有预设档位"和"动作槽别浪费在离谱尺寸上"两件事同时成立。
+//
+// edges 容量必须 >= kMaxSizes + 1。
+int bandEdges(const HUState& s, int p, int* edges) {
+    const int lo = minRaiseTo(s, p);
+    const int hi = maxRaiseTo(s, p);  // 全下金额，单独占一槽，不进带
+    if (lo >= hi) return 0;
+
+    int m = 0;
+    edges[m++] = lo;
+    auto push = [&](int a) {
+        if (a < lo) a = lo;
+        if (a > hi) a = hi;
+        if (a <= edges[m - 1]) return;  // 去重（尺寸够小时多个锚点会重合）
+        edges[m++] = int(a);
+    };
+
     if (s.street == ST_PREFLOP) {
-        static const double kMul[kMaxSizes] = {2.2, 2.5, 3.0, 4.0, 5.5};
-        return static_cast<int>(std::llround(double(s.lastRaiseTo) * kMul[i]));
+        // 相对"上次加注额"的倍数。开局 lastRaiseTo = 大盲。
+        static const double kMul[] = {2.2, 2.5, 3.0, 4.0, 5.5, 8.0, 12.0, 20.0, 35.0, 60.0};
+        const double base = double(s.lastRaiseTo);
+        for (double k : kMul) {
+            if (m >= kMaxSizes) break;
+            push(static_cast<int>(std::llround(base * k)));
+        }
+    } else {
+        // 在"跟注额"之上加底池比例；无人下注时 lastRaiseTo = 0，就是纯底池比例。
+        static const double kFrac[] = {1.0 / 4, 1.0 / 3, 1.0 / 2, 2.0 / 3, 3.0 / 4,
+                                       1.0,     1.25,    1.5,     2.0,     3.0,   5.0};
+        const double pot = double(s.pot());
+        const double base = double(s.lastRaiseTo);
+        for (double f : kFrac) {
+            if (m >= kMaxSizes) break;
+            const double inc = std::max<double>(double(kBigBlind), f * pot);
+            push(static_cast<int>(std::llround(base + inc)));
+        }
     }
-    static const double kFrac[kMaxSizes] = {1.0 / 3, 0.5, 2.0 / 3, 1.0, 1.5};
-    int inc = static_cast<int>(std::llround(double(s.pot()) * kFrac[i]));
-    if (inc < kBigBlind) inc = kBigBlind;
-    return int(s.lastRaiseTo) + inc;
+    if (edges[m - 1] != hi) push(hi);
+    return m;  // m 个端点 -> m-1 个带
 }
 
 // 无加注上限时一手牌的动作条数可能超过 kMaxHist。满了之后**左移**而不是
@@ -68,6 +104,71 @@ double equityFromScores(int s0, int s1) {
 }
 
 }  // namespace
+
+int minRaiseTo(const HUState& s, int seat) {
+    const int p = (seat < 0) ? int(s.toAct) : seat;
+    if (s.finished || p < 0 || p > 1) return 1;
+    const int maxTo = int(s.contrib[p]) + int(s.stack[p]);
+    if (p != int(s.toAct)) return maxTo;  // 非行动者的"区间"没有意义，返回上限
+    if (s.allin[1 - p]) return maxTo + 1;  // 对手已全下，不能再加注
+    if (int(s.stack[p]) <= toCall(s, p)) return maxTo + 1;  // 筹码不够跟，只能跟/弃
+    int minTo = int(s.lastRaiseTo) + std::max<int>(s.lastRaiseSize, kBigBlind);
+    if (minTo <= int(s.contrib[p])) minTo = int(s.contrib[p]) + kBigBlind;
+    if (minTo > maxTo) minTo = maxTo;  // 筹码不够一个完整的最小加注 -> 只能全下
+    return minTo;
+}
+
+int maxRaiseTo(const HUState& s, int seat) {
+    const int p = (seat < 0) ? int(s.toAct) : seat;
+    if (p < 0 || p > 1) return 0;
+    return int(s.contrib[p]) + int(s.stack[p]);
+}
+
+bool isRaisePossible(const HUState& s, int seat) {
+    const int p = (seat < 0) ? int(s.toAct) : seat;
+    if (s.finished) return false;
+    if (s.maxRaisesPerStreet != 0 && s.numRaises >= s.maxRaisesPerStreet) return false;
+    return minRaiseTo(s, p) <= maxRaiseTo(s, p) && !s.allin[1 - p];
+}
+
+bool canRaiseTo(const HUState& s, int to, int seat) {
+    if (!isRaisePossible(s, seat)) return false;
+    const int lo = minRaiseTo(s, seat);
+    const int hi = maxRaiseTo(s, seat);
+    return to >= lo && to <= hi;
+}
+
+int amountInBand(int lo, int hi, double u) {
+    if (hi <= lo) return lo;
+    if (!(u > 0.0)) return lo;
+    if (u >= 1.0) return hi;
+    const double r = double(hi) / double(lo);
+    int a = static_cast<int>(std::llround(double(lo) * std::pow(r, u)));
+    if (a < lo) a = lo;
+    if (a > hi) a = hi;
+    return a;
+}
+
+Move makeRaise(const HUState& s, int to, int seat) {
+    Move m;
+    const int p = (seat < 0) ? int(s.toAct) : seat;
+    const int lo = minRaiseTo(s, p);
+    const int hi = maxRaiseTo(s, p);
+    if (!isRaisePossible(s, p)) {
+        m.kind = (toCall(s, p) > 0) ? MK_FOLD : MK_CHECK;
+        m.to = s.contrib[p];
+        return m;
+    }
+    if (to < lo) to = lo;
+    if (to >= hi) {
+        m.kind = MK_ALLIN;
+        m.to = static_cast<int16_t>(hi);
+        return m;
+    }
+    m.kind = MK_RAISE;
+    m.to = static_cast<int16_t>(to);
+    return m;
+}
 
 void setDefaultMaxRaises(int n) {
     if (n < 0) n = 0;
@@ -146,28 +247,26 @@ int legalMoves(const HUState& s, LegalMove* out) {
         (s.maxRaisesPerStreet == 0 || s.numRaises < s.maxRaisesPerStreet);
     const bool canRaise = raiseAllowed && !s.allin[o] && myStack > need;
     if (canRaise) {
-        int minTo = int(s.lastRaiseTo) + std::max<int>(s.lastRaiseSize, kBigBlind);
-        if (minTo <= s.contrib[p]) minTo = s.contrib[p] + kBigBlind;
-        int slot = 0;
-        int prev = -1;
-        for (int i = 0; i < kMaxSizes; ++i) {
-            int to = ladderTo(s, i);
-            if (to < minTo) to = minTo;
-            if (to >= maxTo) break;  // 再大就是 all-in，不重复占槽
-            if (to == prev) continue;
-            prev = to;
-            out[n].slot = slotOfSize(slot++);
+        // 尺寸槽 = 把 [最小加注额, 全下额) 在对数尺度上切成的带。全下单独占一槽，
+        // 所以带只覆盖到 maxTo - 1；带内的具体金额由调用方在 [to, toHi] 里取任意值。
+        int edges[kMaxSizes + 1];
+        const int m = bandEdges(s, p, edges);
+        for (int i = 0; i + 1 < m && i < kMaxSizes; ++i) {
+            out[n].slot = slotOfSize(i);
             out[n].mv.kind = MK_RAISE;
-            out[n].mv.to = static_cast<int16_t>(to);
+            out[n].mv.to = static_cast<int16_t>(edges[i]);
+            out[n].toHi = edges[i + 1] - 1;
             ++n;
         }
         if (maxTo > callTo) {
             out[n].slot = kSlotAllIn;
             out[n].mv.kind = MK_ALLIN;
             out[n].mv.to = static_cast<int16_t>(maxTo);
+            out[n].toHi = maxTo;
             ++n;
         }
     }
+    if (n > kNumActions) n = kNumActions;  // 防御：调用方的缓冲区就是 kNumActions
     return n;
 }
 

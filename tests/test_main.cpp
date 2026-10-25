@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -127,7 +128,7 @@ void testRules() {
     CHECK(s.toAct == 0);
     CHECK(s.contrib[0] == texas::kSmallBlind && s.contrib[1] == texas::kBigBlind);
 
-    texas::LegalMove lm[16];
+    texas::LegalMove lm[texas::kNumActions];
     int n = texas::legalMoves(s, lm);
     CHECK(n >= 4);
     CHECK(lm[0].slot == texas::kSlotFold);
@@ -233,7 +234,7 @@ void testRules() {
         texas::HUState r = rigged("Ah", "Ad", "Kh", "Kd");
         CHECK(r.maxRaisesPerStreet == 0);
         int raises = 0;
-        texas::LegalMove rl[16];
+        texas::LegalMove rl[texas::kNumActions];
         for (int it = 0; it < 40 && !r.terminal(); ++it) {
             const int n2 = texas::legalMoves(r, rl);
             if (n2 <= 0) break;
@@ -269,7 +270,7 @@ void testRules() {
         texas::HUState g = texas::dealNewHand(rng);
         int guard = 0;
         while (!g.terminal() && guard < 1000) {
-            texas::LegalMove mv[16];
+            texas::LegalMove mv[texas::kNumActions];
             const int k = texas::legalMoves(g, mv);
             if (k <= 0) break;
             texas::applyMove(g, mv[rng() % static_cast<size_t>(k)].mv, rng);
@@ -315,7 +316,7 @@ void testFeatures() {
     for (float v : obs.seq) seqSum += v;
     CHECK_NEAR(seqSum, 0.0, 1e-6);
 
-    texas::LegalMove lm[16];
+    texas::LegalMove lm[texas::kNumActions];
     const int n = texas::legalMoves(s, lm);
     CHECK(n > 0);
     std::array<float, texas::kActionInput> af;
@@ -513,12 +514,156 @@ void testLeague() {
     CHECK(emptyPool.at(0, 0) == nullptr);
 }
 
+// ---------------------------------------------------------------- 任意金额
+
+// ACPC 的规则是"任何不小于最小加注的整数金额"。这一节钉住三件事：
+//   1) 引擎接受任意合法整数（不是几个预设档位）；
+//   2) 尺寸带首尾相接铺满整个合法区间，不重不漏；
+//   3) 带内落点连续，任意整数都可能被取到。
+void testAnyAmount() {
+    section("任意下注金额");
+
+    texas::Rng rng(2026);
+    texas::HUState s = rigged("Ah", "Ad", "Kh", "Kd");  // 翻前，小盲先动
+
+    // 1) 合法区间：最小加注 = 2 个大盲，上限 = 全下
+    CHECK(texas::minRaiseTo(s) == 2 * texas::kBigBlind);
+    CHECK(texas::maxRaiseTo(s) == texas::kStartingStack);
+
+    // 2) 任意整数金额都合法
+    CHECK(texas::canRaiseTo(s, 2 * texas::kBigBlind));
+    CHECK(texas::canRaiseTo(s, 1234));
+    CHECK(texas::canRaiseTo(s, 7777));
+    CHECK(texas::canRaiseTo(s, texas::kStartingStack));
+    CHECK(!texas::canRaiseTo(s, 2 * texas::kBigBlind - 1));
+    CHECK(!texas::canRaiseTo(s, texas::kStartingStack + 1));
+    CHECK(!texas::canRaiseTo(s, 0));
+    CHECK(!texas::canRaiseTo(s, -5));
+
+    // 3) 真能执行：加注到 1234，之后的最小加注跟着 1234 重算
+    {
+        texas::HUState g = s;
+        const texas::Move m = texas::makeRaise(g, 1234);
+        CHECK(m.kind == texas::MK_RAISE);
+        CHECK(int(m.to) == 1234);
+        texas::applyMove(g, m, rng);
+        CHECK(g.contrib[0] == 1234);
+        CHECK(g.lastRaiseTo == 1234);
+        CHECK(g.lastRaiseSize == 1234 - texas::kBigBlind);
+        CHECK(g.toAct == 1);
+        const int nextMin = 1234 + (1234 - texas::kBigBlind);
+        CHECK(texas::minRaiseTo(g) == nextMin);
+        CHECK(texas::canRaiseTo(g, nextMin));
+        CHECK(!texas::canRaiseTo(g, nextMin - 1));
+    }
+
+    // 4) makeRaise 的钳位与全下退化
+    CHECK(texas::makeRaise(s, 1).to == 2 * texas::kBigBlind);
+    CHECK(texas::makeRaise(s, texas::kStartingStack).kind == texas::MK_ALLIN);
+    CHECK(texas::makeRaise(s, texas::kStartingStack + 500).kind == texas::MK_ALLIN);
+
+    // 5) 尺寸带：首尾相接、铺满 [最小加注, 全下)，槽位唯一
+    {
+        texas::LegalMove lm[texas::kNumActions];
+        const int n = texas::legalMoves(s, lm);
+        CHECK(n <= texas::kNumActions);
+
+        bool slotUsed[texas::kNumActions] = {false};
+        int bands = 0;
+        int prevHi = -1;
+        for (int i = 0; i < n; ++i) {
+            CHECK(!slotUsed[lm[i].slot]);
+            slotUsed[lm[i].slot] = true;
+            if (lm[i].mv.kind != texas::MK_RAISE) continue;
+            if (bands == 0) {
+                CHECK(lm[i].mv.to == texas::minRaiseTo(s));
+            } else {
+                CHECK(lm[i].mv.to == prevHi + 1);  // 不重不漏
+            }
+            CHECK(lm[i].toHi >= lm[i].mv.to);
+            prevHi = lm[i].toHi;
+            ++bands;
+        }
+        CHECK(bands > 1);
+        CHECK(bands <= texas::kMaxSizes);
+        CHECK(prevHi == texas::maxRaiseTo(s) - 1);  // 带只到全下前一档
+    }
+
+    // 6) 一个决策点上"可达金额"是连续的，不是有限几个档位
+    {
+        texas::LegalMove lm[texas::kNumActions];
+        const int n = texas::legalMoves(s, lm);
+        std::set<int> reach;
+        int bands = 0;
+        for (int i = 0; i < n; ++i) {
+            if (lm[i].mv.kind != texas::MK_RAISE) continue;
+            ++bands;
+            for (int k = 0; k <= 400; ++k) {
+                reach.insert(texas::amountInBand(int(lm[i].mv.to), lm[i].toHi, double(k) / 400.0));
+            }
+        }
+        CHECK(bands >= 10);            // 旧版只有 5 个固定档
+        CHECK(reach.size() > 1000);    // 旧版这里最多 5 个金额
+        CHECK(reach.count(1234) == 1);  // 随手一个数都能打出来
+        CHECK(reach.count(2 * texas::kBigBlind) == 1);
+        CHECK(reach.count(texas::kStartingStack - 1) == 1);
+    }
+
+    // 7) 带内落点：单调、端点可达、能取到几千个不同金额
+    {
+        const int lo = 500;
+        const int hi = 5000;
+        CHECK(texas::amountInBand(lo, hi, 0.0) == lo);
+        CHECK(texas::amountInBand(lo, hi, 1.0) == hi);
+
+        std::set<int> vals;
+        int prev = 0;
+        bool mono = true;
+        for (int i = 0; i <= 10000; ++i) {
+            const int a = texas::amountInBand(lo, hi, double(i) / 10000.0);
+            if (a < prev) mono = false;
+            if (a < lo || a > hi) mono = false;
+            prev = a;
+            vals.insert(a);
+        }
+        CHECK(mono);
+        CHECK(vals.size() > 3000);  // 上限 4501 个整数，覆盖了大部分
+        CHECK(vals.count(lo) == 1);
+        CHECK(vals.count(hi) == 1);
+    }
+
+    // 8) 规则机器人的金额始终合法，且随底池连续变化（不是固定档位）
+    {
+        std::set<int> amts;
+        int illegal = 0;
+        for (int t = 0; t < 3000; ++t) {
+            texas::HUState g = texas::dealNewHand(rng);
+            const int steps = int(rng() % 6);
+            for (int i = 0; i < steps && !g.terminal(); ++i) {
+                texas::LegalMove lm[texas::kNumActions];
+                const int n = texas::legalMoves(g, lm);
+                if (n <= 0) break;
+                texas::applyMove(g, lm[rng() % static_cast<size_t>(n)].mv, rng);
+            }
+            if (g.terminal()) continue;
+            const texas::Move m = texas::ruleAgentMove(g, rng);
+            if (m.kind == texas::MK_RAISE || m.kind == texas::MK_ALLIN) {
+                if (!texas::canRaiseTo(g, m.to)) ++illegal;
+                amts.insert(int(m.to));
+            }
+        }
+        CHECK(illegal == 0);
+        CHECK(amts.size() > 10);
+    }
+}
+
 }  // namespace
 
 int main() {
     testCards();
     testRules();
     testFeatures();
+    testAnyAmount();
     testPpo();
     testNetwork();
     testLeague();

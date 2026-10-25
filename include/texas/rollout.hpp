@@ -16,7 +16,8 @@ namespace texas {
 
 struct ActionOption {
     int slot = 0;
-    Move mv;
+    Move mv;   // 尺寸带时，mv.to 是带的下端点（抽象动作的锚）
+    int hi = 0;  // 尺寸带的上端点；带内任何整数金额合法
     std::array<float, kActionInput> feat{};
 };
 

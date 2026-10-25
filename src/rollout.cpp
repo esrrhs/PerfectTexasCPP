@@ -140,7 +140,7 @@ std::pair<int, float> sampleAction(const float* logits, const std::vector<Action
 }
 
 Move ruleAgentMove(const HUState& s, Rng& rng) {
-    LegalMove mv[16];
+    LegalMove mv[kNumActions];
     const int n = legalMoves(s, mv);
     if (n == 0) return Move{};
 
@@ -154,15 +154,6 @@ Move ruleAgentMove(const HUState& s, Rng& rng) {
     std::uniform_real_distribution<float> u(0.0f, 1.0f);
     const float jitter = u(rng);
 
-    auto findSlot = [&](int slot, Move& out) {
-        for (int i = 0; i < n; ++i) {
-            if (mv[i].slot == slot) {
-                out = mv[i].mv;
-                return true;
-            }
-        }
-        return false;
-    };
     auto checkCall = [&](Move& out) {
         for (int i = 0; i < n; ++i) {
             if (mv[i].slot == kSlotCheckCall) {
@@ -182,22 +173,31 @@ Move ruleAgentMove(const HUState& s, Rng& rng) {
         return false;
     };
 
+    // 下注金额直接按底池比例算成一个整数，不再找"预设档位"——动作空间里
+    // 已经没有档位这个概念了，只有"任意合法金额"。
+    const int me0 = s.toAct;
+    auto betPotFraction = [&](double frac) {
+        const int inc = std::max<int>(kBigBlind, static_cast<int>(std::llround(frac * double(pot))));
+        return int(s.contrib[me0]) + inc;
+    };
+
     Move out{};
     if (need == 0) {
         // 无人下注：按牌力决定下注尺寸，弱牌偶尔诈唬
         const float betThreshold = 0.58f - 0.22f * jitter;
-        if (strength > betThreshold) {
-            const int want = strength > 0.85f ? slotOfSize(4) : (strength > 0.7f ? slotOfSize(3) : slotOfSize(1));
-            if (findSlot(want, out)) return out;
+        if (strength > betThreshold && isRaisePossible(s)) {
+            const double frac = (strength > 0.85f) ? 1.0 : (strength > 0.7f ? 0.75 : 0.5);
+            out = makeRaise(s, betPotFraction(frac));
+            if (out.kind == MK_RAISE || out.kind == MK_ALLIN) return out;
         }
         checkCall(out);
         return out;
     }
 
     const float odds = float(need) / float(pot + need);
-    if (strength > 0.80f && jitter > 0.55f) {
-        const int want = strength > 0.93f ? kSlotAllIn : slotOfSize(3);
-        if (findSlot(want, out)) return out;
+    if (strength > 0.80f && jitter > 0.55f && isRaisePossible(s)) {
+        out = makeRaise(s, strength > 0.93f ? maxRaiseTo(s) : betPotFraction(0.9));
+        if (out.kind == MK_RAISE || out.kind == MK_ALLIN) return out;
     }
     if (strength > odds + 0.10f && jitter > 0.12f) {
         checkCall(out);
@@ -355,13 +355,14 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
             t.seq = obs.seq;
             t.extra = obs.extra;
 
-            LegalMove lm[16];
+            LegalMove lm[kNumActions];
             const int n = legalMoves(g.st, lm);
             t.actions.resize(static_cast<size_t>(n));
             for (int k = 0; k < n; ++k) {
                 ActionOption& a = t.actions[static_cast<size_t>(k)];
                 a.slot = lm[k].slot;
                 a.mv = lm[k].mv;
+                a.hi = lm[k].toHi;
                 encodeActionFeature(g.st, lm[k], a.feat);
             }
             t.gameId = idx[static_cast<size_t>(i)];
@@ -396,10 +397,18 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
                 t.value = std::isfinite(v) ? v : 0.0f;
             }
 
-            applyMove(g.st, opt->mv, rng);
+            // 尺寸带 -> 具体金额：带内对数均匀落一个整数。
+            // 槽位是抽象动作（"打多大这个量级"），金额是带内的任意值，
+            // 所以引擎层面没有任何预设档位限制。
+            Move played = opt->mv;
+            if (played.kind == MK_RAISE && opt->hi > int(played.to)) {
+                played.to = static_cast<int16_t>(
+                    amountInBand(int(played.to), opt->hi, uu(rng)));
+            }
+            applyMove(g.st, played, rng);
             ++stats.decisions;
-            if (opt->mv.kind == MK_ALLIN) ++stats.allinDecisions;
-            if (opt->mv.kind == MK_FOLD) ++stats.folds;
+            if (played.kind == MK_ALLIN) ++stats.allinDecisions;
+            if (played.kind == MK_FOLD) ++stats.folds;
 
             if (cfg.oracleReward) {
                 const float eq = equityFor(g, seat, cfg.equityIters);
@@ -419,7 +428,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         (void)seat;
         for (int gi : idx) {
             GameCtx& g = gs[static_cast<size_t>(gi)];
-            LegalMove lm[16];
+            LegalMove lm[kNumActions];
             const int n = legalMoves(g.st, lm);
             if (n <= 0) {
                 g.active = false;
@@ -427,7 +436,12 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
                 continue;
             }
             const int pick = static_cast<int>(rng() % static_cast<size_t>(n));
-            applyMove(g.st, lm[pick].mv, rng);
+            Move played = lm[pick].mv;
+            if (played.kind == MK_RAISE && lm[pick].toHi > int(played.to)) {
+                played.to = static_cast<int16_t>(
+                    amountInBand(int(played.to), lm[pick].toHi, uu(rng)));
+            }
+            applyMove(g.st, played, rng);
             if (lm[pick].mv.kind == MK_FOLD) ++stats.folds;
             if (g.st.terminal()) finishGame(g);
         }

@@ -32,9 +32,13 @@ namespace texas {
 constexpr int kStartingStack = 20000;  // 200BB，对齐 ACPC
 constexpr int kSmallBlind = 50;
 constexpr int kBigBlind = 100;         // ACPC：大盲 100、小盲 50
-constexpr int kMaxSizes = 5;           // 每街的尺寸档数
+// 每街的"下注尺寸带"数。带与带之间在**对数尺度**上均分整个合法区间
+// [最小加注额, 全下额)，带内可落成任意整数金额——所以金额不是预设档位，
+// 而是"策略选一段量级、带内取任意值"，和 ACPC 的整数金额一致。
+constexpr int kMaxSizes = 16;
+// 网络动作槽：fold / check-call / kMaxSizes 个尺寸带 / all-in
+constexpr int kNumActions = kMaxSizes + 3;
 constexpr int kMaxHist = 64;           // 一手牌的动作条数上限（无加注上限后要放宽）
-constexpr int kNumActions = 8;         // 网络动作槽：fold / check-call / 5 档尺寸 / all-in
 
 // 每街加注次数上限。0 = 无上限，与 ACPC 一致。
 constexpr int kNoRaiseCap = 0;
@@ -55,20 +59,20 @@ enum MoveKind : uint8_t {
 };
 
 // 动作槽位映射（全局固定，与具体局面无关）：
-//   0     fold
-//   1     check / call
-//   2..6  第 i 档尺寸（翻前 = 上次加注额的倍数，翻后 = 底池比例）
-//   7     all-in
+//   0              fold
+//   1              check / call
+//   2 .. 2+K-1     第 i 个尺寸带：只表示"打多大这个量级"，带内金额任意
+//   kNumActions-1  all-in
 constexpr int kSlotFold = 0;
 constexpr int kSlotCheckCall = 1;
 constexpr int kSlotSize0 = 2;
-constexpr int kSlotAllIn = 7;
+constexpr int kSlotAllIn = kNumActions - 1;
 
 inline int slotOfSize(int i) { return kSlotSize0 + i; }
 
 struct Move {
     uint8_t kind = MK_CHECK;
-    int16_t to = 0;  // 执行后本街的投入额
+    int16_t to = 0;  // 执行后本街的投入额（任意合法整数，不再限定几个预设值）
 };
 
 struct HistEntry {
@@ -81,7 +85,8 @@ struct HistEntry {
 
 struct LegalMove {
     int slot = 0;
-    Move mv;
+    Move mv;      // 尺寸带：to 是带的**下端点**，只作为代表值/评估用
+    int toHi = 0;  // 尺寸带的上端点（闭区间）。带内任何整数金额都合法
 };
 
 struct HUState {
@@ -132,7 +137,27 @@ inline int toCall(const HUState& s, int p) {
 }
 
 // 枚举当前局面的合法动作（含 slot）。返回条数。
+//
+// 尺寸槽不再对应固定金额：每个尺寸槽是一个**闭区间带** [mv.to, toHi]，
+// 带内任何整数金额都合法。这样金额本身没有预设档位（ACPC 的规则就是
+// "任何不小于最小加注的整数额"），策略只需要选带，具体金额由 amountInBand 落点。
 int legalMoves(const HUState& s, LegalMove* out);
+
+// 合法加注区间（本街投入额的绝对值，闭区间）。不能加注时 lo > hi。
+int minRaiseTo(const HUState& s, int seat = -1);
+int maxRaiseTo(const HUState& s, int seat = -1);
+
+// 带内取一个具体金额：u ∈ [0, 1)，按对数均匀落点。
+// 因为带是连续整数区间，任意合法金额都可能被取到。
+int amountInBand(int lo, int hi, double u);
+
+// 构造"加注到 to"的合法动作：越界钳进 [minRaiseTo, maxRaiseTo]，
+// 顶到上限就退化成全下。不能加注时返回 MK_CHECK（调用方应先检查 isRaisePossible）。
+bool isRaisePossible(const HUState& s, int seat = -1);
+Move makeRaise(const HUState& s, int to, int seat = -1);
+
+// 任意金额的合法性判定（ACPC 口径：整数、>= 最小加注、<= 全下）。
+bool canRaiseTo(const HUState& s, int to, int seat = -1);
 
 // 执行一个动作（内部会让机会节点发牌：本街结束就发下一条街）。
 void applyMove(HUState& s, const Move& m, Rng& rng);
