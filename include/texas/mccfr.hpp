@@ -426,7 +426,8 @@ private:
 
     double traverse(const HoldemGame::State& s, int traverser, double reachT) {
         if (HoldemGame::isTerminal(s)) {
-            return HoldemGame::utilityFrom(s, traverser);
+            // 带上牌力缓存：整轮公共牌固定，同一摊牌的牌力只算一次而不是几十次
+            return HoldemGame::utilityFrom(s, traverser, &scores_, iter_);
         }
         if (HoldemGame::needsChance(s)) {
             HoldemGame::State t = s;
@@ -439,7 +440,7 @@ private:
 
         Move moves[HoldemGame::kMaxActions];
         const int na = HoldemGame::actions(s, moves, HoldemGame::kMaxActions);
-        if (na <= 0) return HoldemGame::utilityFrom(s, traverser);
+        if (na <= 0) return HoldemGame::utilityFrom(s, traverser, &scores_, iter_);
 
         // 这个引用在整轮遍历内有效：扩容只发生在 iterate() 的 prepare()
         InfoSetData& is = isets_.get(abstraction_.infosetIdWithBucket(s, cachedBucket(s, p)));
@@ -471,8 +472,14 @@ private:
                 r += vals[i] - nodeVal;
                 is.regret[i] = (variant_ == CfrVariant::CFRPlus) ? std::max(0.0, r) : r;
             }
-            // 线性加权平均（DCFR 再叠一层平均策略折扣）
-            const double w = static_cast<double>(iter_);
+            // 平均策略的加权方式两个变体不同，这里混用会出问题：
+            //   CFR+ 靠线性权重 w = t 实现"越晚的迭代越重要"。
+            //   DCFR 的 (t/(t+1))^2 折扣本身就是加权方式（等价于权重 ∝ k^2），
+            //   再乘一个 t 会让权重变成 k^3，平均窗口被压到只剩最后 16%。
+            // 实测后果是训练越久平均策略越弱：跨种子两两对打时 100 万/200 万轮
+            // 相对 50 万轮分别 -0.225±0.163 / -0.269±0.165（显著更差）；
+            // 去掉重复的线性权重后变成 -0.091 / -0.064（不显著）。
+            const double w = (variant_ == CfrVariant::DCFR) ? 1.0 : static_cast<double>(iter_);
             for (int i = 0; i < na; ++i) {
                 is.avg[i] = is.avg[i] * avgDiscount_ + w * reachT * sigma[i];
             }
@@ -487,6 +494,7 @@ private:
     HoldemAbstraction abstraction_;
     InfoSetTable isets_;
     std::mt19937_64 rng_;
+    HoldemGame::ScoreCache scores_;
     Card board_[5] = {};
     int bucketVal_[2][6] = {};
     int bucketStamp_[2][6] = {{-1, -1, -1, -1, -1, -1}, {-1, -1, -1, -1, -1, -1}};

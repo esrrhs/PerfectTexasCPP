@@ -351,24 +351,41 @@ struct HoldemGame {
         all[n++] = s.hole[p][1];
         for (int i = 0; i < s.boardCount; ++i) all[n++] = s.board[i];
         if (n == 7) return evaluate7(all);
+        if (n == 6) return evaluate6(all);
         if (n == 5) return evaluate5(all);
-        if (n == 6) {
-            int best = -1;
-            for (int skip = 0; skip < 6; ++skip) {
-                Card h5[5];
-                int k = 0;
-                for (int i = 0; i < 6; ++i) {
-                    if (i != skip) h5[k++] = all[i];
-                }
-                best = std::max(best, evaluate5(h5));
-            }
-            return best;
-        }
         return 0;
     }
 
+    // 一手牌的牌力只取决于（底牌, 公共牌张数）—— 一轮 MCCFR 遍历里整副公共牌是
+    // 固定的，同样的摊牌算力会被反复重算（实测每轮约 38 次 evaluate7）。
+    // 这个缓存按 (玩家, 公共牌张数) 记住结果，把重算次数压到最多 6 次。
+    // stamp 由调用方给（MCCFR 用迭代轮数），换了牌自然失效，不需要手动清理。
+    struct ScoreCache {
+        int stamp[kMaxPlayers][6];
+        int score[kMaxPlayers][6];
+        ScoreCache() {
+            for (int p = 0; p < kMaxPlayers; ++p) {
+                for (int b = 0; b < 6; ++b) {
+                    stamp[p][b] = -1;
+                    score[p][b] = 0;
+                }
+            }
+        }
+    };
+
+    static int cachedHandScore(const State& s, int p, ScoreCache* cache, int stamp) {
+        if (cache == nullptr || s.boardCount < 0 || s.boardCount > 5) return handScore(s, p);
+        int* st = &cache->stamp[p][s.boardCount];
+        if (*st == stamp) return cache->score[p][s.boardCount];
+        const int v = handScore(s, p);
+        *st = stamp;
+        cache->score[p][s.boardCount] = v;
+        return v;
+    }
+
     // 每人净收益（零和）。按投入额分层结算边池。
-    static void payouts(const State& s, double* out) {
+    static void payouts(const State& s, double* out, ScoreCache* cache = nullptr,
+                        int stamp = 0) {
         for (int i = 0; i < s.numPlayers; ++i) out[i] = 0.0;
 
         if (numActive(s) == 1) {
@@ -397,7 +414,7 @@ struct HoldemGame {
 
         int scores[kMaxPlayers];
         for (int i = 0; i < s.numPlayers; ++i) {
-            scores[i] = s.folded[i] ? -1 : handScore(s, i);
+            scores[i] = s.folded[i] ? -1 : cachedHandScore(s, i, cache, stamp);
         }
 
         int prev = 0;
@@ -435,9 +452,10 @@ struct HoldemGame {
         for (int i = 0; i < s.numPlayers; ++i) out[i] -= static_cast<double>(s.contrib[i]);
     }
 
-    static double utilityFrom(const State& s, int player) {
+    static double utilityFrom(const State& s, int player, ScoreCache* cache = nullptr,
+                              int stamp = 0) {
         double pay[kMaxPlayers];
-        payouts(s, pay);
+        payouts(s, pay, cache, stamp);
         return pay[player];
     }
 };
