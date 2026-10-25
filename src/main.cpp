@@ -1,13 +1,13 @@
 // PerfectTexasCPP 命令行入口。
 //
-//   texas_cli solve kuhn  [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]
-//   texas_cli solve leduc [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]
-//   texas_cli holdem      [--iters N] [--buckets N] [--variant dcfr|cfrplus]
+//   perfecttexas solve kuhn  [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]
+//   perfecttexas solve leduc [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]
+//   perfecttexas holdem      [--iters N] [--buckets N] [--variant dcfr|cfrplus]
 //                         [--sizes PRESET] [--no-sized-history]
 //                         [--save FILE] [--load FILE] [--seed N] [--ev-hands N]
-//   texas_cli match --a FILE --b FILE [--hands N] [--seed N]
-//   texas_cli equity --hero AhKh [--board QhJh2c] [--opp 1] [--iters 200000]
-//   texas_cli demo
+//   perfecttexas match --a FILE --b FILE [--hands N] [--seed N]
+//   perfecttexas equity --hero AhKh [--board QhJh2c] [--opp 1] [--iters 200000]
+//   perfecttexas demo
 //
 // solve  训练一个 CFR 求解器，周期性报告可利用度与博弈值
 // holdem 训练无限注德州求解器，可存盘成基准
@@ -71,14 +71,14 @@ void usage() {
         "PerfectTexasCPP —— 德州扑克不完全信息博弈求解器（CFR / CFR+ / DCFR）\n"
         "\n"
         "用法:\n"
-        "  texas_cli solve kuhn  [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]\n"
-        "  texas_cli solve leduc [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]\n"
-        "  texas_cli holdem      [--iters N] [--buckets N] [--variant dcfr|cfrplus]\n"
+        "  perfecttexas solve kuhn  [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]\n"
+        "  perfecttexas solve leduc [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]\n"
+        "  perfecttexas holdem      [--iters N] [--buckets N] [--variant dcfr|cfrplus]\n"
         "                        [--sizes PRESET] [--no-sized-history]\n"
         "                        [--save FILE] [--load FILE] [--seed N] [--ev-hands N]\n"
-        "  texas_cli match --a FILE --b FILE [--hands N] [--seed N]\n"
-        "  texas_cli equity --hero AhKh [--board QhJh2c] [--opp 1] [--iters 200000]\n"
-        "  texas_cli demo\n"
+        "  perfecttexas match --a FILE --b FILE [--hands N] [--seed N]\n"
+        "  perfecttexas equity --hero AhKh [--board QhJh2c] [--opp 1] [--iters 200000]\n"
+        "  perfecttexas demo\n"
         "\n"
         "选项:\n"
         "  --iters N    迭代轮数（kuhn 默认 20000，leduc 默认 10000，holdem 默认 1000000）\n"

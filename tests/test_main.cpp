@@ -493,7 +493,7 @@ void testHoldemActionSpace() {
         space.preflopCount = 1;
         space.postflopCount = 1;
         space.includeAllIn = false;
-        const char* path = "texas_cfr_test_space.bin";
+        const char* path = "perfecttexas_test_space.bin";
         texas::HoldemSolver src(20, 999ULL, texas::CfrVariant::DCFR, true);
         src.setActionSpace(space);
         src.iterate(3000);
@@ -567,8 +567,8 @@ void testActionSpaceNaming() {
 void testHoldemSaveV4Compat() {
     section("无限注德州 / 旧存盘格式兼容");
 
-    const char* v4path = "texas_cfr_test_v4.bin";
-    const char* v5path = "texas_cfr_test_v5.bin";
+    const char* v4path = "perfecttexas_test_v4.bin";
+    const char* v5path = "perfecttexas_test_v5.bin";
     {
         std::FILE* f = std::fopen(v4path, "wb");
         CHECK(f != nullptr);
@@ -1222,7 +1222,7 @@ void testHoldemSolverVariants() {
 
     // 存盘 / 读盘的往返必须逐位一致，否则"用冻结快照当基准对手"这件事就不可靠
     {
-        const char* path = "texas_cfr_test_model.bin";
+        const char* path = "perfecttexas_test_model.bin";
         texas::HoldemSolver src(20, 424242ULL, texas::CfrVariant::DCFR);
         src.iterate(20000);
         CHECK(src.save(path));
@@ -1254,7 +1254,7 @@ void testHoldemSolverVariants() {
 
         // 读一个不存在或损坏的文件必须失败而不是崩溃
         texas::HoldemSolver bad(20, 1ULL, texas::CfrVariant::DCFR);
-        CHECK(!bad.load("texas_cfr_no_such_model.bin"));
+        CHECK(!bad.load("perfecttexas_no_such_model.bin"));
         std::remove(path);
     }
 

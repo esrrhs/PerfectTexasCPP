@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(texas_cfr LANGUAGES CXX)
+project(PerfectTexasCPP LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,13 +20,13 @@ else()
   endif()
 endif()
 
-add_library(texas_cfr INTERFACE)
-target_include_directories(texas_cfr INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_library(perfecttexas_core INTERFACE)
+target_include_directories(perfecttexas_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-add_executable(texas_cli src/main.cpp)
-target_link_libraries(texas_cli PRIVATE texas_cfr)
+add_executable(perfecttexas src/main.cpp)
+target_link_libraries(perfecttexas PRIVATE perfecttexas_core)
 
 enable_testing()
-add_executable(texas_tests tests/test_main.cpp)
-target_link_libraries(texas_tests PRIVATE texas_cfr)
-add_test(NAME texas_tests COMMAND texas_tests)
+add_executable(perfecttexas_tests tests/test_main.cpp)
+target_link_libraries(perfecttexas_tests PRIVATE perfecttexas_core)
+add_test(NAME perfecttexas_tests COMMAND perfecttexas_tests)

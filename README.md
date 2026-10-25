@@ -86,28 +86,28 @@ mingw32-make -C build -j
 
 ```bash
 # 训练 Kuhn Poker，报告可利用度下降曲线
-./build/texas_cli solve kuhn --iters 20000
+./build/perfecttexas solve kuhn --iters 20000
 
 # 训练 Leduc，写出 CSV 方便画收敛曲线
-./build/texas_cli solve leduc --iters 10000 --report 1000 --csv leduc.csv
+./build/perfecttexas solve leduc --iters 10000 --report 1000 --csv leduc.csv
 
 # 无限注德州（完整规则 + MCCFR，默认 100 万轮，约 18 秒）
-./build/texas_cli holdem
+./build/perfecttexas holdem
 
 # 存成冻结基准，以后每次改求解器都拿它做对照
-./build/texas_cli holdem --iters 1000000 --save base.bin
+./build/perfecttexas holdem --iters 1000000 --save base.bin
 
 # 两份已存盘策略对打，报每手净收益 + 95% 置信区间
-./build/texas_cli match --a new.bin --b base.bin --hands 400000
+./build/perfecttexas match --a new.bin --b base.bin --hands 400000
 
 # 对比 vanilla CFR
-./build/texas_cli solve kuhn --iters 10000 --vanilla
+./build/perfecttexas solve kuhn --iters 10000 --vanilla
 
 # 手牌胜率（蒙特卡洛）
-./build/texas_cli equity --hero AhKh --board QhJh2c --opp 2 --iters 100000
+./build/perfecttexas equity --hero AhKh --board QhJh2c --opp 2 --iters 100000
 
 # 一键演示
-./build/texas_cli demo
+./build/perfecttexas demo
 ```
 
 `solve` 输出示例：
@@ -578,7 +578,7 @@ isets_.prepare(256);   // 注释说"一轮最多新增 152 个信息集"
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-./build/texas_cli holdem
+./build/perfecttexas holdem
 ```
 
 无任何外部依赖：不链接第三方库，不加载数据表文件。
@@ -696,12 +696,12 @@ cmake --build build -j
 
 ```bash
 # 1. 冻结一个基准，之后永不重训
-./build/texas_cli holdem --iters 500000 --variant cfrplus --save base_cfrplus.bin
+./build/perfecttexas holdem --iters 500000 --variant cfrplus --save base_cfrplus.bin
 
 # 2. 候选策略（多个种子）逐个对打
 for s in 1 777 12345 99991 31337; do
-  ./build/texas_cli holdem --iters 500000 --seed $s --save cand.bin
-  ./build/texas_cli match --a cand.bin --b base_cfrplus.bin --hands 600000
+  ./build/perfecttexas holdem --iters 500000 --seed $s --save cand.bin
+  ./build/perfecttexas match --a cand.bin --b base_cfrplus.bin --hands 600000
 done
 ```
 
