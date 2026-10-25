@@ -11,6 +11,11 @@ namespace {
 
 constexpr float kStackF = float(kStartingStack);
 constexpr float kPotF = 2.0f * kStartingStack;
+// 加注次数没有上限（ACPC 口径），归一化到 6 并对更大的值饱和。
+// 6 次加注在 200BB 下已经接近"再加就没意义"的深度。
+constexpr float kRaiseNorm = 6.0f;
+
+float raiseNorm(int n) { return std::min(float(n), kRaiseNorm) / kRaiseNorm; }
 
 void putCard(float* plane, Card c) {
     if (c >= 0 && c < kNumCards) plane[c] = 1.0f;
@@ -71,7 +76,7 @@ void encodeObservation(const HUState& s, Obs& o, float eqActing) {
     x[13] = (pot > 0) ? float(effStack) / float(pot) : 0.0f;
     x[14] = strength;
     x[15] = float(outs.total) / 15.0f;
-    x[16] = float(s.numRaises) / float(kMaxRaises);
+    x[16] = raiseNorm(s.numRaises);
     x[17] = s.allin[me] ? 1.0f : 0.0f;
     x[18] = s.allin[opp] ? 1.0f : 0.0f;
     x[19] = (pot > 0) ? float(s.contrib[me]) / float(pot) : 0.0f;
@@ -141,7 +146,7 @@ void encodeActionFeature(const HUState& s, const LegalMove& lm,
     out[9] = (lm.mv.kind == MK_ALLIN) ? 1.0f : 0.0f;
     out[10] = isRaise ? 1.0f : 0.0f;
     out[11] = (potAfter > 0) ? float(std::max(0, to - int(s.contrib[opp]))) / float(potAfter) : 0.0f;
-    out[12] = float(s.numRaises + (isRaise ? 1 : 0)) / float(kMaxRaises);
+    out[12] = raiseNorm(s.numRaises + (isRaise ? 1 : 0));
     out[13] = 1.0f;
     out[14] = (potF > 0) ? float(delta) / float(potF) : 0.0f;
     out[15] = (s.street == ST_PREFLOP) ? 1.0f : 0.0f;

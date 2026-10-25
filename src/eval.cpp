@@ -25,6 +25,7 @@ EvalResult summarize(const std::vector<int>& scores) {
     r.chipsPerHand = mean;
     r.stderr = std::sqrt(var / n);
     r.bbPer100 = mean / double(kBigBlind) * 100.0;
+    r.mbbPerGame = mean / double(kBigBlind) * 1000.0;  // ACPC 单位
     return r;
 }
 

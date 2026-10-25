@@ -2,15 +2,23 @@
 
 // 单挑无限注德州（Heads-Up No-Limit Hold'em）规则引擎。
 //
-// 为强化学习自对局设计：State 是纯 POD、拷贝成本 ~120 字节，一局牌的全部
-// 信息都在里面，不需要指针或堆分配。CFR 时代的多路/边池逻辑已经删掉——
-// 单挑的结算只有"赢家通吃 / 平分"两种情形，代码少了三分之二，边界也少。
+// 规则口径对齐 ACPC（Annual Computer Poker Competition）的 HUNL：
+//
+//   stack = 20000 20000      → 200 个大盲
+//   blind = 100 50           → 大盲 100 / 小盲 50（1:2，与 ACPC 一致）
+//   firstPlayer = 2 1 1 1    → 小盲翻前先行动，大盲翻后先行动
+//   maxRaises                → 无上限（ACPC 只要求"不小于上次下注或大盲"）
+//
+// 和 ACPC 的唯一差异是"按钮归谁"：ACPC 的 2 人桌用反向盲注，按钮位下大盲；
+// 这里沿用常见的按钮=小盲。两者只是记账口径不同，游戏树（谁先动、谁下多少）
+// 完全一样，筹码每手重置（Doyle's Game）也一致。
+//
+// State 是纯 POD，一局牌的全部信息都在里面，不需要指针或堆分配。
+// 单挑的结算只有"赢家通吃 / 平分"两种，没有边池。
 //
 // 座位约定（单挑固定）：
 //   0 = 小盲 SB（按钮位，翻牌前先行动，翻牌后后行动）
 //   1 = 大盲 BB（翻牌前最后行动，翻牌后先行动）
-//
-// 筹码单位就是引擎的最小单位，盲注 1/2、起始 200（=100BB）。
 
 #include <array>
 #include <cstdint>
@@ -21,13 +29,21 @@
 
 namespace texas {
 
-constexpr int kStartingStack = 200;
-constexpr int kSmallBlind = 1;
-constexpr int kBigBlind = 2;
-constexpr int kMaxSizes = 5;     // 每街的尺寸档数
-constexpr int kMaxRaises = 3;    // 每街最多 3 次主动加注（开池 / 3-bet / 4-bet）
-constexpr int kMaxHist = 48;     // 一手牌的动作条数上限
-constexpr int kNumActions = 8;   // 网络动作槽：fold / check-call / 5 档尺寸 / all-in
+constexpr int kStartingStack = 20000;  // 200BB，对齐 ACPC
+constexpr int kSmallBlind = 50;
+constexpr int kBigBlind = 100;         // ACPC：大盲 100、小盲 50
+constexpr int kMaxSizes = 5;           // 每街的尺寸档数
+constexpr int kMaxHist = 64;           // 一手牌的动作条数上限（无加注上限后要放宽）
+constexpr int kNumActions = 8;         // 网络动作槽：fold / check-call / 5 档尺寸 / all-in
+
+// 每街加注次数上限。0 = 无上限，与 ACPC 一致。
+constexpr int kNoRaiseCap = 0;
+
+// 投入额 / 身后筹码这些字段是 int16_t（省内存，hist 数组才塞得下 64 条）。
+// 200BB 下单人最多投入 20000，离 int16 上限 32767 尚有余量；再加深盲就得换 int32。
+static_assert(kStartingStack <= 32767, "起始筹码超出 int16 表示范围");
+static_assert(2 * kStartingStack <= 2147483647, "单手投入总额超出 int 表示范围");
+
 
 enum Street : uint8_t { ST_PREFLOP = 0, ST_FLOP = 1, ST_TURN = 2, ST_RIVER = 3 };
 enum MoveKind : uint8_t {
@@ -60,7 +76,7 @@ struct HistEntry {
     uint8_t kind = MK_CHECK;
     uint8_t street = 0;
     int16_t to = 0;      // 本街投入额
-    int16_t potAfter = 0;
+    int32_t potAfter = 0;  // 动作后的底池。200BB 下单手底池可达 40000，int16 会溢出
 };
 
 struct LegalMove {
@@ -84,6 +100,7 @@ struct HUState {
     int16_t lastRaiseTo = 0;    // 跟注所需的投入额
     int16_t lastRaiseSize = 0;  // 上一次加注的增量，用于算最小加注
     uint8_t numRaises = 0;
+    uint8_t maxRaisesPerStreet = kNoRaiseCap;  // 0 = 无上限（ACPC 口径）
     uint8_t finished = 0;
     uint8_t histLen = 0;
     HistEntry hist[kMaxHist];
@@ -92,6 +109,12 @@ struct HUState {
     int stackOf(int p) const { return stack[p]; }
     bool terminal() const { return finished != 0; }
 };
+
+// 每街加注次数上限的全局默认值（0 = 无上限）。供 CLI / 测试设定，
+// makeState 会把它写进 state，所以规则本身仍然是自描述、可拷贝的。
+void setDefaultMaxRaises(int n);
+int defaultMaxRaises();
+
 
 using Rng = std::mt19937_64;
 

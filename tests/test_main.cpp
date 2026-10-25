@@ -123,9 +123,9 @@ void testRules() {
 
     texas::Rng rng(7);
     texas::HUState s = rigged("Ah", "Ad", "Kh", "Kd");
-    CHECK(s.pot() == 3);
+    CHECK(s.pot() == texas::kSmallBlind + texas::kBigBlind);
     CHECK(s.toAct == 0);
-    CHECK(s.contrib[0] == 1 && s.contrib[1] == 2);
+    CHECK(s.contrib[0] == texas::kSmallBlind && s.contrib[1] == texas::kBigBlind);
 
     texas::LegalMove lm[16];
     int n = texas::legalMoves(s, lm);
@@ -139,7 +139,7 @@ void testRules() {
         if (lm[i].mv.kind == texas::MK_RAISE) {
             if (lm[i].mv.to <= lastTo) increasing = false;
             lastTo = lm[i].mv.to;
-            CHECK(lm[i].mv.to >= 4);
+            CHECK(lm[i].mv.to >= 2 * texas::kBigBlind);  // 最小加注 = 大盲 + 大盲
             CHECK(lm[i].mv.to > s.contrib[0]);
         }
     }
@@ -156,7 +156,7 @@ void testRules() {
     texas::applyMove(s2, call, rng);
     CHECK(!s2.terminal());
     CHECK(s2.toAct == 1);
-    CHECK(s2.pot() == 4);
+    CHECK(s2.pot() == 2 * texas::kBigBlind);
 
     // 大盲过牌 → 翻牌，公共牌 3 张，大盲先行动
     texas::legalMoves(s2, lm);
@@ -173,8 +173,8 @@ void testRules() {
         texas::legalMoves(f, lm);
         texas::applyMove(f, lm[0].mv, rng);
         CHECK(f.terminal());
-        CHECK(texas::payoff(f, 0) == -1);
-        CHECK(texas::payoff(f, 1) == 1);
+        CHECK(texas::payoff(f, 0) == -texas::kSmallBlind);
+        CHECK(texas::payoff(f, 1) == texas::kSmallBlind);
         CHECK(texas::payoff(f, 0) + texas::payoff(f, 1) == 0);
     }
 
@@ -222,6 +222,43 @@ void testRules() {
         CHECK_NEAR(eq + texas::perfectEquity(sd, 1), 1.0, 1e-12);
     }
 
+    // ---- 对齐 ACPC 的三条不变式 ----
+    // 1) 筹码深度必须是 200BB（ACPC：stack 20000 / big blind 100）
+    section("对齐 ACPC");
+    CHECK(texas::kStartingStack / texas::kBigBlind == 200);
+    CHECK(texas::kBigBlind == 2 * texas::kSmallBlind);
+    // 2) 默认无加注次数上限
+    CHECK(texas::defaultMaxRaises() == 0);
+    {
+        texas::HUState r = rigged("Ah", "Ad", "Kh", "Kd");
+        CHECK(r.maxRaisesPerStreet == 0);
+        int raises = 0;
+        texas::LegalMove rl[16];
+        for (int it = 0; it < 40 && !r.terminal(); ++it) {
+            const int n2 = texas::legalMoves(r, rl);
+            if (n2 <= 0) break;
+            // 每次都取最小的一档加注，逼出最长的加注序列
+            int pick = -1;
+            for (int i = 0; i < n2; ++i) {
+                if (rl[i].mv.kind == texas::MK_RAISE) {
+                    pick = i;
+                    break;
+                }
+            }
+            if (pick < 0) break;
+            texas::applyMove(r, rl[pick].mv, rng);
+            ++raises;
+        }
+        CHECK(raises > 3);  // 旧版 kMaxRaises=3 时这里永远到不了 4
+    }
+    // 3) 单位换算：永远弃牌 = 750 mbb/g（ACPC 文献的标尺）
+    {
+        const double chips = 0.5 * double(texas::kSmallBlind + texas::kBigBlind);
+        const double mbbPerGame = chips / double(texas::kBigBlind) * 1000.0;
+        CHECK(std::fabs(mbbPerGame - 750.0) < 1e-9);
+    }
+    texas::setDefaultMaxRaises(0);
+
     // 随机对局：必然终局、零和、筹码守恒
     int zeroSumFail = 0;
     int notTerminal = 0;
@@ -231,7 +268,7 @@ void testRules() {
     for (int t = 0; t < 20000; ++t) {
         texas::HUState g = texas::dealNewHand(rng);
         int guard = 0;
-        while (!g.terminal() && guard < 200) {
+        while (!g.terminal() && guard < 1000) {
             texas::LegalMove mv[16];
             const int k = texas::legalMoves(g, mv);
             if (k <= 0) break;

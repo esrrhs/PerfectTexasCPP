@@ -3,14 +3,18 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 namespace texas {
 
 namespace {
 
 // 每街尺寸阶梯的目标投入额。
-//   翻牌前：上次加注额的倍数，开局 lastRaiseTo = 2（大盲）→ 4/5/6/8/11
+//   翻牌前：上次加注额的倍数，开局 lastRaiseTo = 100（大盲）→ 220/250/300/400/550
 //   翻牌后：在上次加注额之上加底池比例，无人下注时就是纯底池比例下注
+
+int g_defaultMaxRaises = kNoRaiseCap;
+
 int ladderTo(const HUState& s, int i) {
     if (s.street == ST_PREFLOP) {
         static const double kMul[kMaxSizes] = {2.2, 2.5, 3.0, 4.0, 5.5};
@@ -22,14 +26,19 @@ int ladderTo(const HUState& s, int i) {
     return int(s.lastRaiseTo) + inc;
 }
 
+// 无加注上限时一手牌的动作条数可能超过 kMaxHist。满了之后**左移**而不是
+// 直接丢弃：网络只看最近 12 步，丢掉最新的会让 LSTM 看到过期的历史。
 void pushHist(HUState& s, int seat, int kind, int to) {
-    if (s.histLen >= kMaxHist) return;
+    if (s.histLen >= kMaxHist) {
+        std::memmove(&s.hist[0], &s.hist[1], sizeof(HistEntry) * (kMaxHist - 1));
+        --s.histLen;
+    }
     HistEntry& e = s.hist[s.histLen++];
     e.seat = static_cast<uint8_t>(seat);
     e.kind = static_cast<uint8_t>(kind);
     e.street = s.street;
     e.to = static_cast<int16_t>(to);
-    e.potAfter = static_cast<int16_t>(s.pot());
+    e.potAfter = static_cast<int32_t>(s.pot());
 }
 
 // 本街结束：发下一条街，或者直接跑到摊牌。
@@ -60,6 +69,14 @@ double equityFromScores(int s0, int s1) {
 
 }  // namespace
 
+void setDefaultMaxRaises(int n) {
+    if (n < 0) n = 0;
+    if (n > 255) n = 255;
+    g_defaultMaxRaises = n;
+}
+
+int defaultMaxRaises() { return g_defaultMaxRaises; }
+
 HUState makeState(const Card* hole0, const Card* hole1, const Card* board, int boardN) {
     HUState s;
     s.hole[0][0] = static_cast<uint8_t>(hole0[0]);
@@ -79,6 +96,7 @@ HUState makeState(const Card* hole0, const Card* hole1, const Card* board, int b
     s.lastRaiseTo = kBigBlind;
     s.lastRaiseSize = kBigBlind;
     s.numRaises = 0;
+    s.maxRaisesPerStreet = static_cast<uint8_t>(g_defaultMaxRaises);
     s.lastAggressor = 255;
     s.folded = 255;
     s.allin[0] = s.allin[1] = 0;
@@ -123,7 +141,10 @@ int legalMoves(const HUState& s, LegalMove* out) {
     ++n;
 
     const int maxTo = s.contrib[p] + myStack;
-    const bool canRaise = (s.numRaises < kMaxRaises) && !s.allin[o] && myStack > need;
+    // 加注次数上限默认是 0 = 无上限（ACPC 口径）。设了上限时按上限截断。
+    const bool raiseAllowed =
+        (s.maxRaisesPerStreet == 0 || s.numRaises < s.maxRaisesPerStreet);
+    const bool canRaise = raiseAllowed && !s.allin[o] && myStack > need;
     if (canRaise) {
         int minTo = int(s.lastRaiseTo) + std::max<int>(s.lastRaiseSize, kBigBlind);
         if (minTo <= s.contrib[p]) minTo = s.contrib[p] + kBigBlind;

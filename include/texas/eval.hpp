@@ -16,7 +16,8 @@ struct EvalResult {
     int hands = 0;
     double chipsPerHand = 0.0;
     double stderr = 0.0;
-    double bbPer100 = 0.0;  // 每百手大盲数
+    double bbPer100 = 0.0;   // 每百手大盲数
+    double mbbPerGame = 0.0; // ACPC 标准口径：每手千分之一大盲（1 bb/100 = 10 mbb/g）
 };
 
 EvalResult evalVsRule(const nn::Actor actors[2], int games, uint64_t seed, int equityIters = 24);

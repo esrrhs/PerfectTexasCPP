@@ -6,7 +6,7 @@
 //
 // train  自对局 PPO 训练（不完全信息 actor + 开天眼 critic）
 // eval   拿存盘模型对固定基准打对局，报每手净收益与标准误
-// bench  未训练策略打规则机器人，作为强度下限
+// bench  未训练策略分别打规则机器人和随机策略，作为强度下限
 
 #include <algorithm>
 #include <chrono>
@@ -70,7 +70,7 @@ void usage() {
         "                     [--out DIR] [--resume DIR] [--mps] [--threads N]\n"
         "                     [--league F] [--rule-prob F] [--random-prob F]\n"
         "                     [--archive-ratio F] [--recent N] [--archive N]\n"
-        "                     [--oracle-iters N]\n"
+        "                     [--max-raises N] [--oracle-iters N]\n"
         "                     [--eval-every N] [--eval-games N]\n"
         "                     [--oracle-coef F] [--no-oracle] [--seed N]\n"
         "  perfecttexas eval  --resume DIR [--vs rule|random|self] [--hands N]\n"
@@ -84,6 +84,7 @@ void usage() {
         "  --archive-ratio F 抽历史对手时用归档快照的比例（默认 0.30）\n"
         "  --recent N      历史池的滚动窗口容量（默认 8）\n"
         "  --archive N     历史池的归档容量，满了隔一个丢一个（默认 16）\n"
+        "  --max-raises N  每街加注次数上限（默认 0 = 无上限，对齐 ACPC）\n"
         "  --oracle-coef F 开天眼稠密奖励的系数（默认 0.05，0 等于关掉）\n"
         "  --no-oracle     关闭开天眼稠密奖励（只保留 critic 的完美信息价值）\n");
 }
@@ -172,14 +173,23 @@ int cmdTrain(int argc, char** argv) {
     rcfg.oracleCoef = static_cast<float>(argDouble(argc, argv, "--oracle-coef", 0.05));
     rcfg.equityIters = argInt(argc, argv, "--oracle-iters", 32);
 
+    // 加注次数上限：0 = 无上限，和 ACPC 一致。非 0 时退回旧版"每街 N 次"的口径。
+    const int maxRaises = argInt(argc, argv, "--max-raises", texas::kNoRaiseCap);
+    texas::setDefaultMaxRaises(maxRaises);
+
     const float selfProb = std::max(
         0.0f, 1.0f - (rcfg.historicalProb + rcfg.ruleProb + rcfg.randomProb));
-    std::printf("PerfectTexasCPP train | 单挑 NLHE %d 筹码 | 节点特征 %d + 开天眼 %d + 序列 %d\n",
-                texas::kStartingStack, texas::kNodeInput, texas::kExtraInput, texas::kSeqInput);
-    std::printf("  hidden=%lld lstm=%lld | device=%s | games/update=%d | oracle=%.2f\n",
-                static_cast<long long>(mc.hidden), static_cast<long long>(mc.lstmHidden),
-                device.type() == torch::kMPS ? "mps" : "cpu", games,
+    const std::string capText =
+        (maxRaises == 0) ? std::string("无（ACPC 口径）") : std::to_string(maxRaises) + " 次/街";
+    std::printf("PerfectTexasCPP train | 单挑 NLHE %d 筹码 = %dBB | 节点特征 %d + 开天眼 %d + 序列 %d\n",
+                texas::kStartingStack, texas::kStartingStack / texas::kBigBlind, texas::kNodeInput,
+                texas::kExtraInput, texas::kSeqInput);
+    std::printf("  blinds %d/%d | 加注上限 %s | oracle=%.2f\n", texas::kSmallBlind,
+                texas::kBigBlind, capText.c_str(),
                 rcfg.oracleReward ? rcfg.oracleCoef : 0.0f);
+    std::printf("  hidden=%lld lstm=%lld | device=%s | games/update=%d\n",
+                static_cast<long long>(mc.hidden), static_cast<long long>(mc.lstmHidden),
+                device.type() == torch::kMPS ? "mps" : "cpu", games);
     // 联赛配比：每局只有一个座位是对手，另一个一定是当前策略。
     std::printf("  league: 自对局 %.2f | 历史快照 %.2f (archive %.2f) | 规则 %.2f | 随机 %.2f"
                 "  [池 recent=%d archive=%d]\n",
@@ -293,8 +303,8 @@ int cmdEval(int argc, char** argv) {
     } else {
         r = texas::evalVsRule(actors, hands, static_cast<uint64_t>(seed));
     }
-    std::printf("%s: %d 手, %+0.3f ± %.3f 筹码/手, %+0.1f bb/100\n", vs.c_str(), r.hands,
-                r.chipsPerHand, r.stderr, r.bbPer100);
+    std::printf("%s: %d 手, %+0.3f ± %.3f 筹码/手, %+0.1f bb/100, %+0.1f mbb/g\n", vs.c_str(),
+                r.hands, r.chipsPerHand, r.stderr, r.bbPer100, r.mbbPerGame);
     return 0;
 }
 
@@ -517,8 +527,15 @@ int cmdBench(int argc, char** argv) {
         actors[s] = texas::nn::Actor(std::make_shared<texas::nn::ActorImpl>(mc));
     }
     const texas::EvalResult r = texas::evalVsRule(actors, hands, 4242);
-    std::printf("未训练策略 vs 规则机器人: %+0.3f ± %.3f 筹码/手 (%+0.1f bb/100)\n",
-                r.chipsPerHand, r.stderr, r.bbPer100);
+    std::printf("未训练策略 vs 规则机器人: %+0.3f ± %.3f 筹码/手 (%+0.1f bb/100, %+0.1f mbb/g)\n",
+                r.chipsPerHand, r.stderr, r.bbPer100, r.mbbPerGame);
+    const texas::EvalResult rr = texas::evalVsRandom(actors, hands, 4243);
+    std::printf("未训练策略 vs 随机策略:   %+0.3f ± %.3f 筹码/手 (%+0.1f bb/100, %+0.1f mbb/g)\n",
+                rr.chipsPerHand, rr.stderr, rr.bbPer100, rr.mbbPerGame);
+    std::printf("  （对齐 ACPC：%d 筹码 = %dBB，永远弃牌 = %+0.1f mbb/g）\n",
+                texas::kStartingStack, texas::kStartingStack / texas::kBigBlind,
+                -0.5 * double(texas::kSmallBlind + texas::kBigBlind) /
+                    double(texas::kBigBlind) * 1000.0);
     return 0;
 }
 
