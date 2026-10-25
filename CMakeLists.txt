@@ -23,21 +23,6 @@ endif()
 add_library(texas_cfr INTERFACE)
 target_include_directories(texas_cfr INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# 可选：接入 texas_algorithm 的查表牌力后端（翻牌后牌力百分位，约 280ns/次）。
-# 不开启时用内置的 evaluate7 启发式，精度较低但零依赖。
-option(TEXAS_CFR_WITH_ALGORITHM "Use texas_algorithm lookup tables for postflop strength" OFF)
-set(TEXAS_ALGORITHM_DIR "" CACHE PATH "Path to texas_algorithm/cpp directory")
-
-if(TEXAS_CFR_WITH_ALGORITHM)
-  if(NOT TEXAS_ALGORITHM_DIR)
-    message(FATAL_ERROR "TEXAS_CFR_WITH_ALGORITHM=ON 需要同时指定 -DTEXAS_ALGORITHM_DIR=<texas_algorithm/cpp>")
-  endif()
-  add_subdirectory(${TEXAS_ALGORITHM_DIR} ${CMAKE_BINARY_DIR}/texas_algorithm)
-  target_compile_definitions(texas_cfr INTERFACE TEXAS_CFR_WITH_ALGORITHM=1)
-  target_link_libraries(texas_cfr INTERFACE texas_algorithm)
-  message(STATUS "texas_cfr: 启用 texas_algorithm 查表牌力后端")
-endif()
-
 add_executable(texas_cli src/main.cpp)
 target_link_libraries(texas_cli PRIVATE texas_cfr)
 

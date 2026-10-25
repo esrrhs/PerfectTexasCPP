@@ -530,12 +530,12 @@ void testHoldemMCCFR() {
     CHECK(bucket72 <= 4);          // 72o 胜率约 35%，落在低桶
 
     texas::HoldemSolver solver(10, 20240518ULL);
-    const int rounds = 20000;
+    const int rounds = 40000;
     solver.iterate(rounds);
     std::printf("  %d 轮后 infosets=%zu\n", rounds, solver.numInfosets());
     CHECK(solver.numInfosets() > 100);
 
-    // 翻牌前小盲面对大盲：强牌应该比弱牌更常加注
+    // 翻牌前小盲面对大盲：强牌应该比弱牌更常加注、更少弃牌
     auto probe = [&](const char* a, const char* b) {
         texas::HoldemGame::State st = texas::HoldemGame::init(2);
         st.hole[0][0] = C(a);
@@ -545,17 +545,22 @@ void testHoldemMCCFR() {
     const std::vector<double> pAA = probe("Ac", "Ad");
     const std::vector<double> p72 = probe("7h", "2d");
 
-    double raiseAA = 0.0;
-    double raise72 = 0.0;
-    for (std::size_t i = 0; i < pAA.size(); ++i) {
-        if (i >= 2) raiseAA += pAA[i];  // 索引 0/1 是弃牌与跟注
-    }
-    for (std::size_t i = 0; i < p72.size(); ++i) {
-        if (i >= 2) raise72 += p72[i];
-    }
-    std::printf("  翻牌前加注率: AA=%.3f  72o=%.3f\n", raiseAA, raise72);
+    auto sumRaise = [](const std::vector<double>& p) {
+        double r = 0.0;
+        for (std::size_t i = 2; i < p.size(); ++i) r += p[i];
+        return r;
+    };
+    const double raiseAA = sumRaise(pAA);
+    const double raise72 = sumRaise(p72);
+    const double foldAA = pAA.empty() ? 1.0 : pAA[0];
+    const double fold72 = p72.empty() ? 0.0 : p72[0];
+
+    std::printf("  翻牌前: AA raise=%.3f fold=%.3f | 72o raise=%.3f fold=%.3f\n", raiseAA, foldAA,
+                raise72, fold72);
     CHECK(raiseAA > raise72);
-    CHECK(raiseAA > 0.5);
+    CHECK(raiseAA > raise72 * 2.0);  // 差距要显著，不是噪声
+    CHECK(foldAA < 0.10);            // AA 几乎不弃牌
+    CHECK(fold72 > 0.50);            // 72o 大部分直接弃
 }
 
 }  // namespace

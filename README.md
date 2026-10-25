@@ -52,7 +52,7 @@ include/texas/
   cfr.hpp       通用 CFR / CFR+ 求解器（模板）
   br.hpp        最优反应与可利用度（exploitability）
   holdem.hpp    无限注德州规则引擎（四街、all-in、边池、摊牌）
-  strength.hpp  牌力抽象（169 类翻牌前 + 翻牌后分桶，可接 texas_algorithm 查表）
+  strength.hpp  牌力抽象（169 类翻牌前 + 翻牌后按分数分位分桶，全部自算）
   mccfr.hpp     无限注德州的 external sampling MCCFR 求解器
 src/main.cpp    CLI 入口
 tests/          自测（用解析解做硬断言）
@@ -173,8 +173,10 @@ HUNL 原始决策点约 10^160，这里做两层压缩：
 
 1. **牌力抽象**（`strength.hpp`）
    - 翻牌前：169 类手牌，强度取对随机对手的蒙特卡洛胜率，分 10 桶
-   - 翻牌后：优先调用 `texas_algorithm` 的查表排名（`GetWinProbability`，约 280ns/次，
-     给出该手牌在所有同张数组合中的精确百分位）；未启用时回退到牌型 + 踢脚启发式
+   - 翻牌后：按张数统计 5/6/7 张牌"最佳五张"分数的真实分布（各 40 万次采样），
+     用 2048 个分位点把分数映射成百分位，再切桶。等价于"该手牌在所有同张数组合中的
+     排名"，但分布靠自己估计，**不需要任何预生成的数据文件**。
+     两张表都是首次使用时惰性构建，约 0.6 秒，之后 O(log N) 查询。
 2. **动作抽象**（`holdem.hpp`）：每个决策点最多 5 个动作
 
 ### 求解器
@@ -187,29 +189,27 @@ HUNL 原始决策点约 10^160，这里做两层压缩：
 ### 用法
 
 ```bash
-# 零依赖构建（内置启发式牌力）
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 ./build/texas_cli holdem --iters 50000
-
-# 启用 texas_algorithm 查表后端（翻牌后约 11000 轮/秒）
-cmake -S . -B build_ta -DCMAKE_BUILD_TYPE=Release \
-      -DTEXAS_CFR_WITH_ALGORITHM=ON \
-      -DTEXAS_ALGORITHM_DIR=../texas_algorithm/cpp
-cmake --build build_ta -j
-./build_ta/texas_cli holdem --iters 50000 --ta-data /path/to/texas_data
 ```
+
+无任何外部依赖：不链接第三方库，不加载数据表文件。
 
 输出：
 
 ```
-  牌力桶 10 | 牌力后端: texas_algorithm 查表
+  牌力桶 10 | 抽象: 169 类翻牌前 + 翻牌后按分位分桶
         iter    infosets       轮/s
-       20000        9269       11353
+       25000        9282       10099
+      100000        9323       11799
 
   翻牌前（小盲/按钮面对大盲）平均策略:
-    AA      fold=0.01  call=0.68  r4=0.14  r5=0.08  r200=0.09
-    AKs     fold=0.01  call=0.41  r4=0.08  r5=0.32  r200=0.17
-    72o     fold=0.79  call=0.04  r4=0.06  r5=0.07  r200=0.04
+    AA      fold=0.00  call=0.44  r4=0.07  r5=0.32  r200=0.16
+    KK      fold=0.00  call=0.44  r4=0.07  r5=0.32  r200=0.16
+    AKs     fold=0.01  call=0.60  r4=0.16  r5=0.09  r200=0.14
+    22      fold=0.08  call=0.75  r4=0.08  r5=0.06  r200=0.03
+    72o     fold=0.88  call=0.02  r4=0.05  r5=0.02  r200=0.03
 ```
 
 ### 已验证
@@ -218,8 +218,8 @@ cmake --build build_ta -j
 - 摊牌比牌、弃牌结算、两人零和
 - 三人边池：主池 150 由三人争、边池 100 由 P1/P2 争，两种赢家情形下净收益和均为 0
 - all-in 后一次发完 5 张公共牌并摊牌
-- 牌力抽象单调：AA(桶 8) > AKs(6) > 22(3) > 72o(3)
-- 训练后 AA 加注率 0.66、72o 0.13，方向与扑克直觉一致
+- 牌力抽象单调：AA(桶 8) > AKs(6) > 22(3) = 72o(3)
+- 训练 10 万轮后：AA 弃牌率 0.00、加注率 0.55；72o 弃牌率 0.88、加注率 0.10
 
 ### 还没做的
 

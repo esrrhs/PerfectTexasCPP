@@ -44,7 +44,6 @@ struct Args {
     std::string board;
     int opp = 1;
     int buckets = -1;
-    std::string taData;
 };
 
 void usage() {
@@ -54,7 +53,7 @@ void usage() {
         "用法:\n"
         "  texas_cli solve kuhn  [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]\n"
         "  texas_cli solve leduc [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]\n"
-        "  texas_cli holdem      [--iters N] [--buckets N] [--ta-data DIR]\n"
+        "  texas_cli holdem      [--iters N] [--buckets N] [--report M]\n"
         "  texas_cli equity --hero AhKh [--board QhJh2c] [--opp 1] [--iters 200000]\n"
         "  texas_cli demo\n"
         "\n"
@@ -67,8 +66,7 @@ void usage() {
         "  --hero HAND  自己的两张手牌，如 AhKh\n"
         "  --board STR  公共牌，如 QhJh2c（可空）\n"
         "  --opp N      对手人数（默认 1）\n"
-        "  --buckets N  牌力分桶数（holdem 默认 10）\n"
-        "  --ta-data D  texas_algorithm 数据表目录（启用查表后端时需要）\n");
+        "  --buckets N  牌力分桶数（holdem 默认 10）\n");
 }
 
 int parseInt(const char* s, int fallback) {
@@ -105,8 +103,6 @@ Args parseArgs(int argc, char** argv) {
             a.opp = parseInt(argv[++i], a.opp);
         } else if (k == "--buckets" && hasNext) {
             a.buckets = parseInt(argv[++i], a.buckets);
-        } else if (k == "--ta-data" && hasNext) {
-            a.taData = argv[++i];
         }
     }
     return a;
@@ -248,26 +244,14 @@ int runDemo() {
 }
 
 int runHoldem(const Args& a) {
-    bool table = false;
-#if defined(TEXAS_CFR_WITH_ALGORITHM)
-    if (!a.taData.empty()) {
-        texas_algorithm::LoadDir(a.taData);
-        table = texas_algorithm::IsLoaded();
-    }
-#endif
-    if (!a.taData.empty() && !table) {
-        std::printf("提示: 当前构建未启用查表后端，--ta-data 被忽略\n");
-    }
-
     const int iters = (a.iters > 0) ? a.iters : 50000;
     const int buckets = (a.buckets > 0) ? a.buckets : 10;
     const int report = (a.report > 0) ? a.report : std::max(1, iters / 10);
 
     std::printf("\n=== 无限注德州 Hold'em | 单挑 100BB | MCCFR (external sampling) ===\n");
-    std::printf("  牌力桶 %d | 牌力后端: %s\n", buckets,
-                table ? "texas_algorithm 查表" : "内置 evaluate7 启发式");
+    std::printf("  牌力桶 %d | 抽象: 169 类翻牌前 + 翻牌后按分位分桶\n", buckets);
 
-    texas::StrengthModel::instance();  // 预热 169 类翻牌前强度表
+    texas::StrengthModel::instance();  // 预热牌力表
     texas::HoldemSolver solver(buckets);
 
     std::printf("  %10s  %10s  %10s\n", "iter", "infosets", "轮/s");
