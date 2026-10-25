@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -14,8 +15,10 @@
 #include "texas/card.hpp"
 #include "texas/cfr.hpp"
 #include "texas/equity.hpp"
+#include "texas/holdem.hpp"
 #include "texas/kuhn.hpp"
 #include "texas/leduc.hpp"
+#include "texas/mccfr.hpp"
 
 namespace {
 
@@ -318,6 +321,243 @@ void testVanillaVsPlus() {
     CHECK(ePlus <= eVani * 2.0);
 }
 
+// ---------------- 无限注德州 ----------------
+
+void testHoldemRules() {
+    section("无限注德州 / 盲注与合法动作");
+
+    texas::HoldemGame::State s = texas::HoldemGame::init(2);
+    CHECK(s.contrib[0] == texas::HoldemGame::kSmallBlind);
+    CHECK(s.contrib[1] == texas::HoldemGame::kBigBlind);
+    CHECK(s.player == 0);  // 单挑由按钮/小盲先行动
+    CHECK(s.street == 0);
+    CHECK(s.boardCount == 0);
+
+    texas::Move mv[texas::HoldemGame::kMaxActions];
+    int n = texas::HoldemGame::actions(s, mv, texas::HoldemGame::kMaxActions);
+    CHECK(n == 5);  // 弃牌 + 跟注 + 两个下注尺度 + all-in
+    CHECK(mv[0].kind == texas::Move::Fold);
+    CHECK(mv[1].kind == texas::Move::CheckCall);
+    CHECK(mv[2].kind == texas::Move::Raise);
+    CHECK(mv[3].kind == texas::Move::Raise);
+    CHECK(mv[3].amount > mv[2].amount);
+    CHECK(mv[4].kind == texas::Move::Raise);
+    CHECK(mv[4].amount == texas::HoldemGame::kBuyIn);
+    CHECK(mv[2].amount <= texas::HoldemGame::kBuyIn);
+
+    // 小盲补齐，大盲仍有选择权（可以过牌或加注）
+    const auto s1 = texas::HoldemGame::next(s, texas::Move{texas::Move::CheckCall, 0});
+    CHECK(s1.contrib[0] == 2);
+    CHECK(s1.player == 1);
+    CHECK(s1.street == 0);
+
+    // 大盲过牌 => 翻牌，等发牌
+    const auto s2 = texas::HoldemGame::next(s1, texas::Move{texas::Move::CheckCall, 0});
+    CHECK(s2.street == 1);
+    CHECK(s2.pendingDeal == 3);
+    CHECK(texas::HoldemGame::needsChance(s2));
+    CHECK(!texas::HoldemGame::isTerminal(s2));
+
+    // 发翻牌后由大盲（非按钮）先行动
+    std::mt19937_64 rng(1);
+    texas::HoldemGame::State s3 = s2;
+    texas::HoldemGame::deal(s3, rng);
+    CHECK(s3.boardCount == 3);
+    CHECK(!texas::HoldemGame::needsChance(s3));
+    CHECK(s3.player == 1);
+
+    // 无人下注时不允许弃牌（弃牌只在面对下注时合法）
+    texas::Move f[6];
+    const int fn = texas::HoldemGame::actions(s3, f, 6);
+    CHECK(fn == 4);  // 过牌 + 两个下注尺度 + all-in
+    CHECK(f[0].kind == texas::Move::CheckCall);
+    for (int i = 0; i < fn; ++i) CHECK(f[i].kind != texas::Move::Fold);
+
+    std::printf("  OK 盲注、行动顺序、翻牌发牌、无人下注不可弃牌\n");
+}
+
+void testHoldemShowdown() {
+    section("无限注德州 / 摊牌与弃牌");
+
+    // 两人都过牌到河牌，AA 对 KK
+    texas::HoldemGame::State s = texas::HoldemGame::init(2);
+    s.hole[0][0] = C("Ac");
+    s.hole[0][1] = C("Ad");
+    s.hole[1][0] = C("Kc");
+    s.hole[1][1] = C("Kd");
+    s.board[0] = C("2c");
+    s.board[1] = C("7d");
+    s.board[2] = C("9s");
+    s.board[3] = C("Jc");
+    s.board[4] = C("4h");
+    s.boardCount = 5;
+    s.street = 3;
+    s.finished = true;
+    s.contrib[0] = 10;
+    s.contrib[1] = 10;
+
+    CHECK(texas::HoldemGame::isTerminal(s));
+    const double u0 = texas::HoldemGame::utilityFrom(s, 0);
+    const double u1 = texas::HoldemGame::utilityFrom(s, 1);
+    std::printf("  AA vs KK 摊牌: P0=%+.1f P1=%+.1f\n", u0, u1);
+    CHECK_NEAR(u0, 10.0, 0.01);   // 赢走对方投入
+    CHECK_NEAR(u0 + u1, 0.0, 1e-9);
+
+    // 换成 P0 拿 5h3d（纯高牌，且不撞公共牌），应该输
+    s.hole[0][0] = C("5h");
+    s.hole[0][1] = C("3d");
+    CHECK_NEAR(texas::HoldemGame::utilityFrom(s, 0), -10.0, 0.01);
+
+    // 一方弃牌：弃牌方输掉自己已投入的部分
+    texas::HoldemGame::State f = texas::HoldemGame::init(2);
+    f.contrib[0] = 30;
+    f.contrib[1] = 10;
+    f.folded[0] = true;
+    CHECK_NEAR(texas::HoldemGame::utilityFrom(f, 0), -30.0, 0.01);
+    CHECK_NEAR(texas::HoldemGame::utilityFrom(f, 1), 30.0, 0.01);
+
+    std::printf("  OK 摊牌比牌、弃牌结算、零和\n");
+}
+
+void testHoldemSidePot() {
+    section("无限注德州 / 边池分配");
+
+    // 三人：P0 只投 50（短筹码），P1/P2 各投 100
+    // 主池 150（三人争）、边池 100（P1/P2 争）
+    texas::HoldemGame::State s;
+    s.numPlayers = 3;
+    s.board[0] = C("2c");
+    s.board[1] = C("7d");
+    s.board[2] = C("9s");
+    s.board[3] = C("Jc");
+    s.board[4] = C("4h");
+    s.boardCount = 5;
+    s.street = 3;
+    s.finished = true;
+    s.contrib[0] = 50;
+    s.contrib[1] = 100;
+    s.contrib[2] = 100;
+
+    // P0 最强（AA）但只有 50；P1 次之（KK）；P2 最弱（高牌）
+    s.hole[0][0] = C("Ac");
+    s.hole[0][1] = C("Ad");
+    s.hole[1][0] = C("Kc");
+    s.hole[1][1] = C("Kd");
+    s.hole[2][0] = C("5c");
+    s.hole[2][1] = C("6d");
+
+    double pay[6];
+    texas::HoldemGame::payouts(s, pay);
+    std::printf("  边池: P0=%+.1f P1=%+.1f P2=%+.1f\n", pay[0], pay[1], pay[2]);
+
+    CHECK_NEAR(pay[0], 100.0, 0.01);  // 赢主池 150，净 +100
+    CHECK_NEAR(pay[1], 0.0, 0.01);    // 赢边池 100 又付出 100
+    CHECK_NEAR(pay[2], -100.0, 0.01); // 全输
+    CHECK_NEAR(pay[0] + pay[1] + pay[2], 0.0, 1e-9);
+
+    // 让 P1 最强：主池和边池都归 P1
+    s.hole[1][0] = C("Ac");
+    s.hole[1][1] = C("Ah");
+    s.hole[0][0] = C("Kc");
+    s.hole[0][1] = C("Kd");
+    texas::HoldemGame::payouts(s, pay);
+    std::printf("  P1 最强: P0=%+.1f P1=%+.1f P2=%+.1f\n", pay[0], pay[1], pay[2]);
+    CHECK_NEAR(pay[1], 150.0, 0.01);  // 赢下全部 250，净 +150
+    CHECK_NEAR(pay[0], -50.0, 0.01);
+    CHECK_NEAR(pay[2], -100.0, 0.01);
+    CHECK_NEAR(pay[0] + pay[1] + pay[2], 0.0, 1e-9);
+
+    std::printf("  OK 主池/边池分层结算，三人零和\n");
+}
+
+void testHoldemAllIn() {
+    section("无限注德州 / all-in 一次发完");
+
+    texas::HoldemGame::State s = texas::HoldemGame::init(2);
+    s.hole[0][0] = C("Ac");
+    s.hole[0][1] = C("Ad");
+    s.hole[1][0] = C("Kc");
+    s.hole[1][1] = C("Kd");
+
+    // 小盲直接 all-in
+    texas::Move mv[6];
+    const int n = texas::HoldemGame::actions(s, mv, 6);
+    int allIn = -1;
+    for (int i = 0; i < n; ++i) {
+        if (mv[i].kind == texas::Move::Raise && mv[i].amount == texas::HoldemGame::kBuyIn) {
+            allIn = i;
+        }
+    }
+    CHECK(allIn >= 0);
+
+    const auto s1 = texas::HoldemGame::next(s, mv[allIn]);
+    CHECK(s1.contrib[0] == texas::HoldemGame::kBuyIn);
+    CHECK(s1.allIn[0]);
+
+    // 大盲跟注 all-in
+    const auto s2 = texas::HoldemGame::next(s1, texas::Move{texas::Move::CheckCall, 0});
+    CHECK(s2.contrib[1] == texas::HoldemGame::kBuyIn);
+    CHECK(s2.street == 3);
+    CHECK(s2.pendingDeal == 5);  // 一次把翻牌/转牌/河牌全发完
+    CHECK(texas::HoldemGame::needsChance(s2));
+
+    std::mt19937_64 rng(3);
+    texas::HoldemGame::State s3 = s2;
+    texas::HoldemGame::deal(s3, rng);
+    CHECK(s3.boardCount == 5);
+    CHECK(texas::HoldemGame::isTerminal(s3));
+
+    double pay[6];
+    texas::HoldemGame::payouts(s3, pay);
+    CHECK_NEAR(pay[0] + pay[1], 0.0, 1e-9);
+    CHECK_NEAR(std::fabs(pay[0]), static_cast<double>(texas::HoldemGame::kBuyIn), 0.01);
+
+    std::printf("  OK all-in 后一次发完 5 张公共牌并摊牌\n");
+}
+
+void testHoldemMCCFR() {
+    section("无限注德州 / MCCFR 求解");
+
+    // 牌力抽象：AA 必须落在最高桶，72o 落在最低桶
+    const texas::StrengthModel& model = texas::StrengthModel::instance();
+    const int bucketAA = model.preflopBucket(C("Ac"), C("Ad"), 10);
+    const int bucket72 = model.preflopBucket(C("7h"), C("2d"), 10);
+    const int bucketAKs = model.preflopBucket(C("Ah"), C("Kh"), 10);
+    std::printf("  桶: AA=%d AKs=%d 72o=%d\n", bucketAA, bucketAKs, bucket72);
+    CHECK(bucketAA > bucketAKs);   // AA 强于 AKs
+    CHECK(bucketAKs > bucket72);   // AKs 强于 72o
+    CHECK(bucketAA >= 7);          // AA 胜率约 85%，落在高桶
+    CHECK(bucket72 <= 4);          // 72o 胜率约 35%，落在低桶
+
+    texas::HoldemSolver solver(10, 20240518ULL);
+    const int rounds = 20000;
+    solver.iterate(rounds);
+    std::printf("  %d 轮后 infosets=%zu\n", rounds, solver.numInfosets());
+    CHECK(solver.numInfosets() > 100);
+
+    // 翻牌前小盲面对大盲：强牌应该比弱牌更常加注
+    auto probe = [&](const char* a, const char* b) {
+        texas::HoldemGame::State st = texas::HoldemGame::init(2);
+        st.hole[0][0] = C(a);
+        st.hole[0][1] = C(b);
+        return solver.averageStrategy(st);
+    };
+    const std::vector<double> pAA = probe("Ac", "Ad");
+    const std::vector<double> p72 = probe("7h", "2d");
+
+    double raiseAA = 0.0;
+    double raise72 = 0.0;
+    for (std::size_t i = 0; i < pAA.size(); ++i) {
+        if (i >= 2) raiseAA += pAA[i];  // 索引 0/1 是弃牌与跟注
+    }
+    for (std::size_t i = 0; i < p72.size(); ++i) {
+        if (i >= 2) raise72 += p72[i];
+    }
+    std::printf("  翻牌前加注率: AA=%.3f  72o=%.3f\n", raiseAA, raise72);
+    CHECK(raiseAA > raise72);
+    CHECK(raiseAA > 0.5);
+}
+
 }  // namespace
 
 int main() {
@@ -330,6 +570,11 @@ int main() {
     testExploitabilityBaseline();
     testLeduc();
     testVanillaVsPlus();
+    testHoldemRules();
+    testHoldemShowdown();
+    testHoldemSidePot();
+    testHoldemAllIn();
+    testHoldemMCCFR();
 
     std::printf("\n================================================\n");
     std::printf("通过 %d 项，失败 %d 项\n", g_passed, g_failed);

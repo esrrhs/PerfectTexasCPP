@@ -51,6 +51,9 @@ include/texas/
   leduc.hpp     Leduc Hold'em（6 张牌 + 公共牌 + 两轮下注，标准 benchmark）
   cfr.hpp       通用 CFR / CFR+ 求解器（模板）
   br.hpp        最优反应与可利用度（exploitability）
+  holdem.hpp    无限注德州规则引擎（四街、all-in、边池、摊牌）
+  strength.hpp  牌力抽象（169 类翻牌前 + 翻牌后分桶，可接 texas_algorithm 查表）
+  mccfr.hpp     无限注德州的 external sampling MCCFR 求解器
 src/main.cpp    CLI 入口
 tests/          自测（用解析解做硬断言）
 ```
@@ -78,6 +81,9 @@ mingw32-make -C build -j
 
 # 训练 Leduc，写出 CSV 方便画收敛曲线
 ./build/texas_cli solve leduc --iters 10000 --report 1000 --csv leduc.csv
+
+# 无限注德州（完整规则 + MCCFR）
+./build/texas_cli holdem --iters 50000
 
 # 对比 vanilla CFR
 ./build/texas_cli solve kuhn --iters 10000 --vanilla
@@ -152,17 +158,71 @@ exploitability = 0.001080   共 12 个信息集
 - 每轮最多 2 次加注（首次下注记作第 1 次），第二轮开始前翻 1 张公共牌
 - 成对（手牌 rank == 公共牌 rank）胜过非成对，都非成对时比 rank
 
-## 扩展到完整德州扑克
+## 无限注德州（完整规则）
 
-本仓库刻意停在 Leduc，因为它的均衡可以用表格精确求出，适合验证算法正确性。
-往完整无限注德州（HUNL）走，需要补三层：
+`holdem.hpp` 是完整的无限注德州规则引擎：
 
-1. **抽象**：HUNL 决策点约 10^160，必须压缩。牌力用 E[HS] 或 potential-aware 分桶，
-   下注尺度离散化到 3～5 个
-2. **函数近似**：抽象后仍有 10^7 量级，把遗憾表和策略表换成神经网络（Deep CFR），
-   用 external sampling 生成训练数据
-3. **实时子博弈求解**：只展开当前这一条街，用蓝图策略的价值作边界，秒级 re-solve
-   （DeepStack / Libratus 的做法）
+- 52 张牌、四条街（翻牌前 / 翻牌 / 转牌 / 河牌）
+- 无限注下注，每街最多 2 次加注，下注尺寸抽象为 半个底池 / 一个底池 / all-in
+- all-in 后一次发完剩余公共牌、**边池分层结算**、摊牌比牌，支持 2～6 人
+- 盲注、行动顺序、无人下注时不可弃牌等边界都有单测覆盖
 
-`cfr.hpp` 的求解器接口已经和游戏解耦，接入 HUNL 只需再写一个 `holdem.hpp` 实现同一套
-静态接口；`card.hpp` 里的 `evaluate7` 和 `equity.hpp` 可以直接用来做牌力分桶。
+### 为什么必须抽象
+
+HUNL 原始决策点约 10^160，这里做两层压缩：
+
+1. **牌力抽象**（`strength.hpp`）
+   - 翻牌前：169 类手牌，强度取对随机对手的蒙特卡洛胜率，分 10 桶
+   - 翻牌后：优先调用 `texas_algorithm` 的查表排名（`GetWinProbability`，约 280ns/次，
+     给出该手牌在所有同张数组合中的精确百分位）；未启用时回退到牌型 + 踢脚启发式
+2. **动作抽象**（`holdem.hpp`）：每个决策点最多 5 个动作
+
+### 求解器
+
+`mccfr.hpp` 用 external sampling MCCFR：轮到 traverser 展开全部动作，对手和机会节点各采样一个。
+全树遍历不可行——光翻牌就有 C(48,3)=17296 种组合。
+
+信息集 =（街，牌力桶，下注历史），这才让"具体手牌"塌缩成有限状态。
+
+### 用法
+
+```bash
+# 零依赖构建（内置启发式牌力）
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+./build/texas_cli holdem --iters 50000
+
+# 启用 texas_algorithm 查表后端（翻牌后约 11000 轮/秒）
+cmake -S . -B build_ta -DCMAKE_BUILD_TYPE=Release \
+      -DTEXAS_CFR_WITH_ALGORITHM=ON \
+      -DTEXAS_ALGORITHM_DIR=../texas_algorithm/cpp
+cmake --build build_ta -j
+./build_ta/texas_cli holdem --iters 50000 --ta-data /path/to/texas_data
+```
+
+输出：
+
+```
+  牌力桶 10 | 牌力后端: texas_algorithm 查表
+        iter    infosets       轮/s
+       20000        9269       11353
+
+  翻牌前（小盲/按钮面对大盲）平均策略:
+    AA      fold=0.01  call=0.68  r4=0.14  r5=0.08  r200=0.09
+    AKs     fold=0.01  call=0.41  r4=0.08  r5=0.32  r200=0.17
+    72o     fold=0.79  call=0.04  r4=0.06  r5=0.07  r200=0.04
+```
+
+### 已验证
+
+- 盲注、行动顺序、翻牌发牌、无人下注不可弃牌
+- 摊牌比牌、弃牌结算、两人零和
+- 三人边池：主池 150 由三人争、边池 100 由 P1/P2 争，两种赢家情形下净收益和均为 0
+- all-in 后一次发完 5 张公共牌并摊牌
+- 牌力抽象单调：AA(桶 8) > AKs(6) > 22(3) > 72o(3)
+- 训练后 AA 加注率 0.66、72o 0.13，方向与扑克直觉一致
+
+### 还没做的
+
+- 这里的 MCCFR 只到"趋势正确"，没到可利用度可测的水平。真正对抗职业选手还需要
+  蓝图策略 + 实时子博弈求解（DeepStack / Libratus 路线）和 GPU 级算力。
+- 牌力抽象用的是简单胜率分位，更细的做法是 potential-aware 或 OSS 分桶。
