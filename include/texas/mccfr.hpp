@@ -39,6 +39,12 @@ enum class CfrVariant { CFRPlus, DCFR };
 struct HoldemAbstraction {
     int buckets = 20;
 
+    // 应对方能否看见对手的下注额。true 用带尺寸的历史哈希，false 用抹掉尺寸的那个。
+    // 这看起来是个无害的粒度选择，其实是信息划分里最容易出错的一维：设成 false 时
+    // "加注到 5"和"加注到 200"对应同一个信息集，应对方被迫用同一套动作分布应付
+    // 小额加注和全下两种完全不同的局面。默认必须是 true。
+    bool sizedHistory = true;
+
     int bucketOf(const HoldemGame::State& s, int p) const {
         const StrengthModel& m = StrengthModel::instance();
         if (s.boardCount < 3) {
@@ -52,8 +58,9 @@ struct HoldemAbstraction {
 
     std::uint64_t infosetIdWithBucket(const HoldemGame::State& s, int bucket) const {
         const int p = s.player;
-        // histHash 在 next() 里增量维护，这里 O(1) 取用，不用重新哈希整个历史
-        std::uint64_t h = s.histHash;
+        // histHash / histSizedHash 在 next() 里增量维护，这里 O(1) 取用，
+        // 不用重新哈希整个历史
+        std::uint64_t h = sizedHistory ? s.histSizedHash : s.histHash;
         h ^= static_cast<std::uint64_t>(bucket + 1) * 0x9E3779B97F4A7C15ULL;
         h ^= static_cast<std::uint64_t>(s.street + 1) * 0xC2B2AE3D27D4EB4FULL;
         h ^= static_cast<std::uint64_t>(p + 1) * 0x165667B19E3779F9ULL;
@@ -210,10 +217,13 @@ class HoldemSolver {
 public:
     using InfoSet = InfoSetData;
 
+    // sizedHistory 只能在造对象时定：训练中途改它会瞬间把所有键对到另一套表上，
+    // 已有的遗憾和平均策略全部失效。
     explicit HoldemSolver(int buckets = 20, std::uint64_t seed = 20240518ULL,
-                          CfrVariant variant = CfrVariant::DCFR)
+                          CfrVariant variant = CfrVariant::DCFR, bool sizedHistory = true)
         : rng_(seed), variant_(variant) {
         abstraction_.buckets = buckets;
+        abstraction_.sizedHistory = sizedHistory;
     }
 
     void iterate(int rounds) {

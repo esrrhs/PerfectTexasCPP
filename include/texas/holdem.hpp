@@ -67,17 +67,47 @@ struct HoldemGame {
         static constexpr int kHistCap = 64;
         char hist[kHistCap] = {};
         int histLen = 0;
+
+        // 两个历史哈希，只在下注额这一维上不同：
+        //   histHash      只含动作字符（'f' / 'c' / 'k' / 'r' / '/'）。加注额被抹掉。
+        //   histSizedHash 在上面的基础上再混入每次加注后的本街投入额。
+        // 为什么要同时维护：这两者对应两种信息划分，而"哪种更好"只能靠对打回答。
+        // 让抽象挑一个（HoldemAbstraction::sizedHistory），就能在同一进程里训练两个
+        // 求解器并用 headToHead 直接对打。多一个 uint64 的代价是每次动作一次乘加，
+        // 在 63 ns/节点的量级上测不出来。
         std::uint64_t histHash = 0;
+        std::uint64_t histSizedHash = 0;
 
         void pushHist(char c) {
             if (histLen < kHistCap - 1) hist[histLen++] = c;
-            histHash ^= static_cast<std::uint64_t>(static_cast<unsigned char>(c));
+            const std::uint64_t v = static_cast<std::uint64_t>(static_cast<unsigned char>(c));
+            histHash ^= v;
             histHash *= 1099511628211ULL;
+            histSizedHash ^= v;
+            histSizedHash *= 1099511628211ULL;
+        }
+
+        // 加注额必须能被应对方看见。早先所有加注都只推一个 'r'，于是"加注到 5"、
+        // "加注到 8" 和"加注到 200"产生完全相同的历史哈希 —— 应对方拿到的是**同一个
+        // 信息集**，也就是它根本分不清面对的是小额加注还是 100BB 全下，只能对这两种
+        // 截然不同的局面强行用同一套动作分布。这是比任何调参都严重的结构性缺陷。
+        //
+        // 这不是边角情况：枚举可达树，4442 个动作字符序列里有 3796 个（85.5%）背后
+        // 藏着多个不同的筹码局面，平均每个藏着 11.1 个，最坏的一个藏 36 个。
+        //
+        // 混入的是加注后的本街投入。也可以混"这是第几个加注按钮"，两者对信息集的切分
+        // 是等价的（尺寸由状态唯一决定，投入额与按钮号互相可推），选投入额是因为它
+        // 不依赖动作集的定义——将来换掉下注尺寸表，这里不用跟着改。
+        void mixRaiseSize(int roundContribAfter) {
+            histSizedHash ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(roundContribAfter));
+            histSizedHash *= 1099511628211ULL;
+            histSizedHash ^= histSizedHash >> 29;
         }
 
         void setHist(const char* s) {
             histLen = 0;
             histHash = 0;
+            histSizedHash = 0;
             for (; *s != '\0'; ++s) pushHist(*s);
         }
 
@@ -240,6 +270,7 @@ struct HoldemGame {
             ++t.raises;
             ++t.acts;
             t.pushHist('r');
+            t.mixRaiseSize(t.roundContrib[p]);
         }
 
         for (int i = 0; i < t.numPlayers; ++i) {

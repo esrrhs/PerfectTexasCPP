@@ -785,11 +785,150 @@ void testHoldemAbstraction() {
     std::printf("  OK 牌力抽象（评测器等价 / 翻牌前 169 类 / 听牌潜力修正 / 牌型分桶）\n");
 }
 
+void testHoldemInfosetPartition() {
+    section("无限注德州 / 信息集划分：应对方必须看得见下注额");
+
+    texas::StrengthModel::instance();
+
+    // 造一手固定的牌，避免桶把键搅乱（翻牌前用的是 preflopClass，与下注无关）
+    auto fresh = [] {
+        texas::HoldemGame::State s = texas::HoldemGame::init(2);
+        s.hole[0][0] = C("Ac");
+        s.hole[0][1] = C("Ad");
+        s.hole[1][0] = C("7h");
+        s.hole[1][1] = C("2d");
+        return s;
+    };
+
+    // 小盲加注到不同尺寸后，大盲面对的必须是不同信息集。
+    // 这里的 5 / 8 / 200 是 2.5x、4x 和全下，是三个完全不同的局面。
+    texas::HoldemAbstraction sized;               // 默认 sizedHistory = true
+    texas::HoldemAbstraction flat;
+    flat.sizedHistory = false;
+    CHECK(sized.sizedHistory);
+    CHECK(!flat.sizedHistory);
+
+    {
+        const int totals[3] = {5, 8, 200};
+        std::uint64_t ks[3];
+        std::uint64_t kf[3];
+        int contribs[3];
+        for (int i = 0; i < 3; ++i) {
+            const texas::HoldemGame::State s =
+                texas::HoldemGame::next(fresh(), texas::Move{texas::Move::Raise, totals[i]});
+            ks[i] = sized.infosetId(s);
+            kf[i] = flat.infosetId(s);
+            contribs[i] = s.contrib[0];
+            std::printf("  加注到 %-3d -> 投入 %-3d 看得见键 %016llx  看不见键 %016llx\n", totals[i],
+                        contribs[i], static_cast<unsigned long long>(ks[i]),
+                        static_cast<unsigned long long>(kf[i]));
+        }
+        // 三个局面确实不同（否则这个测试本身没意义）
+        CHECK(contribs[0] != contribs[1] && contribs[1] != contribs[2] && contribs[0] != contribs[2]);
+        // 看不见尺寸时三者塌成同一个键——这正是那个缺陷的表现
+        CHECK(kf[0] == kf[1] && kf[1] == kf[2]);
+        // 看得见时必须三者互不相同
+        CHECK(ks[0] != ks[1]);
+        CHECK(ks[1] != ks[2]);
+        CHECK(ks[0] != ks[2]);
+    }
+
+    // 同一个决策节点下的三个加注动作，字符历史都是 'r'，但局面不同。
+    // 这条断言直接盯着"历史里只有字符"这个失信息的机制。
+    {
+        texas::HoldemGame::State s = fresh();
+        texas::Move mv[texas::HoldemGame::kMaxActions];
+        const int na = texas::HoldemGame::actions(s, mv, texas::HoldemGame::kMaxActions);
+        int raiseCount = 0;
+        int distinctSized = 0;
+        int distinctFlat = 0;
+        int distinctChars = 0;
+        std::uint64_t firstSized = 0;
+        std::uint64_t firstFlat = 0;
+        std::string firstStr;
+        for (int i = 0; i < na; ++i) {
+            if (mv[i].kind != texas::Move::Raise) continue;
+            const texas::HoldemGame::State t = texas::HoldemGame::next(s, mv[i]);
+            const std::uint64_t ks = sized.infosetId(t);
+            const std::uint64_t kf = flat.infosetId(t);
+            const std::string str = t.histString();
+            if (raiseCount == 0) {
+                firstSized = ks;
+                firstFlat = kf;
+                firstStr = str;
+            } else {
+                if (ks != firstSized) ++distinctSized;
+                if (kf != firstFlat) ++distinctFlat;
+                if (str != firstStr) ++distinctChars;
+            }
+            ++raiseCount;
+        }
+        std::printf("  同一节点的加注动作 %d 个\n", raiseCount);
+        // 引擎当前给出的加注动作数：2.5x / 4x / 全下
+        CHECK(raiseCount == 3);
+        // 可读历史字符串完全一样（都是 "r"），这正是缺陷的机制
+        CHECK(distinctChars == 0);
+        CHECK(distinctSized == 2);  // 三个带尺寸键两两不同
+        CHECK(distinctFlat == 0);   // 看不见尺寸时全部相同
+    }
+
+    // 不变的恒等式：没有加注的历史上，两个哈希必须逐位相同。
+    // 这条保证"抹掉尺寸"只在加注处丢信息，不会莫名其妙地额外改动别的东西。
+    {
+        int checked = 0;
+        int mismatch = 0;
+        // 只有过牌/跟注/弃牌的路径
+        texas::HoldemGame::State s = fresh();
+        for (int i = 0; i < 12 && !texas::HoldemGame::isTerminal(s); ++i) {
+            if (texas::HoldemGame::needsChance(s)) {
+                texas::Card b[5] = {C("Ks"), C("7c"), C("2d"), C("9h"), C("3s")};
+                texas::HoldemGame::reveal(s, b);
+            } else {
+                texas::HoldemGame::State t =
+                    texas::HoldemGame::next(s, texas::Move{texas::Move::CheckCall, 0});
+                // CheckCall 在引擎内部可能是跟注（'c'）也可能是过牌（'k'），两者都不碰尺寸哈希
+                if (t.histHash != t.histSizedHash) ++mismatch;
+                ++checked;
+                s = t;
+            }
+        }
+        std::printf("  无加注路径上检查了 %d 步，两哈希不一致 %d 处\n", checked, mismatch);
+        CHECK(checked > 3);
+        CHECK(mismatch == 0);
+    }
+
+    // 哈希格式一旦改变，所有已存的模型文件都会读不出来（键全变），所以把定义钉在这里。
+    // 下面这段是 pushHist 的规格说明，不是"顺手抄一遍实现"。
+    {
+        const texas::HoldemGame::State s =
+            texas::HoldemGame::next(fresh(), texas::Move{texas::Move::Raise, 8});
+        std::uint64_t h = 0;
+        for (const char* p = "r"; *p != '\0'; ++p) {
+            h ^= static_cast<std::uint64_t>(static_cast<unsigned char>(*p));
+            h *= 1099511628211ULL;
+        }
+        std::printf("  手动折算出无尺寸哈希 %016llx，引擎 %016llx\n",
+                    static_cast<unsigned long long>(h),
+                    static_cast<unsigned long long>(s.histHash));
+        CHECK(s.histHash == h);
+        // 有尺寸的那个必须与之不同（否则说明 mixRaiseSize 没被调用）
+        CHECK(s.histSizedHash != s.histHash);
+    }
+
+    std::printf("  OK 信息集划分（尺寸可见 / 抹掉尺寸时塌缩 / 恒等式 / 哈希格式固定）\n");
+}
+
 void testHoldemSolverVariants() {
     section("无限注德州 / 遗憾折扣与模型存盘");
 
     // DCFR 的核心好处是同一轮数下"当前策略"离均衡更近，用遗憾上界直接量。
-    // 实测同种子下 DCFR/CFR+ 的比值随轮数单调下降：4万=0.51 10万=0.42 20万=0.37。
+    //
+    // 阈值随信息划分变过：修好"看不见下注额"的缺陷后，树大了 15 倍（3.8 万 -> 59 万
+    // 信息集），10 万轮摊薄到每个信息集上就不够了，比值从 <0.55 抬到 0.72。
+    // 这不是 DCFR 变差——比值随预算单调下降：10万=0.720 20万=0.638 50万=0.554 100万=0.503，
+    // 且同预算对打 DCFR 在 10万/20万/50万/100万 分别 +1.96/+1.32/+1.08/+1.06 筹码每手
+    // （6.7~9.0 sigma）。所以这里断言 0.80，并把上界随预算下降的趋势交给下面第二个块管。
+    // 10 万轮 20 桶、6 个种子的实测比值区间是 0.706~0.747，取 0.80 留了余量。
     {
         texas::HoldemSolver plus(20, 20240518ULL, texas::CfrVariant::CFRPlus);
         texas::HoldemSolver dcfr(20, 20240518ULL, texas::CfrVariant::DCFR);
@@ -797,7 +936,7 @@ void testHoldemSolverVariants() {
         dcfr.iterate(100000);
         std::printf("  10 万轮遗憾上界: CFR+=%.2f DCFR=%.2f（比值 %.2f）\n", plus.regretBound(),
                     dcfr.regretBound(), dcfr.regretBound() / plus.regretBound());
-        CHECK(dcfr.regretBound() < plus.regretBound() * 0.55);
+        CHECK(dcfr.regretBound() < plus.regretBound() * 0.80);
     }
 
     // 遗憾上界应随轮数下降，否则说明折扣因子算错了（比如把 t 写成常数）
@@ -892,14 +1031,15 @@ void testHoldemMCCFR() {
 
     std::printf("  翻牌前: AA raise=%.3f fold=%.3f | 72o raise=%.3f fold=%.3f\n", raiseAA, foldAA,
                 raise72, fold72);
-    // 阈值由实测支撑，不是估计：8 个种子各跑 50 万轮，
-    //   AA 弃牌率恒为 0.000；72o 弃牌最低 0.725；raiseAA > raise72 在 8/8 个种子上成立。
-    // 但"raiseAA 是 raise72 的几倍"**不稳定**：同样 8 个种子，比值分布在 1.6 到 52 之间
-    // （种子 1 是 1.6，种子 12345 是 52）。所以这里只断言序关系和弃牌率，
-    // 不断言倍数——早先写过 `raiseAA > raise72 * 2.0`，那条会随随机流假警报。
-    CHECK(raiseAA > raise72);  // 8/8 成立，最紧的一次是 1.6 倍
-    CHECK(foldAA < 0.01);      // AA 几乎不弃牌（8 个种子实测全为 0.000）
-    CHECK(fold72 > 0.60);      // 72o 大部分直接弃（8 个种子最低 0.725）
+    // 阈值由实测支撑，不是估计。8 个种子各跑 50 万轮（含尺寸可见的信息划分）：
+    //   AA 弃牌率最高 0.0020；72o 弃牌最低 0.921；raiseAA > raise72 在 8/8 个种子上成立，
+    //   最紧的一次是 5.84 倍。
+    // 但"raiseAA 是 raise72 的几倍"**仍然不稳定**：同样 8 个种子，比值分布在 5.84 到 1084
+    // 之间（种子 2024 是 5.84，种子 999983 是 1084——分母已经接近 0）。所以这里只断言
+    // 序关系和弃牌率，不断言倍数：早先写过 `raiseAA > raise72 * 2.0`，那条会随随机流假警报。
+    CHECK(raiseAA > raise72);  // 8/8 成立，最紧的一次是 5.84 倍
+    CHECK(foldAA < 0.01);      // AA 几乎不弃牌（8 个种子最高 0.0020）
+    CHECK(fold72 > 0.85);      // 72o 大部分直接弃（8 个种子最低 0.921）
 }
 
 }  // namespace
@@ -920,6 +1060,7 @@ int main() {
     testHoldemScoreCache();
     testHoldemAllIn();
     testHoldemAbstraction();
+    testHoldemInfosetPartition();
     testHoldemSolverVariants();
     testHoldemMCCFR();
 

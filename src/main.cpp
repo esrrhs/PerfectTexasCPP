@@ -73,7 +73,7 @@ void usage() {
         "  texas_cli demo\n"
         "\n"
         "选项:\n"
-        "  --iters N    迭代轮数（kuhn 默认 20000，leduc 默认 10000，holdem 默认 500000）\n"
+        "  --iters N    迭代轮数（kuhn 默认 20000，leduc 默认 10000，holdem 默认 1000000）\n"
         "  --report M   每隔多少轮报告一次（默认 iters/10）\n"
         "  --csv FILE   把 (iter,exploitability,value) 曲线写成 CSV\n"
         "  --vanilla    用原始 CFR 而不是 CFR+\n"
@@ -291,7 +291,10 @@ const char* variantName(texas::CfrVariant v) {
 }
 
 int runHoldem(const Args& a) {
-    const int iters = (a.iters > 0) ? a.iters : 500000;
+    // 默认 100 万轮。这个数不是拍脑袋：修好信息集划分后（树大了 15 倍），
+    // 以固定的旧模型为标尺测强度曲线是 12.5万+1.04 / 25万+1.78 / 50万+2.06 /
+    // 100万+2.51 / 200万+2.40（筹码每手），100 万到 200 万已经在噪声里。
+    const int iters = (a.iters > 0) ? a.iters : 1000000;
     const int buckets = (a.buckets > 0) ? a.buckets : 20;
     const int report = (a.report > 0) ? a.report : std::max(1, iters / 10);
     const int evHands = (a.evHands >= 0) ? a.evHands : 20000;
