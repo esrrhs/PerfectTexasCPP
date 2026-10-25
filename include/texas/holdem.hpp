@@ -32,6 +32,123 @@ struct Move {
     int amount = 0;
 };
 
+// 动作抽象：一次性决定"每街给几档加注尺寸、各是多大"。
+//
+// 早先尺寸是写死在 actions() 里的，于是"哪种加注尺寸更好"这件事根本测不了——
+// 一套二进制只能用一套动作集。做成参数之后可以训练多套动作集并互相对打。
+//
+// 上限由 kMaxActions 决定：弃牌 + 跟注占 2 个，all-in 占 1 个，最多剩 3 档尺寸。
+struct ActionSpace {
+    static constexpr int kMaxSizes = 3;
+
+    // 翻牌前：加注到 (当前最大本街投入 × mul1000 / 1000)。
+    // 默认 {2500, 4000} = 2.5 倍 / 4 倍，与早期的 maxRC + (maxRC*3)/2、maxRC*4
+    // 逐位等价（对奇数 maxRC 也相等：x + floor(1.5x) == floor(2.5x)）。
+    int preflopMul1000[kMaxSizes] = {2500, 4000, 2500};
+    int preflopCount = 2;
+
+    // 翻牌后：加注到 (当前最大 + 底池 × frac1000 / 1000)。
+    // 默认 {500, 1000} = 半池 / 一池。
+    int postflopFrac1000[kMaxSizes] = {500, 1000, 500};
+    int postflopCount = 2;
+
+    // all-in 单独算一个动作，避免被比例尺寸吞掉
+    bool includeAllIn = true;
+};
+
+// 两个动作集是否描述同一个博弈。只比 actions() 真正读的字段——直接 memcmp
+// 会踩到结构体的填充字节，那几位是没有定义的。
+inline bool sameActionSpace(const ActionSpace& x, const ActionSpace& y) {
+    if (x.preflopCount != y.preflopCount || x.postflopCount != y.postflopCount) return false;
+    if (x.includeAllIn != y.includeAllIn) return false;
+    for (int i = 0; i < x.preflopCount; ++i) {
+        if (x.preflopMul1000[i] != y.preflopMul1000[i]) return false;
+    }
+    for (int i = 0; i < x.postflopCount; ++i) {
+        if (x.postflopFrac1000[i] != y.postflopFrac1000[i]) return false;
+    }
+    return true;
+}
+
+// 具名动作集。定义只有一份：名字→动作集与动作集→名字都读它。
+//
+// 这两张表各自漂移过一次，很安静：`--sizes three --load 某文件` 时动作集以文件为准
+// （正确的行为），但打印用的是命令行那个字符串，于是输出写着 "three"、后面跟着
+// "翻牌前 2 档"，看上去自相矛盾却没报错。往返测试（testActionSpaceNaming）钉住它。
+struct ActionPreset {
+    const char* name;
+    ActionSpace space;
+};
+
+inline const std::vector<ActionPreset>& actionPresets() {
+    static const std::vector<ActionPreset> table = [] {
+        std::vector<ActionPreset> t;
+        t.push_back({"default", ActionSpace{}});
+        {
+            ActionSpace s;
+            s.preflopCount = 1;
+            s.postflopCount = 1;
+            t.push_back({"one", s});
+        }
+        {
+            ActionSpace s;
+            s.preflopCount = 3;
+            s.preflopMul1000[0] = 2000;
+            s.preflopMul1000[1] = 3000;
+            s.preflopMul1000[2] = 5000;
+            s.postflopCount = 3;
+            s.postflopFrac1000[0] = 333;
+            s.postflopFrac1000[1] = 750;
+            s.postflopFrac1000[2] = 1500;
+            t.push_back({"three", s});
+        }
+        {
+            ActionSpace s;
+            s.includeAllIn = false;
+            t.push_back({"nojam", s});
+        }
+        {
+            ActionSpace s;
+            s.preflopMul1000[0] = 2000;
+            s.preflopMul1000[1] = 3000;
+            s.postflopFrac1000[0] = 333;
+            s.postflopFrac1000[1] = 750;
+            t.push_back({"small", s});
+        }
+        {
+            ActionSpace s;
+            s.preflopMul1000[0] = 3000;
+            s.preflopMul1000[1] = 5000;
+            s.postflopFrac1000[0] = 1000;
+            s.postflopFrac1000[1] = 2000;
+            t.push_back({"big", s});
+        }
+        return t;
+    }();
+    return table;
+}
+
+// 名字 → 动作集。返回 false 表示名字不认识（此时 out 是默认动作集）。
+inline bool actionPreset(const std::string& name, ActionSpace& out) {
+    for (const ActionPreset& p : actionPresets()) {
+        if (name == p.name) {
+            out = p.space;
+            return true;
+        }
+    }
+    out = ActionSpace{};
+    return false;
+}
+
+// 动作集 → 名字。**按内容反查，不能回显用户输入**：读盘时动作集以文件里的值为准，
+// 命令行那个字符串此刻已经不是实际在跑的东西了。认不出来就返回 "custom"。
+inline const char* actionSpaceName(const ActionSpace& sp) {
+    for (const ActionPreset& p : actionPresets()) {
+        if (sameActionSpace(p.space, sp)) return p.name;
+    }
+    return "custom";
+}
+
 struct HoldemGame {
     static constexpr int kMaxPlayers = 6;
     static constexpr int kSmallBlind = 1;
@@ -201,7 +318,7 @@ struct HoldemGame {
     //
     // 每条街允许 kMaxRaises 次加注，保证翻牌前的加注战（open → 3-bet →
     // 4-bet）真的能打到，而不是第二次加注之后就只能全下。
-    static int actions(const State& s, Move* out, int maxOut) {
+    static int actions(const State& s, Move* out, int maxOut, const ActionSpace& space) {
         if (isTerminal(s) || needsChance(s)) return 0;
         const int p = s.player;
         if (p < 0) return 0;
@@ -225,21 +342,25 @@ struct HoldemGame {
             };
 
             if (s.street == 0) {
-                // 翻牌前：2.5x / 4x 当前最大投入
-                emitRaise(maxRC + (maxRC * 3) / 2);
-                emitRaise(maxRC * 4);
+                for (int i = 0; i < space.preflopCount && i < ActionSpace::kMaxSizes && n < maxOut; ++i) {
+                    emitRaise((maxRC * space.preflopMul1000[i]) / 1000);
+                }
             } else {
-                // 翻牌后：半池 / 一池
                 const int potNow = pot(s);
-                emitRaise(maxRC + std::max(kBigBlind, potNow / 2));
-                emitRaise(maxRC + std::max(kBigBlind, potNow));
+                for (int i = 0; i < space.postflopCount && i < ActionSpace::kMaxSizes && n < maxOut; ++i) {
+                    emitRaise(maxRC + std::max(kBigBlind, (potNow * space.postflopFrac1000[i]) / 1000));
+                }
             }
-            // all-in 单独作为一个动作，避免被比例尺寸吞掉
-            if (n < maxOut && s.contrib[p] < kBuyIn) {
+            if (space.includeAllIn && n < maxOut && s.contrib[p] < kBuyIn) {
                 out[n++] = Move{Move::Raise, kBuyIn};
             }
         }
         return n;
+    }
+
+    // 默认动作集，保持老调用点不变
+    static int actions(const State& s, Move* out, int maxOut) {
+        return actions(s, out, maxOut, ActionSpace{});
     }
 
     // ---------- 状态转移 ----------

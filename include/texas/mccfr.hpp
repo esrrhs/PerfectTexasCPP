@@ -45,6 +45,9 @@ struct HoldemAbstraction {
     // 小额加注和全下两种完全不同的局面。默认必须是 true。
     bool sizedHistory = true;
 
+    // 每街给几档加注尺寸、各是多大。默认值等于历史行为（2.5x/4x、半池/一池、含 all-in）。
+    ActionSpace actionSpace;
+
     int bucketOf(const HoldemGame::State& s, int p) const {
         const StrengthModel& m = StrengthModel::instance();
         if (s.boardCount < 3) {
@@ -83,6 +86,13 @@ struct InfoSetData {
 class InfoSetTable {
 public:
     InfoSetData& get(std::uint64_t key) {
+        // 插入前先保证有余量。以前靠调用方"每轮预留够多"这条约定（prepare(256)），
+        // 一旦某轮新增的信息集超过预留量，表会被填满，下面的线性探测就**永远**
+        // 找不到空槽——直接死循环，而且采样剖析会把它算进调用者身上，很难定位。
+        // 3 档动作集一轮能新增 330 个，正好踩中这个坑。
+        if ((size_ + 1) * 10 >= slots_.size() * 7) {
+            rehash(slots_.empty() ? 1024 : slots_.size() * 2);
+        }
         std::size_t i = mix(key) & mask_;
         for (;;) {
             Slot& sl = slots_[i];
@@ -109,16 +119,20 @@ public:
         }
     }
 
-    // 在两轮遍历之间腾出 extra 个空位，保证这一轮遍历内不会扩容（引用稳定）
+    // 在两轮遍历之间腾出 extra 个空位。只是性能优化：有了 get() 里的自动扩容，
+    // 即使预留不足也不会死循环，只是那一轮会多一次扩容 + 一次重新取引用。
     void prepare(std::size_t extra) {
-        // 容量必须能装下 size_+extra 且负载不超过 0.7，所以可能一次要翻好几倍；
-        // 只翻一倍会让 get() 在表满后死循环，读盘时尤其明显
         while (slots_.empty() || (size_ + extra) * 10 >= slots_.size() * 7) {
             rehash(slots_.empty() ? 1024 : slots_.size() * 2);
         }
     }
 
     std::size_t size() const { return size_; }
+
+    // 扩容代数。traverse 在递归前后比一次：只有真的扩容过，它手里的引用才失效。
+    // 直接每次都重新查表会让大表上每个 traverser 节点多一次 cache miss，
+    // 实测 100 万轮慢 15% 左右；比代数几乎不要钱。
+    std::size_t generation() const { return generation_; }
 
     // 所有信息集的正遗憾之和。除以迭代轮数就是平均外部遗憾的上界，
     // 也是"当前策略"离均衡多远的廉价指标（收敛时应按 1/sqrt(T) 下降）。
@@ -146,6 +160,7 @@ public:
         slots_.clear();
         mask_ = 0;
         size_ = 0;
+        ++generation_;
     }
 
 private:
@@ -165,6 +180,7 @@ private:
     }
 
     void rehash(std::size_t cap) {
+        ++generation_;
         std::vector<Slot> old = std::move(slots_);
         slots_.assign(cap, Slot{});
         mask_ = cap - 1;
@@ -181,6 +197,7 @@ private:
     std::vector<Slot> slots_;
     std::size_t mask_ = 0;
     std::size_t size_ = 0;
+    std::size_t generation_ = 0;
 };
 
 // 给两位玩家各发两张底牌
@@ -226,6 +243,10 @@ public:
         abstraction_.sizedHistory = sizedHistory;
     }
 
+    // 换动作集。**必须在第一次 iterate() 之前调用**：动作集决定合法动作个数，
+    // 而信息集里存的就是"每个动作一个遗憾值"，中途换会让 n 对不上、旧数据全部作废。
+    void setActionSpace(const ActionSpace& space) { abstraction_.actionSpace = space; }
+
     void iterate(int rounds) {
         for (int i = 0; i < rounds; ++i) {
             ++iter_;
@@ -240,8 +261,9 @@ public:
                 const double q = t / (t + 1.0);
                 avgDiscount_ = q * q;
             }
-            // 一轮最多新增 152 个信息集，留 256 余量后本轮就不再扩容
-            isets_.prepare(256);
+            // 预留量按上一轮实际新增量自适应，别写死。写死 256 时，3 档动作集
+            // 一轮能新增 330 个信息集，直接把表填满（见 get() 里的注释）。
+            isets_.prepare(perRoundReserve_);
             HoldemGame::State root = HoldemGame::init(2);
             dealHoles(root, rng_);
             // 整副公共牌在根节点一次抽定：与逐街抽牌的联合分布相同，但整棵树共用
@@ -249,14 +271,18 @@ public:
             sampleFullBoard(root);
             // 交替更新，每轮只让一个玩家做 traverser
             const int traverser = iter_ & 1;
+            const std::size_t before = isets_.size();
             traverse(root, traverser, 1.0);
+            const std::size_t added = isets_.size() - before;
+            if (added > perRoundReserve_) perRoundReserve_ = added * 2;
         }
     }
 
     // 写入 out（至少 HoldemGame::kMaxActions 个元素），返回动作个数
     int fillAverageStrategy(const HoldemGame::State& s, double* out, int maxOut) const {
         Move moves[HoldemGame::kMaxActions];
-        const int na = HoldemGame::actions(s, moves, HoldemGame::kMaxActions);
+        const int na =
+            HoldemGame::actions(s, moves, HoldemGame::kMaxActions, abstraction_.actionSpace);
         const int n = std::min(na, maxOut);
         if (n <= 0) return 0;
         const InfoSetData* is = isets_.find(abstraction_.infosetId(s));
@@ -318,7 +344,8 @@ public:
                     continue;
                 }
                 Move moves[HoldemGame::kMaxActions];
-                const int na = HoldemGame::actions(s, moves, HoldemGame::kMaxActions);
+                const int na =
+            HoldemGame::actions(s, moves, HoldemGame::kMaxActions, abstraction_.actionSpace);
                 if (na <= 0) break;
                 int pick;
                 if (s.player == heroSeat) {
@@ -344,15 +371,30 @@ public:
         std::FILE* f = std::fopen(path, "wb");
         if (f == nullptr) return false;
         const std::uint32_t magic = 0x54434652u;  // "TCFR"
-        const std::uint32_t ver = 3;
+        // 版本 4 起把抽象参数也写进去。必须存：信息集键是从"当前抽象"算出来的，
+        // 读盘时若桶数/尺寸可见性/动作集与存盘时不同，所有键都对不上，会静默退化成
+        // 均匀策略。这种错误比读不出来更难查。
+        const std::uint32_t ver = 4;
         const std::uint64_t cnt = static_cast<std::uint64_t>(isets_.size());
         const std::uint64_t iters = static_cast<std::uint64_t>(iter_);
+        const std::int32_t buckets = abstraction_.buckets;
+        const std::int32_t sized = abstraction_.sizedHistory ? 1 : 0;
+        const std::int32_t allin = abstraction_.actionSpace.includeAllIn ? 1 : 0;
         std::fwrite(&magic, sizeof(magic), 1, f);
         std::fwrite(&ver, sizeof(ver), 1, f);
         std::fwrite(&cnt, sizeof(cnt), 1, f);
         // 轮数必须存下来：DCFR 的折扣因子依赖 t，断点续训要接着原来的 t 走；
         // 另外读盘后遗憾上界 = 正遗憾和 / t，没有 t 就没法显示
         std::fwrite(&iters, sizeof(iters), 1, f);
+        std::fwrite(&buckets, sizeof(buckets), 1, f);
+        std::fwrite(&sized, sizeof(sized), 1, f);
+        std::fwrite(abstraction_.actionSpace.preflopMul1000, sizeof(int), ActionSpace::kMaxSizes,
+                    f);
+        std::fwrite(&abstraction_.actionSpace.preflopCount, sizeof(int), 1, f);
+        std::fwrite(abstraction_.actionSpace.postflopFrac1000, sizeof(int),
+                    ActionSpace::kMaxSizes, f);
+        std::fwrite(&abstraction_.actionSpace.postflopCount, sizeof(int), 1, f);
+        std::fwrite(&allin, sizeof(allin), 1, f);
         isets_.forEach([f](std::uint64_t key, const InfoSetData& is) {
             const std::uint32_t n = static_cast<std::uint32_t>(is.n);
             std::fwrite(&key, sizeof(key), 1, f);
@@ -376,7 +418,7 @@ public:
             std::fclose(f);
             return false;
         }
-        if (std::fread(&ver, sizeof(ver), 1, f) != 1 || ver != 3) {
+        if (std::fread(&ver, sizeof(ver), 1, f) != 1 || ver != 4) {
             std::fclose(f);
             return false;
         }
@@ -388,6 +430,45 @@ public:
             std::fclose(f);
             return false;
         }
+        // 抽象参数跟着模型走：读盘后这个求解器代表的就是存盘时那个模型
+        std::int32_t buckets = 20;
+        std::int32_t sized = 1;
+        std::int32_t allin = 1;
+        ActionSpace space;
+        if (std::fread(&buckets, sizeof(buckets), 1, f) != 1) {
+            std::fclose(f);
+            return false;
+        }
+        if (std::fread(&sized, sizeof(sized), 1, f) != 1) {
+            std::fclose(f);
+            return false;
+        }
+        if (std::fread(space.preflopMul1000, sizeof(int), ActionSpace::kMaxSizes, f) !=
+            ActionSpace::kMaxSizes) {
+            std::fclose(f);
+            return false;
+        }
+        if (std::fread(&space.preflopCount, sizeof(int), 1, f) != 1) {
+            std::fclose(f);
+            return false;
+        }
+        if (std::fread(space.postflopFrac1000, sizeof(int), ActionSpace::kMaxSizes, f) !=
+            ActionSpace::kMaxSizes) {
+            std::fclose(f);
+            return false;
+        }
+        if (std::fread(&space.postflopCount, sizeof(int), 1, f) != 1) {
+            std::fclose(f);
+            return false;
+        }
+        if (std::fread(&allin, sizeof(allin), 1, f) != 1) {
+            std::fclose(f);
+            return false;
+        }
+        abstraction_.buckets = static_cast<int>(buckets);
+        abstraction_.sizedHistory = (sized != 0);
+        abstraction_.actionSpace = space;
+        abstraction_.actionSpace.includeAllIn = (allin != 0);
         isets_.clear();
         isets_.prepare(static_cast<std::size_t>(cnt) + 1024);
         for (std::uint64_t i = 0; i < cnt; ++i) {
@@ -449,11 +530,14 @@ private:
         if (p < 0) return 0.0;
 
         Move moves[HoldemGame::kMaxActions];
-        const int na = HoldemGame::actions(s, moves, HoldemGame::kMaxActions);
+        const int na =
+            HoldemGame::actions(s, moves, HoldemGame::kMaxActions, abstraction_.actionSpace);
         if (na <= 0) return HoldemGame::utilityFrom(s, traverser, &scores_, iter_);
 
-        // 这个引用在整轮遍历内有效：扩容只发生在 iterate() 的 prepare()
-        InfoSetData& is = isets_.get(abstraction_.infosetIdWithBucket(s, cachedBucket(s, p)));
+        // 这个引用只在**递归之前**用。递归期间 get() 可能扩容，`is` 会失效，
+        // 所以更新遗憾之前必须按 key 重新取一次（见下面的 is2）。
+        const std::uint64_t key = abstraction_.infosetIdWithBucket(s, cachedBucket(s, p));
+        InfoSetData& is = isets_.get(key);
         if (is.n != na) is.n = na;
 
         double sigma[HoldemGame::kMaxActions] = {};
@@ -469,18 +553,23 @@ private:
         }
 
         if (p == traverser) {
+            const std::size_t gen = isets_.generation();
             double vals[HoldemGame::kMaxActions] = {};
             double nodeVal = 0.0;
             for (int i = 0; i < na; ++i) {
                 vals[i] = traverse(HoldemGame::next(s, moves[i]), traverser, reachT * sigma[i]);
                 nodeVal += sigma[i] * vals[i];
             }
+            // 递归里 get() 可能扩容。只有扩容过（代数变了）才需要按 key 重新取，
+            // 否则复用上面的引用——大表上每次重取都是一次 cache miss。
+            InfoSetData* p2 = (isets_.generation() == gen) ? &is : &isets_.get(key);
+            InfoSetData& is2 = *p2;
             // CFR+：遗憾裁到非负；DCFR：先按正负分别打折，不裁剪
             for (int i = 0; i < na; ++i) {
-                double r = is.regret[i] *
-                           (is.regret[i] > 0.0 ? posDiscount_ : negDiscount_);
+                double r = is2.regret[i] *
+                           (is2.regret[i] > 0.0 ? posDiscount_ : negDiscount_);
                 r += vals[i] - nodeVal;
-                is.regret[i] = (variant_ == CfrVariant::CFRPlus) ? std::max(0.0, r) : r;
+                is2.regret[i] = (variant_ == CfrVariant::CFRPlus) ? std::max(0.0, r) : r;
             }
             // 平均策略的加权方式两个变体不同，这里混用会出问题：
             //   CFR+ 靠线性权重 w = t 实现"越晚的迭代越重要"。
@@ -491,13 +580,13 @@ private:
             // 去掉重复的线性权重后变成 -0.091 / -0.064（不显著）。
             const double w = (variant_ == CfrVariant::DCFR) ? 1.0 : static_cast<double>(iter_);
             for (int i = 0; i < na; ++i) {
-                is.avg[i] = is.avg[i] * avgDiscount_ + w * reachT * sigma[i];
+                is2.avg[i] = is2.avg[i] * avgDiscount_ + w * reachT * sigma[i];
             }
             return nodeVal;
         }
 
         // 对手节点：按当前策略采样一个动作
-        const int pick = sampleIndex(sigma, na, rng_);
+        const int pick = std::min(sampleIndex(sigma, na, rng_), na - 1);
         return traverse(HoldemGame::next(s, moves[pick]), traverser, reachT);
     }
 
@@ -513,6 +602,8 @@ private:
     double negDiscount_ = 1.0;
     double avgDiscount_ = 1.0;
     int iter_ = 0;
+    // 下一轮要预留多少空位。按实测的每轮新增量自适应，避免写死导致表被填满。
+    std::size_t perRoundReserve_ = 256;
 };
 
 // ---------------- 跨策略对打 ----------------
@@ -545,11 +636,15 @@ inline MatchResult headToHead(const HoldemSolver& hero, const HoldemSolver& vill
                 continue;
             }
             Move moves[HoldemGame::kMaxActions];
-            const int na = HoldemGame::actions(s, moves, HoldemGame::kMaxActions);
+            // 轮到谁就用谁的动作集。两边动作集不同时这在博弈论上是合法的：
+            // 每个玩家只能从自己的抽象里选招，这恰好就是"受限抽象互相打"的定义。
+            const bool isHero = (s.player == heroSeat);
+            const ActionSpace& space = isHero ? hero.abstraction().actionSpace
+                                              : villain.abstraction().actionSpace;
+            const int na = HoldemGame::actions(s, moves, HoldemGame::kMaxActions, space);
             if (na <= 0) break;
-            const int n = (s.player == heroSeat)
-                              ? hero.fillAverageStrategy(s, buf, HoldemGame::kMaxActions)
-                              : villain.fillAverageStrategy(s, buf, HoldemGame::kMaxActions);
+            const int n = isHero ? hero.fillAverageStrategy(s, buf, HoldemGame::kMaxActions)
+                                 : villain.fillAverageStrategy(s, buf, HoldemGame::kMaxActions);
             int pick = sampleIndex(buf, n, rng);
             if (pick >= na) pick = na - 1;
             s = HoldemGame::next(s, moves[pick]);

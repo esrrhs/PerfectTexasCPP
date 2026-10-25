@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -374,6 +375,180 @@ void testHoldemRules() {
     for (int i = 0; i < fn; ++i) CHECK(f[i].kind != texas::Move::Fold);
 
     std::printf("  OK 盲注、行动顺序、翻牌发牌、无人下注不可弃牌\n");
+}
+
+void testHoldemActionSpace() {
+    section("无限注德州 / 动作集参数化");
+
+    const int NA = texas::HoldemGame::kMaxActions;
+    const int BUY = texas::HoldemGame::kBuyIn;
+
+    // 默认动作集必须与早期写死的尺寸**逐位一致**，否则所有已训模型和基准快照都失效。
+    // 翻牌前 maxRC=2，2.5x -> 5，4x -> 8；早期写的是 maxRC + (maxRC*3)/2 和 maxRC*4。
+    {
+        const texas::HoldemGame::State s = texas::HoldemGame::init(2);
+        texas::Move mv[NA];
+        texas::ActionSpace def;
+        const int n = texas::HoldemGame::actions(s, mv, NA, def);
+        CHECK(n == 5);
+        CHECK(mv[2].amount == 5);
+        CHECK(mv[3].amount == 8);
+        CHECK(mv[4].amount == BUY);
+        // 显式指定 2.5x/4x 应得到完全相同的结果
+        texas::ActionSpace same;
+        same.preflopMul1000[0] = 2500;
+        same.preflopMul1000[1] = 4000;
+        CHECK(same.preflopCount == 2);
+        texas::Move mv2[NA];
+        const int n2 = texas::HoldemGame::actions(s, mv2, NA, same);
+        CHECK(n2 == n);
+        for (int i = 0; i < n && i < n2; ++i) {
+            CHECK(mv2[i].kind == mv[i].kind);
+            CHECK(mv2[i].amount == mv[i].amount);
+        }
+        // 单参重载等于默认动作集
+        texas::Move mv3[NA];
+        const int n3 = texas::HoldemGame::actions(s, mv3, NA);
+        CHECK(n3 == n);
+        for (int i = 0; i < n && i < n3; ++i) CHECK(mv3[i].amount == mv[i].amount);
+    }
+
+    // 改尺寸档数：1 档 / 3 档
+    {
+        const texas::HoldemGame::State s = texas::HoldemGame::init(2);
+        texas::Move mv[NA];
+        texas::ActionSpace one;
+        one.preflopCount = 1;
+        CHECK(texas::HoldemGame::actions(s, mv, NA, one) == 4);  // 弃 + 跟 + 1 档 + allin
+        CHECK(mv[2].amount == 5);
+        CHECK(mv[3].amount == BUY);
+
+        texas::ActionSpace three;
+        three.preflopCount = 3;
+        three.preflopMul1000[2] = 6000;
+        const int n = texas::HoldemGame::actions(s, mv, NA, three);
+        CHECK(n == NA);  // 弃 + 跟 + 3 档 + allin 正好填满 kMaxActions
+        CHECK(mv[2].amount == 5);
+        CHECK(mv[3].amount == 8);
+        CHECK(mv[4].amount == 12);
+        CHECK(mv[5].amount == BUY);
+    }
+
+    // 去掉独立的 all-in 动作
+    {
+        const texas::HoldemGame::State s = texas::HoldemGame::init(2);
+        texas::Move mv[NA];
+        texas::ActionSpace noJam;
+        noJam.includeAllIn = false;
+        const int n = texas::HoldemGame::actions(s, mv, NA, noJam);
+        CHECK(n == 4);
+        for (int i = 0; i < n; ++i) CHECK(mv[i].amount < BUY);
+    }
+
+    // 翻牌后的底池比例：一池就是底池大小，半池是一半
+    {
+        texas::HoldemGame::State s = texas::HoldemGame::init(2);
+        s = texas::HoldemGame::next(s, texas::Move{texas::Move::Raise, 8});       // 小盲加到 8
+        s = texas::HoldemGame::next(s, texas::Move{texas::Move::CheckCall, 0});   // 大盲跟
+        texas::Card board[5] = {C("Ks"), C("8c"), C("3d"), 0, 0};
+        texas::HoldemGame::reveal(s, board);
+        CHECK(s.street == 1);
+        CHECK(texas::HoldemGame::pot(s) == 16);
+        CHECK(s.player == 1);  // 翻牌后大盲先行动
+
+        texas::Move mv[NA];
+        const int n = texas::HoldemGame::actions(s, mv, NA);
+        CHECK(n == 4);  // 过牌 + 半池 + 一池 + allin
+        const int base = s.contrib[1];
+        CHECK(mv[1].amount == base + 8);   // 半池 = 16/2
+        CHECK(mv[2].amount == base + 16);  // 一池 = 16
+        CHECK(mv[3].amount == BUY);
+
+        // 换成 {1/3 池, 3/4 池}：尺寸必须跟着变
+        texas::ActionSpace alt;
+        alt.postflopFrac1000[0] = 333;
+        alt.postflopFrac1000[1] = 750;
+        texas::Move mv2[NA];
+        const int n2 = texas::HoldemGame::actions(s, mv2, NA, alt);
+        CHECK(n2 == 4);
+        CHECK(mv2[1].amount == base + 5);   // 16*333/1000 = 5
+        CHECK(mv2[2].amount == base + 12);  // 16*750/1000 = 12
+        CHECK(mv2[1].amount < mv[1].amount);
+        CHECK(mv2[2].amount < mv[2].amount);
+    }
+
+    // 动作集要能跟着模型存盘：读盘后这个求解器代表的就是存盘时那个模型
+    {
+        texas::ActionSpace space;
+        space.preflopCount = 1;
+        space.postflopCount = 1;
+        space.includeAllIn = false;
+        const char* path = "texas_cfr_test_space.bin";
+        texas::HoldemSolver src(20, 999ULL, texas::CfrVariant::DCFR, true);
+        src.setActionSpace(space);
+        src.iterate(3000);
+        CHECK(src.save(path));
+
+        texas::HoldemSolver dst(20, 1ULL, texas::CfrVariant::DCFR, true);
+        CHECK(dst.load(path));
+        CHECK(dst.abstraction().actionSpace.preflopCount == 1);
+        CHECK(dst.abstraction().actionSpace.postflopCount == 1);
+        CHECK(!dst.abstraction().actionSpace.includeAllIn);
+        // 键必须还能对上：读回来的一手牌策略与存盘前逐位相同
+        texas::HoldemGame::State st = texas::HoldemGame::init(2);
+        st.hole[0][0] = C("Ac");
+        st.hole[0][1] = C("Ad");
+        const std::vector<double> a = src.averageStrategy(st);
+        const std::vector<double> b = dst.averageStrategy(st);
+        CHECK(a.size() == b.size());
+        if (a.size() == b.size()) {
+            for (std::size_t i = 0; i < a.size(); ++i) CHECK_NEAR(a[i], b[i], 1e-12);
+        }
+        std::remove(path);
+    }
+
+    std::printf("  OK 动作集参数化（默认逐位不变 / 档数 / 去 all-in / 底池比例 / 随模型存盘）\n");
+}
+
+// 名字 ↔ 动作集必须是同一个双射。CLI 打印的那一行按内容反查名字，
+// 若表和名字能各自漂移，就会出现"动作集 three：翻牌前 2 档"这种自相矛盾
+// 却不报错的输出——这正是改 --sizes 时踩到的东西。
+void testActionSpaceNaming() {
+    section("无限注德州 / 动作集命名的往返");
+
+    const auto& table = texas::actionPresets();
+    CHECK(table.size() >= 6);
+
+    // 每个名字都能解析，且解析回来的动作集反查仍是同一个名字
+    std::set<std::string> names;
+    for (const texas::ActionPreset& p : table) {
+        texas::ActionSpace sp;
+        CHECK(texas::actionPreset(p.name, sp));
+        CHECK(texas::sameActionSpace(sp, p.space));
+        CHECK(std::string(texas::actionSpaceName(sp)) == p.name);
+        names.insert(p.name);
+    }
+    CHECK(names.size() == table.size());  // 没有重名
+
+    // 认不出来的名字不能悄悄变成某个预设
+    texas::ActionSpace fallback;
+    fallback.preflopCount = 3;
+    CHECK(!texas::actionPreset("nope", fallback));
+    CHECK(texas::sameActionSpace(fallback, texas::ActionSpace{}));
+
+    // 手工改一位就不再属于任何预设
+    texas::ActionSpace odd;
+    odd.preflopMul1000[0] = 2750;
+    CHECK(std::string(texas::actionSpaceName(odd)) == "custom");
+
+    // 只看 actions() 真读的字段：把尾部未使用的槽位改成噪声，名字不能变
+    texas::ActionSpace tail = texas::ActionSpace{};
+    tail.preflopMul1000[2] = 7777;   // preflopCount=2，这个槽不被读
+    tail.postflopFrac1000[2] = 8888;
+    CHECK(std::string(texas::actionSpaceName(tail)) == "default");
+
+    std::printf("  OK 动作集命名往返（%zu 个预设 / 未知名字 / 未读槽位不影响命名）\n",
+                table.size());
 }
 
 void testHoldemShowdown() {
@@ -1055,6 +1230,8 @@ int main() {
     testLeduc();
     testVanillaVsPlus();
     testHoldemRules();
+    testHoldemActionSpace();
+    testActionSpaceNaming();
     testHoldemShowdown();
     testHoldemSidePot();
     testHoldemScoreCache();

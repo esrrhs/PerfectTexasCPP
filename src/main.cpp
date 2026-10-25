@@ -3,6 +3,7 @@
 //   texas_cli solve kuhn  [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]
 //   texas_cli solve leduc [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]
 //   texas_cli holdem      [--iters N] [--buckets N] [--variant dcfr|cfrplus]
+//                         [--sizes PRESET] [--no-sized-history]
 //                         [--save FILE] [--load FILE] [--seed N] [--ev-hands N]
 //   texas_cli match --a FILE --b FILE [--hands N] [--seed N]
 //   texas_cli equity --hero AhKh [--board QhJh2c] [--opp 1] [--iters 200000]
@@ -22,6 +23,8 @@
 #include <fstream>
 #include <string>
 #include <type_traits>
+#include <utility>
+#include <vector>
 #include <utility>
 #include <vector>
 
@@ -50,6 +53,8 @@ struct Args {
     int opp = 1;
     int buckets = -1;
     std::string variant = "dcfr";
+    std::string sizes = "default";
+    bool sizedHistory = true;
     std::string save;
     std::string load;
     std::string fileA;
@@ -67,6 +72,7 @@ void usage() {
         "  texas_cli solve kuhn  [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]\n"
         "  texas_cli solve leduc [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]\n"
         "  texas_cli holdem      [--iters N] [--buckets N] [--variant dcfr|cfrplus]\n"
+        "                        [--sizes PRESET] [--no-sized-history]\n"
         "                        [--save FILE] [--load FILE] [--seed N] [--ev-hands N]\n"
         "  texas_cli match --a FILE --b FILE [--hands N] [--seed N]\n"
         "  texas_cli equity --hero AhKh [--board QhJh2c] [--opp 1] [--iters 200000]\n"
@@ -83,6 +89,10 @@ void usage() {
         "  --opp N      对手人数（默认 1）\n"
         "  --buckets N  翻牌后分桶数（默认 20，最小 9；越大越细但收敛越慢）\n"
         "  --variant V  遗憾累计方式：dcfr（默认）或 cfrplus\n"
+        "  --sizes P    动作抽象预设：default（2.5x/4x + 半池/一池）\n"
+        "               one（1 档）/ three（3 档）/ nojam（去掉 all-in）\n"
+        "               small（2x/3x + 1/3,3/4 池）/ big（3x/5x + 一池,两池）\n"
+        "  --no-sized-history  让应对方看不见对手的下注额（这是要复现的缺陷，不是优化）\n"
         "  --save FILE  训练完把策略存盘，可当作以后的基准对手\n"
         "  --load FILE  从存盘读入策略（给了就跳过训练；续训时 --variant 要与原文件一致）\n"
         "  --seed N     随机种子（默认 20240518）\n"
@@ -127,6 +137,10 @@ Args parseArgs(int argc, char** argv) {
             a.buckets = parseInt(argv[++i], a.buckets);
         } else if (k == "--variant" && hasNext) {
             a.variant = argv[++i];
+        } else if (k == "--sizes" && hasNext) {
+            a.sizes = argv[++i];
+        } else if (k == "--no-sized-history") {
+            a.sizedHistory = false;
         } else if (k == "--save" && hasNext) {
             a.save = argv[++i];
         } else if (k == "--load" && hasNext) {
@@ -290,6 +304,12 @@ const char* variantName(texas::CfrVariant v) {
     return v == texas::CfrVariant::DCFR ? "DCFR" : "CFR+";
 }
 
+// 动作抽象预设的名字表放在 holdem.hpp 里（名字↔动作集是同一个博弈的一部分，
+// 且要能被测试钉住）。这里只做 CLI 侧的两个动作：解析与展示。
+bool parseActionPreset(const std::string& name, texas::ActionSpace& sp) {
+    return texas::actionPreset(name, sp);
+}
+
 int runHoldem(const Args& a) {
     // 默认 100 万轮。这个数不是拍脑袋：修好信息集划分后（树大了 15 倍），
     // 以固定的旧模型为标尺测强度曲线是 12.5万+1.04 / 25万+1.78 / 50万+2.06 /
@@ -301,7 +321,13 @@ int runHoldem(const Args& a) {
     const texas::CfrVariant variant = parseVariant(a.variant);
 
     texas::StrengthModel::instance();  // 预热牌力表
-    texas::HoldemSolver solver(buckets, a.seed, variant);
+    texas::HoldemSolver solver(buckets, a.seed, variant, a.sizedHistory);
+    texas::ActionSpace space;
+    if (!parseActionPreset(a.sizes, space)) {
+        std::printf("错误: 不认识的动作集预设 --sizes %s\n", a.sizes.c_str());
+        return 1;
+    }
+    solver.setActionSpace(space);
 
     std::printf("\n=== 无限注德州 Hold'em | 单挑 100BB | MCCFR (external sampling) ===\n");
     std::printf("  翻牌后 %d 桶 | 抽象: 翻牌前 169 类全分辨率 + 翻牌后潜力修正百分位 | %s\n",
@@ -316,6 +342,20 @@ int runHoldem(const Args& a) {
         }
         std::printf("  已读入 %s：infosets=%zu 遗憾上界=%.4f（跳过训练）\n", a.load.c_str(),
                     solver.numInfosets(), solver.regretBound());
+    }
+
+    // 放在读盘之后打印：动作集跟着模型文件走，--sizes 会被文件里的值覆盖。
+    // 名字按**实际在用的动作集**反查，不回显 a.sizes —— 覆盖之后那个字符串是假的。
+    {
+        const texas::ActionSpace& sp = solver.abstraction().actionSpace;
+        const char* actual = texas::actionSpaceName(sp);
+        std::printf("  动作集 %s：翻牌前 %d 档、翻牌后 %d 档、all-in %s | 下注额%s\n", actual,
+                    sp.preflopCount, sp.postflopCount, sp.includeAllIn ? "有" : "无",
+                    solver.abstraction().sizedHistory ? "可见" : "**不可见**（缺陷复现）");
+        if (loaded && a.sizes != actual) {
+            std::printf("  注意: --sizes %s 被模型文件覆盖，实际在用 %s\n", a.sizes.c_str(),
+                        actual);
+        }
     }
 
     if (!loaded) {
