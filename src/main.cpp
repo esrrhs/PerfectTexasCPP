@@ -66,7 +66,7 @@ void usage() {
         "  --hero HAND  自己的两张手牌，如 AhKh\n"
         "  --board STR  公共牌，如 QhJh2c（可空）\n"
         "  --opp N      对手人数（默认 1）\n"
-        "  --buckets N  牌力分桶数（holdem 默认 10）\n");
+        "  --buckets N  翻牌后分桶数（默认 20，最小 9；越大越细但收敛越慢）\n");
 }
 
 int parseInt(const char* s, int fallback) {
@@ -245,11 +245,11 @@ int runDemo() {
 
 int runHoldem(const Args& a) {
     const int iters = (a.iters > 0) ? a.iters : 50000;
-    const int buckets = (a.buckets > 0) ? a.buckets : 10;
+    const int buckets = (a.buckets > 0) ? a.buckets : 20;
     const int report = (a.report > 0) ? a.report : std::max(1, iters / 10);
 
     std::printf("\n=== 无限注德州 Hold'em | 单挑 100BB | MCCFR (external sampling) ===\n");
-    std::printf("  牌力桶 %d | 抽象: 169 类翻牌前 + 翻牌后按分位分桶\n", buckets);
+    std::printf("  翻牌后 %d 桶 | 抽象: 翻牌前 169 类全分辨率 + 翻牌后潜力修正百分位\n", buckets);
 
     texas::StrengthModel::instance();  // 预热牌力表
     texas::HoldemSolver solver(buckets);
@@ -292,6 +292,13 @@ int runHoldem(const Args& a) {
     show("AKs", "Ah", "Kh");
     show("22", "2c", "2d");
     show("72o", "7h", "2d");
+
+    // 策略质量标尺：打均匀随机对手的平均净收益（不是可利用度，只做横向比较）
+    const int deals = 20000;
+    const double evSb = solver.evVsUniform(deals, 0);
+    const double evBb = solver.evVsUniform(deals, 1);
+    std::printf("\n  对均匀随机对手的每手平均净收益（%d 手）:\n", deals);
+    std::printf("    小盲/按钮位 %.3f 筹码 | 大盲位 %.3f 筹码\n", evSb, evBb);
     return 0;
 }
 

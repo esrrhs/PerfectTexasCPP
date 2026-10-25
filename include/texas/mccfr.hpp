@@ -24,26 +24,21 @@ namespace texas {
 struct HoldemAbstraction {
     int buckets = 10;
 
-    static std::uint64_t hashHist(const std::string& hist) {
-        std::uint64_t h = 1469598103934665603ULL;
-        for (char c : hist) {
-            h ^= static_cast<std::uint64_t>(static_cast<unsigned char>(c));
-            h *= 1099511628211ULL;
-        }
-        return h;
-    }
-
     int bucketOf(const HoldemGame::State& s, int p) const {
         const StrengthModel& m = StrengthModel::instance();
         if (s.boardCount < 3) {
-            return m.preflopBucket(s.hole[p][0], s.hole[p][1], buckets);
+            // 翻牌前只有 169 种可区分的手牌，全分辨率使用。
+            // 这里绝不能套 buckets：10 个桶会把 AA 和 KK、AKs 和 AKo
+            // 压成同一个信息集，等于把翻牌前的手牌结构整个抹掉。
+            return StrengthModel::preflopClass(s.hole[p][0], s.hole[p][1]);
         }
         return m.postflopBucket(s.hole[p], s.board, s.boardCount, buckets);
     }
 
     std::uint64_t infosetId(const HoldemGame::State& s) const {
         const int p = s.player;
-        std::uint64_t h = hashHist(s.hist);
+        // histHash 在 next() 里增量维护，这里 O(1) 取用，不用重新哈希整个历史
+        std::uint64_t h = s.histHash;
         h ^= static_cast<std::uint64_t>(bucketOf(s, p) + 1) * 0x9E3779B97F4A7C15ULL;
         h ^= static_cast<std::uint64_t>(s.street + 1) * 0xC2B2AE3D27D4EB4FULL;
         h ^= static_cast<std::uint64_t>(p + 1) * 0x165667B19E3779F9ULL;
@@ -111,17 +106,58 @@ public:
     int iterations() const { return iter_; }
     const HoldemAbstraction& abstraction() const { return abstraction_; }
 
+    // 策略质量的粗略标尺：用当前平均策略打一个"在合法动作上均匀随机"的对手，
+    // 返回我方每手牌的平均净收益（筹码）。
+    //
+    // 这不是可利用度（真算可利用度要在抽象博弈上做完全遍历，代价不可接受），
+    // 但它是一个确定可复现的绝对数字，可以用来横向对比不同抽象/不同迭代数到底
+    // 有没有变好。均衡策略并不是"对随机对手收益最大"的策略，所以这个数字只做
+    // 相对比较，不能当成理论值。
+    double evVsUniform(int deals, int heroSeat = 0) {
+        if (deals <= 0) return 0.0;
+        double sum = 0.0;
+        for (int i = 0; i < deals; ++i) {
+            HoldemGame::State s = HoldemGame::init(2);
+            dealHole(s);
+            sum += playout(s, heroSeat);
+        }
+        return sum / static_cast<double>(deals);
+    }
+
 private:
+    double playout(HoldemGame::State s, int hero) {
+        for (;;) {
+            if (HoldemGame::isTerminal(s)) return HoldemGame::utilityFrom(s, hero);
+            if (HoldemGame::needsChance(s)) {
+                HoldemGame::deal(s, rng_);
+                continue;
+            }
+            Move moves[HoldemGame::kMaxActions];
+            const int na = HoldemGame::actions(s, moves, HoldemGame::kMaxActions);
+            if (na <= 0) return HoldemGame::utilityFrom(s, hero);
+            int pick = 0;
+            if (s.player == hero) {
+                pick = sampleAction(s);
+                if (pick >= na) pick = na - 1;
+            } else {
+                pick = static_cast<int>(rng_() % static_cast<std::uint64_t>(na));
+            }
+            s = HoldemGame::next(s, moves[pick]);
+        }
+    }
+
     static int legalCount(const HoldemGame::State& s) {
         Move moves[HoldemGame::kMaxActions];
         return HoldemGame::actions(s, moves, HoldemGame::kMaxActions);
     }
 
     void dealHole(HoldemGame::State& s) {
-        std::vector<Card> deck = HoldemGame::remainingDeck(s);
-        for (int i = 0; i < s.numPlayers * 2; ++i) {
-            std::uniform_int_distribution<int> dist(i, static_cast<int>(deck.size()) - 1);
-            std::swap(deck[i], deck[dist(rng_)]);
+        Card deck[kNumCards];
+        const int dn = HoldemGame::buildDeck(s, deck);
+        const int need = s.numPlayers * 2;
+        for (int i = 0; i < need; ++i) {
+            const int j = i + static_cast<int>(rng_() % static_cast<std::uint64_t>(dn - i));
+            std::swap(deck[i], deck[j]);
         }
         int k = 0;
         for (int p = 0; p < s.numPlayers; ++p) {

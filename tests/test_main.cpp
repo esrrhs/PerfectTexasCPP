@@ -515,22 +515,177 @@ void testHoldemAllIn() {
     std::printf("  OK all-in 后一次发完 5 张公共牌并摊牌\n");
 }
 
+void testHoldemAbstraction() {
+    section("无限注德州 / 牌力抽象");
+
+    // ---- 评测器：快路径必须与暴力实现逐位等价 ----
+    // 5 张穷举 C(52,5) 全量对照
+    {
+        long long bad = 0;
+        texas::Card c[5];
+        for (int a = 0; a < 52; ++a)
+        for (int b = a + 1; b < 52; ++b)
+        for (int d = b + 1; d < 52; ++d)
+        for (int e = d + 1; e < 52; ++e)
+        for (int f = e + 1; f < 52; ++f) {
+            c[0] = a; c[1] = b; c[2] = d; c[3] = e; c[4] = f;
+            if (texas::evaluateBest(c, 5) != texas::evaluate5(c)) ++bad;
+        }
+        std::printf("  C(52,5) 穷举 %d 组，快路径与 evaluate5 不一致 %lld 处\n", 2598960, bad);
+        CHECK(bad == 0);
+    }
+    // 7 张随机对照 21 组合暴力
+    {
+        std::mt19937_64 rng(777);
+        long long bad = 0;
+        for (int it = 0; it < 300000; ++it) {
+            texas::Card d[52];
+            for (int i = 0; i < 52; ++i) d[i] = i;
+            for (int i = 0; i < 7; ++i) std::swap(d[i], d[i + static_cast<int>(rng() % (52 - i))]);
+            texas::Card c[7] = {d[0], d[1], d[2], d[3], d[4], d[5], d[6]};
+            if (texas::evaluateBest(c, 7) != texas::evaluate7Brute(c)) ++bad;
+        }
+        std::printf("  7 张随机 30 万组，快路径与暴力不一致 %lld 处\n", bad);
+        CHECK(bad == 0);
+    }
+
+    // ---- 翻牌前：169 类必须各自独立，不能被桶合并 ----
+    const texas::StrengthModel& model = texas::StrengthModel::instance();
+    const int clsAA = texas::StrengthModel::preflopClass(C("Ac"), C("Ad"));
+    const int clsKK = texas::StrengthModel::preflopClass(C("Kc"), C("Kd"));
+    const int clsAKs = texas::StrengthModel::preflopClass(C("Ah"), C("Kh"));
+    const int clsAKo = texas::StrengthModel::preflopClass(C("Ah"), C("Kd"));
+    const int cls72 = texas::StrengthModel::preflopClass(C("7h"), C("2d"));
+    std::printf("  类号: AA=%d KK=%d AKs=%d AKo=%d 72o=%d\n", clsAA, clsKK, clsAKs, clsAKo, cls72);
+    CHECK(clsAA != clsKK);    // 老版本这两手会被压进同一个桶
+    CHECK(clsAKs != clsAKo);  // 同花/非同花不能混
+    CHECK(clsAA != cls72);
+    // 花色置换不变
+    CHECK(texas::StrengthModel::preflopClass(C("Ac"), C("Ad")) ==
+          texas::StrengthModel::preflopClass(C("Ah"), C("As")));
+    CHECK(texas::StrengthModel::preflopClass(C("Ah"), C("Kh")) ==
+          texas::StrengthModel::preflopClass(C("As"), C("Ks")));
+
+    // 胜率排序：AA > KK > QQ，同花 > 非同花
+    const double eqAA = model.preflopEquity(C("Ac"), C("Ad"));
+    const double eqKK = model.preflopEquity(C("Kc"), C("Kd"));
+    const double eqQQ = model.preflopEquity(C("Qc"), C("Qd"));
+    const double eqAKs = model.preflopEquity(C("Ah"), C("Kh"));
+    const double eqAKo = model.preflopEquity(C("Ah"), C("Kd"));
+    const double eq72 = model.preflopEquity(C("7h"), C("2d"));
+    std::printf("  胜率: AA=%.4f KK=%.4f QQ=%.4f AKs=%.4f AKo=%.4f 72o=%.4f\n", eqAA, eqKK, eqQQ,
+                eqAKs, eqAKo, eq72);
+    CHECK(eqAA > eqKK);
+    CHECK(eqKK > eqQQ);
+    CHECK(eqAKs > eqAKo);
+    CHECK(eqAKs > eq72);
+    CHECK(eqAA > 0.83 && eqAA < 0.87);  // AA 对单随机对手约 85%
+
+    // ---- 翻牌后：潜力修正必须把听牌从"当前牌力排名"里救出来 ----
+    // 同一块翻牌面，AhTh 和 AdTd 的"当前最佳五张"完全相同（都是 A 高牌），
+    // 所以百分位严格相等；但 AhTh 有同花听牌，修正后必须严格更强。
+    {
+        const texas::Card board[3] = {C("Kh"), C("7h"), C("2s")};
+        const texas::Card draw[2] = {C("Ah"), C("Th")};
+        const texas::Card dry[2] = {C("Ad"), C("Td")};
+        const double pDraw = model.postflopPercentile(draw, board, 3);
+        const double pDry = model.postflopPercentile(dry, board, 3);
+        const double sDraw = model.postflopStrength(draw, board, 3);
+        const double sDry = model.postflopStrength(dry, board, 3);
+        const texas::DrawOuts outs = texas::StrengthModel::computeOuts(draw, board, 3);
+        std::printf("  K72 面: 同花听牌 pct=%.3f str=%.3f (outs 花%d 顺%d 共%d)\n", pDraw, sDraw,
+                    outs.flush, outs.straight, outs.total);
+        std::printf("          无听牌   pct=%.3f str=%.3f\n", pDry, sDry);
+        CHECK(std::fabs(pDraw - pDry) < 1e-12);  // 当前牌力确实一模一样
+        CHECK(outs.flush == 9);                  // 同花听牌 9 个出路
+        CHECK(sDraw > sDry + 0.10);              // 潜力修正必须显著拉开
+        CHECK(sDraw > pDraw);                    // 听牌只会上调，不会下调
+    }
+    // 两头顺听牌 8 个出路，卡顺 4 个
+    {
+        const texas::Card board[3] = {C("9c"), C("8d"), C("2s")};
+        const texas::Card oesd[2] = {C("Th"), C("7c")};
+        const texas::Card gut[2] = {C("Th"), C("6c")};
+        const texas::DrawOuts a = texas::StrengthModel::computeOuts(oesd, board, 3);
+        const texas::DrawOuts b = texas::StrengthModel::computeOuts(gut, board, 3);
+        std::printf("  98 2 面: T7o 顺子outs=%d | T6o 顺子outs=%d\n", a.straight, b.straight);
+        CHECK(a.straight == 8);
+        CHECK(b.straight == 4);
+    }
+    // 河牌没有后续牌，修正必须退化成百分位本身
+    {
+        const texas::Card board[5] = {C("Kh"), C("7h"), C("2s"), C("9d"), C("3c")};
+        const texas::Card hole[2] = {C("Ah"), C("Th")};
+        CHECK_NEAR(model.postflopStrength(hole, board, 5),
+                   model.postflopPercentile(hole, board, 5), 1e-12);
+    }
+    // 百分位必须随牌力单调
+    {
+        const texas::Card board[5] = {C("Kh"), C("7h"), C("2s"), C("9d"), C("3c")};
+        const texas::Card nuts[2] = {C("Ks"), C("Kd")};  // 三条 K
+        const texas::Card weak[2] = {C("4h"), C("5d")};  // 高牌
+        CHECK(model.postflopPercentile(nuts, board, 5) >
+              model.postflopPercentile(weak, board, 5));
+    }
+
+    // ---- 分桶：九个牌型必须落在互不重叠的桶区间里 ----
+    // 等质量分桶会把两对以上（只占 8.2%）全塞进最后一个桶，模型分不清超对和
+    // 暗三条。这里逐个牌型构造一手牌，验证桶号严格单调递增。
+    {
+        struct Case {
+            const char* name;
+            texas::HandCategory cat;
+            const char* h1;
+            const char* h2;
+            const char* b1;
+            const char* b2;
+            const char* b3;
+        };
+        const Case cases[] = {
+            {"高牌", texas::HandCategory::HighCard, "9h", "5h", "Ks", "7c", "2d"},
+            {"一对", texas::HandCategory::OnePair, "Kd", "5h", "Ks", "7c", "2d"},
+            {"两对", texas::HandCategory::TwoPair, "Kd", "7h", "Ks", "7c", "2d"},
+            {"三条", texas::HandCategory::ThreeOfAKind, "7d", "7s", "Ks", "7c", "2d"},
+            {"顺子", texas::HandCategory::Straight, "7h", "6h", "Ts", "9c", "8d"},
+            {"同花", texas::HandCategory::Flush, "Ah", "5h", "Kh", "7h", "2h"},
+            {"葫芦", texas::HandCategory::FullHouse, "7h", "7s", "Ks", "Kc", "7d"},
+            {"四条", texas::HandCategory::FourOfAKind, "Kh", "Kd", "Ks", "Kc", "7d"},
+            {"同花顺", texas::HandCategory::StraightFlush, "Th", "6h", "9h", "8h", "7h"},
+        };
+        for (int B : {20, 50}) {
+            int prev = -1;
+            bool ok = true;
+            std::printf("  桶=%d 各牌型桶位:", B);
+            for (const auto& c : cases) {
+                const texas::Card hole[2] = {C(c.h1), C(c.h2)};
+                const texas::Card board[3] = {C(c.b1), C(c.b2), C(c.b3)};
+                // 先确认构造出来的确实是目标牌型
+                texas::Card all[5] = {C(c.h1), C(c.h2), C(c.b1), C(c.b2), C(c.b3)};
+                CHECK(texas::handCategoryOf(texas::evaluate5(all)) == static_cast<int>(c.cat));
+                const int bk = model.postflopBucket(hole, board, 3, B);
+                std::printf(" %s=%d", c.name, bk);
+                if (bk <= prev) ok = false;
+                prev = bk;
+            }
+            std::printf("\n");
+            CHECK(ok);
+        }
+        // 超对和暗三条绝对不能同桶（老版本 10 桶时这里就是坏的）
+        const texas::Card b[3] = {C("Ks"), C("7c"), C("2d")};
+        const texas::Card over[2] = {C("Ac"), C("Ah")};
+        const texas::Card set[2] = {C("7d"), C("7s")};
+        CHECK(model.postflopBucket(over, b, 3, 20) != model.postflopBucket(set, b, 3, 20));
+        CHECK(model.postflopBucket(set, b, 3, 20) > model.postflopBucket(over, b, 3, 20));
+    }
+
+    std::printf("  OK 牌力抽象（评测器等价 / 翻牌前 169 类 / 听牌潜力修正 / 牌型分桶）\n");
+}
+
 void testHoldemMCCFR() {
     section("无限注德州 / MCCFR 求解");
 
-    // 牌力抽象：AA 必须落在最高桶，72o 落在最低桶
-    const texas::StrengthModel& model = texas::StrengthModel::instance();
-    const int bucketAA = model.preflopBucket(C("Ac"), C("Ad"), 10);
-    const int bucket72 = model.preflopBucket(C("7h"), C("2d"), 10);
-    const int bucketAKs = model.preflopBucket(C("Ah"), C("Kh"), 10);
-    std::printf("  桶: AA=%d AKs=%d 72o=%d\n", bucketAA, bucketAKs, bucket72);
-    CHECK(bucketAA > bucketAKs);   // AA 强于 AKs
-    CHECK(bucketAKs > bucket72);   // AKs 强于 72o
-    CHECK(bucketAA >= 7);          // AA 胜率约 85%，落在高桶
-    CHECK(bucket72 <= 4);          // 72o 胜率约 35%，落在低桶
-
-    texas::HoldemSolver solver(10, 20240518ULL);
-    const int rounds = 40000;
+    texas::HoldemSolver solver(20, 20240518ULL);
+    const int rounds = 150000;
     solver.iterate(rounds);
     std::printf("  %d 轮后 infosets=%zu\n", rounds, solver.numInfosets());
     CHECK(solver.numInfosets() > 100);
@@ -579,6 +734,7 @@ int main() {
     testHoldemShowdown();
     testHoldemSidePot();
     testHoldemAllIn();
+    testHoldemAbstraction();
     testHoldemMCCFR();
 
     std::printf("\n================================================\n");

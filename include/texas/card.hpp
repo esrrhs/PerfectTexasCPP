@@ -175,7 +175,8 @@ inline const std::array<std::array<int, 5>, 21>& sevenCardMasks() {
     return kTable;
 }
 
-inline int evaluate7(const Card* c) {
+// 暴力参考实现：枚举 21 种 5 张组合取最大。保留下来给测试做等价性对照。
+inline int evaluate7Brute(const Card* c) {
     int best = -1;
     for (const auto& m : sevenCardMasks()) {
         const Card h[5] = {c[m[0]], c[m[1]], c[m[2]], c[m[3]], c[m[4]]};
@@ -184,5 +185,163 @@ inline int evaluate7(const Card* c) {
     }
     return best;
 }
+
+// ---------------------------------------------------------------- 快速评估
+//
+// 上面 evaluate7Brute 每次要做 21 次 evaluate5，而 evaluate5 内部还有一次
+// std::sort 和两次栈上数组清零，实测 734ns/次。牌力评估是蒙特卡洛采样、
+// 牌力表构建、胜率计算的公共热点，必须压下来。
+//
+// 快路径只用一次 O(n) 扫描建两张计数表，然后按牌型优先级逐条判定：
+//   - 顺子：13 位 rank 掩码查 8192 项的表，O(1)
+//   - 同花：花色计数 ≥5 即有，取的 5 张牌名直接下降扫描掩码
+//   - 对子/三条/葫芦/四条：从 rank 计数表按降序收集
+// 分数编码与 evaluate5 完全一致（cat * 16^5 + 递减 kicker），所以两者可以
+// 直接互相比较，handCategoryOf 也照旧可用。
+
+// mask 的 bit r 表示存在 rank r 的牌，返回该掩码里最大顺子的高牌 rank（无则 -1）
+inline const std::array<std::int16_t, 8192>& straightHighTable() {
+    static const std::array<std::int16_t, 8192> kTable = [] {
+        std::array<std::int16_t, 8192> t{};
+        for (int m = 0; m < 8192; ++m) {
+            int sh = -1;
+            for (int high = 12; high >= 4; --high) {
+                const int run = 0x1F << (high - 4);
+                if ((m & run) == run) {
+                    sh = high;
+                    break;
+                }
+            }
+            // A-2-3-4-5：5 当高牌（rank 3）
+            if (sh < 0 && (m & 0xF) == 0xF && (m & 0x1000) != 0) sh = 3;
+            t[static_cast<std::size_t>(m)] = static_cast<std::int16_t>(sh);
+        }
+        return t;
+    }();
+    return kTable;
+}
+
+inline int packScore(int cat, const int* vals) {
+    int s = cat;
+    for (int i = 0; i < 5; ++i) s = s * 16 + vals[i];
+    return s;
+}
+
+// n ∈ [5, 7]，分数与 max over C(n,5) 个 evaluate5 完全一致
+inline int evaluateBest(const Card* c, int n) {
+    int rc[13] = {};
+    int sc[4] = {};
+    int sm[4] = {};
+    for (int i = 0; i < n; ++i) {
+        const int r = c[i] >> 2;
+        const int s = c[i] & 3;
+        ++rc[r];
+        ++sc[s];
+        sm[s] |= 1 << r;
+    }
+
+    int quad = -1;
+    int trip1 = -1, trip2 = -1;
+    int pair1 = -1, pair2 = -1;
+    int rmask = 0;
+    for (int r = 12; r >= 0; --r) {
+        const int cnt = rc[r];
+        if (cnt == 0) continue;
+        rmask |= 1 << r;
+        if (cnt == 4) {
+            if (quad < 0) quad = r;
+        } else if (cnt == 3) {
+            if (trip1 < 0) trip1 = r;
+            else if (trip2 < 0) trip2 = r;
+        } else if (cnt == 2) {
+            if (pair1 < 0) pair1 = r;
+            else if (pair2 < 0) pair2 = r;
+        }
+    }
+
+    // 四条
+    if (quad >= 0) {
+        int kicker = -1;
+        for (int r = 12; r >= 0; --r) {
+            if (r != quad && rc[r] > 0) { kicker = r; break; }
+        }
+        const int v[5] = {quad, kicker < 0 ? 0 : kicker, 0, 0, 0};
+        return packScore(static_cast<int>(HandCategory::FourOfAKind), v);
+    }
+
+    // 葫芦（两个三条也算）
+    if (trip1 >= 0 && (trip2 >= 0 || pair1 >= 0)) {
+        const int pairPart = std::max(trip2, pair1);
+        const int v[5] = {trip1, pairPart, 0, 0, 0};
+        return packScore(static_cast<int>(HandCategory::FullHouse), v);
+    }
+
+    // 同花 / 同花顺
+    int flushSuit = -1;
+    for (int s = 0; s < 4; ++s) {
+        if (sc[s] >= 5) { flushSuit = s; break; }
+    }
+    if (flushSuit >= 0) {
+        const int fm = sm[flushSuit];
+        const int sh = straightHighTable()[static_cast<std::size_t>(fm)];
+        if (sh >= 0) {
+            const int v[5] = {sh, 0, 0, 0, 0};
+            return packScore(static_cast<int>(HandCategory::StraightFlush), v);
+        }
+        int v[5] = {0, 0, 0, 0, 0};
+        int k = 0;
+        for (int r = 12; r >= 0 && k < 5; --r) {
+            if ((fm >> r) & 1) v[k++] = r;
+        }
+        return packScore(static_cast<int>(HandCategory::Flush), v);
+    }
+
+    // 顺子
+    const int sh = straightHighTable()[static_cast<std::size_t>(rmask)];
+    if (sh >= 0) {
+        const int v[5] = {sh, 0, 0, 0, 0};
+        return packScore(static_cast<int>(HandCategory::Straight), v);
+    }
+
+    // 三条
+    if (trip1 >= 0) {
+        int v[5] = {trip1, 0, 0, 0, 0};
+        int k = 1;
+        for (int r = 12; r >= 0 && k < 3; --r) {
+            if (r != trip1 && rc[r] > 0) v[k++] = r;
+        }
+        return packScore(static_cast<int>(HandCategory::ThreeOfAKind), v);
+    }
+
+    // 两对
+    if (pair1 >= 0 && pair2 >= 0) {
+        int v[5] = {pair1, pair2, 0, 0, 0};
+        for (int r = 12; r >= 0; --r) {
+            if (r != pair1 && r != pair2 && rc[r] > 0) { v[2] = r; break; }
+        }
+        return packScore(static_cast<int>(HandCategory::TwoPair), v);
+    }
+
+    // 一对
+    if (pair1 >= 0) {
+        int v[5] = {pair1, 0, 0, 0, 0};
+        int k = 1;
+        for (int r = 12; r >= 0 && k < 4; --r) {
+            if (r != pair1 && rc[r] > 0) v[k++] = r;
+        }
+        return packScore(static_cast<int>(HandCategory::OnePair), v);
+    }
+
+    // 高牌
+    int v[5] = {0, 0, 0, 0, 0};
+    int k = 0;
+    for (int r = 12; r >= 0 && k < 5; --r) {
+        if (rc[r] > 0) v[k++] = r;
+    }
+    return packScore(static_cast<int>(HandCategory::HighCard), v);
+}
+
+inline int evaluate6(const Card* c) { return evaluateBest(c, 6); }
+inline int evaluate7(const Card* c) { return evaluateBest(c, 7); }
 
 }  // namespace texas

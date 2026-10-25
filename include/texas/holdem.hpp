@@ -37,7 +37,7 @@ struct HoldemGame {
     static constexpr int kSmallBlind = 1;
     static constexpr int kBigBlind = 2;
     static constexpr int kBuyIn = 200;    // 100BB
-    static constexpr int kMaxRaises = 2;  // 每条街最多 2 次加注
+    static constexpr int kMaxRaises = 3;  // 每条街最多 3 次加注（够打到 4-bet）
     static constexpr int kMaxActions = 6;
 
     struct State {
@@ -58,7 +58,30 @@ struct HoldemGame {
 
         int pendingDeal = 0;  // >0 表示待发公共牌张数（机会节点）
         bool finished = false;
-        std::string hist;
+
+        // 下注历史。早年这里用 std::string，结果每个节点 next() 都要深拷贝一次
+        // （一次堆分配），而 infosetId 还要把整个字符串重新哈希一遍（O(长度)）。
+        // MCCFR 每轮要经过十几个节点，这两项直接吃掉了大半吞吐。
+        // 现在改成定长缓冲（拷贝退化成 memcpy）+ 增量哈希（O(1) 取键）。
+        // 缓冲只服务于可读性/调试，信息集键以 histHash 为准，所以即使截断也不会串味。
+        static constexpr int kHistCap = 64;
+        char hist[kHistCap] = {};
+        int histLen = 0;
+        std::uint64_t histHash = 0;
+
+        void pushHist(char c) {
+            if (histLen < kHistCap - 1) hist[histLen++] = c;
+            histHash ^= static_cast<std::uint64_t>(static_cast<unsigned char>(c));
+            histHash *= 1099511628211ULL;
+        }
+
+        void setHist(const char* s) {
+            histLen = 0;
+            histHash = 0;
+            for (; *s != '\0'; ++s) pushHist(*s);
+        }
+
+        std::string histString() const { return std::string(hist, hist + histLen); }
     };
 
     static State init(int numPlayers) {
@@ -135,7 +158,19 @@ struct HoldemGame {
     }
 
     // ---------- 合法动作 ----------
-
+    //
+    // 加注尺寸（下注抽象）按街分开：
+    //
+    //   翻牌前：底池只有 3，用"底池比例"算出来的加注是加到 4/5，而下一个
+    //           选项直接就是全下 200——中间 5 到 200 之间没有任何尺寸，模型
+    //           想造大底池只能全下，策略会退化成"要么跛入要么推"。所以翻牌前
+    //           按当前最大投入的倍数给尺寸（2.5x / 4x），开池、3-bet、4-bet
+    //           自然形成阶梯。
+    //
+    //   翻牌后：按底池比例（半池 / 一池），这是标准下注尺度。
+    //
+    // 每条街允许 kMaxRaises 次加注，保证翻牌前的加注战（open → 3-bet →
+    // 4-bet）真的能打到，而不是第二次加注之后就只能全下。
     static int actions(const State& s, Move* out, int maxOut) {
         if (isTerminal(s) || needsChance(s)) return 0;
         const int p = s.player;
@@ -150,20 +185,27 @@ struct HoldemGame {
         if (n < maxOut) out[n++] = Move{Move::CheckCall, 0};
 
         if (s.raises < kMaxRaises && stackLeft > callNeed && n < maxOut) {
-            const int potNow = pot(s);
-            const double fracs[2] = {0.5, 1.0};  // 半个底池、一个底池
-            int prevTarget = -1;
-            for (int k = 0; k < 2 && n < maxOut; ++k) {
-                int raiseBy = static_cast<int>(potNow * fracs[k]);
-                if (raiseBy < kBigBlind) raiseBy = kBigBlind;
-                const int targetTotal = std::min(kBuyIn, s.contrib[p] + callNeed + raiseBy);
-                if (targetTotal <= s.contrib[p]) continue;
-                if (targetTotal == prevTarget) continue;
-                prevTarget = targetTotal;
-                out[n++] = Move{Move::Raise, targetTotal};
+            // 以"本街投入"为单位给出目标，再换算成总投入
+            auto emitRaise = [&](int roundTarget) {
+                if (n >= maxOut) return;
+                if (roundTarget <= maxRC) roundTarget = maxRC + kBigBlind;
+                const int total = s.contrib[p] + (roundTarget - s.roundContrib[p]);
+                if (total <= s.contrib[p]) return;
+                out[n++] = Move{Move::Raise, std::min(kBuyIn, total)};
+            };
+
+            if (s.street == 0) {
+                // 翻牌前：2.5x / 4x 当前最大投入
+                emitRaise(maxRC + (maxRC * 3) / 2);
+                emitRaise(maxRC * 4);
+            } else {
+                // 翻牌后：半池 / 一池
+                const int potNow = pot(s);
+                emitRaise(maxRC + std::max(kBigBlind, potNow / 2));
+                emitRaise(maxRC + std::max(kBigBlind, potNow));
             }
-            // all-in 单独作为一个动作，避免被两个比例尺度吞掉
-            if (n < maxOut && s.contrib[p] < kBuyIn && prevTarget != kBuyIn) {
+            // all-in 单独作为一个动作，避免被比例尺寸吞掉
+            if (n < maxOut && s.contrib[p] < kBuyIn) {
                 out[n++] = Move{Move::Raise, kBuyIn};
             }
         }
@@ -179,7 +221,7 @@ struct HoldemGame {
 
         if (m.kind == Move::Fold) {
             t.folded[p] = true;
-            t.hist.push_back('f');
+            t.pushHist('f');
             t.player = -1;
             return t;
         }
@@ -189,7 +231,7 @@ struct HoldemGame {
             t.contrib[p] += delta;
             t.roundContrib[p] = maxRC;
             ++t.acts;
-            t.hist.push_back(delta > 0 ? 'c' : 'k');
+            t.pushHist(delta > 0 ? 'c' : 'k');
         } else {
             const int targetTotal = std::min(m.amount, kBuyIn);
             const int delta = targetTotal - s.contrib[p];
@@ -197,7 +239,7 @@ struct HoldemGame {
             t.roundContrib[p] = s.roundContrib[p] + delta;
             ++t.raises;
             ++t.acts;
-            t.hist.push_back('r');
+            t.pushHist('r');
         }
 
         for (int i = 0; i < t.numPlayers; ++i) {
@@ -216,7 +258,7 @@ struct HoldemGame {
         for (int i = 0; i < t.numPlayers; ++i) t.roundContrib[i] = 0;
         t.raises = 0;
         t.acts = 0;
-        t.hist.push_back('/');
+        t.pushHist('/');
 
         if (t.street == 3) {
             t.finished = true;  // 河牌打完，摊牌
@@ -241,28 +283,36 @@ struct HoldemGame {
 
     // ---------- 发牌（机会节点） ----------
 
-    static std::vector<Card> remainingDeck(const State& s) {
+    // 未使用的牌（不含手牌和已发公共牌），按数组返回，避免发牌时堆分配
+    static int buildDeck(const State& s, Card* out) {
         bool used[kNumCards] = {};
         for (int i = 0; i < s.numPlayers; ++i) {
             used[s.hole[i][0]] = true;
             used[s.hole[i][1]] = true;
         }
         for (int i = 0; i < s.boardCount; ++i) used[s.board[i]] = true;
-        std::vector<Card> deck;
-        deck.reserve(kNumCards);
+        int n = 0;
         for (int c = 0; c < kNumCards; ++c) {
-            if (!used[c]) deck.push_back(c);
+            if (!used[c]) out[n++] = c;
         }
-        return deck;
+        return n;
+    }
+
+    static std::vector<Card> remainingDeck(const State& s) {
+        Card buf[kNumCards];
+        const int n = buildDeck(s, buf);
+        return std::vector<Card>(buf, buf + n);
     }
 
     template <class Rng>
     static void deal(State& s, Rng& rng) {
-        std::vector<Card> deck = remainingDeck(s);
+        // 发牌是每轮必经的热点，这里不碰堆：定长数组 + 部分 Fisher-Yates
+        Card deck[kNumCards];
+        const int dn = buildDeck(s, deck);
         const int need = s.pendingDeal;
-        for (int i = 0; i < need && i < static_cast<int>(deck.size()); ++i) {
-            std::uniform_int_distribution<int> dist(i, static_cast<int>(deck.size()) - 1);
-            std::swap(deck[i], deck[dist(rng)]);
+        for (int i = 0; i < need && i < dn; ++i) {
+            const int j = i + static_cast<int>(rng() % static_cast<std::uint64_t>(dn - i));
+            std::swap(deck[i], deck[j]);
             s.board[s.boardCount++] = deck[i];
         }
         s.pendingDeal = 0;
@@ -270,7 +320,7 @@ struct HoldemGame {
             s.finished = true;
             s.player = -1;
         } else {
-            s.player = nextPlayer(s, 0);  // 翻牌后由小盲之后开始
+            s.player = nextPlayer(s, 0);  // 翻牌后由大盲先行动（单挑时小盲/按钮在后）
         }
     }
 
