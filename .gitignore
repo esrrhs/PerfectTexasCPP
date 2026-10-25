@@ -9,3 +9,8 @@ out/
 .DS_Store
 .vscode/
 .idea/
+build_rl*/
+ckpt/
+ckpt_*/
+*.pt
+.workbuddy/

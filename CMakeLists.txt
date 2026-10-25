@@ -10,7 +10,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 if(MSVC)
-  add_compile_options(/W4 /utf-8)
+  add_compile_options(/W4 /utf-8 /bigobj)
 else()
   add_compile_options(-Wall -Wextra)
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64)")
@@ -20,8 +20,26 @@ else()
   endif()
 endif()
 
-add_library(perfecttexas_core INTERFACE)
-target_include_directories(perfecttexas_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# LibTorch：默认找 ~/libtorch，也可以用 -DCMAKE_PREFIX_PATH=/path/to/libtorch 指定。
+if(NOT DEFINED Torch_DIR AND EXISTS "$ENV{HOME}/libtorch/share/cmake/Torch")
+  list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/libtorch")
+endif()
+find_package(Torch REQUIRED)
+find_package(Threads REQUIRED)
+
+add_library(perfecttexas_core STATIC
+  src/hu.cpp
+  src/features.cpp
+  src/nn.cpp
+  src/rollout.cpp
+  src/learner.cpp
+  src/eval.cpp
+)
+target_include_directories(perfecttexas_core PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${TORCH_INCLUDE_DIRS})
+target_link_libraries(perfecttexas_core PUBLIC ${TORCH_LIBRARIES} Threads::Threads)
+target_compile_options(perfecttexas_core PUBLIC ${TORCH_CXX_FLAGS})
 
 add_executable(perfecttexas src/main.cpp)
 target_link_libraries(perfecttexas PRIVATE perfecttexas_core)

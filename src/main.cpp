@@ -1,18 +1,12 @@
 // PerfectTexasCPP 命令行入口。
 //
-//   perfecttexas solve kuhn  [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]
-//   perfecttexas solve leduc [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]
-//   perfecttexas holdem      [--iters N] [--buckets N] [--variant dcfr|cfrplus]
-//                         [--sizes PRESET] [--no-sized-history]
-//                         [--save FILE] [--load FILE] [--seed N] [--ev-hands N]
-//   perfecttexas match --a FILE --b FILE [--hands N] [--seed N]
-//   perfecttexas equity --hero AhKh [--board QhJh2c] [--opp 1] [--iters 200000]
-//   perfecttexas demo
+//   perfecttexas train  [--updates N] [--games N] [--out DIR] [--resume DIR]
+//   perfecttexas eval   --resume DIR [--vs rule|random|self] [--hands N]
+//   perfecttexas bench  [--hands N]
 //
-// solve  训练一个 CFR 求解器，周期性报告可利用度与博弈值
-// holdem 训练无限注德州求解器，可存盘成基准
-// match  两个已存盘策略对打，报每手净收益与标准误（判断谁更强）
-// equity 手牌胜率（蒙特卡洛）
+// train  自对局 PPO 训练（不完全信息 actor + 开天眼 critic）
+// eval   拿存盘模型对固定基准打对局，报每手净收益与标准误
+// bench  未训练策略打规则机器人，作为强度下限
 
 #include <algorithm>
 #include <chrono>
@@ -20,471 +14,497 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <filesystem>
+#include <memory>
 #include <string>
-#include <type_traits>
-#include <utility>
-#include <vector>
-#include <utility>
 #include <vector>
 
-#include "texas/br.hpp"
-#include "texas/card.hpp"
-#include "texas/cfr.hpp"
-#include "texas/equity.hpp"
-#include "texas/holdem.hpp"
-#include "texas/kuhn.hpp"
-#include "texas/leduc.hpp"
-#include "texas/mccfr.hpp"
+#include <torch/torch.h>
+
+#include "texas/eval.hpp"
+#include "texas/features.hpp"
+#include "texas/hu.hpp"
+#include "texas/learner.hpp"
+#include "texas/nn.hpp"
+#include "texas/ppo.hpp"
 #include "texas/strength.hpp"
+#include "texas/rollout.hpp"
 
 namespace {
 
-struct Args {
-    std::string cmd;
-    std::string game;
-    int iters = -1;
-    int report = -1;
-    int dump = -1;
-    std::string csv;
-    bool vanilla = false;
-    std::string hero;
-    std::string board;
-    int opp = 1;
-    int buckets = -1;
-    std::string variant = "dcfr";
-    // 默认用实测最强的 sharp（前 4 档 + 后 3 档），不是历史的那套 2 档。
-    // 历史数字全部是用 --sizes default 测的，为了能复现，那套动作集仍然保留。
-    std::string sizes = "sharp";
-    bool sizedHistory = true;
-    std::string save;
-    std::string load;
-    std::string fileA;
-    std::string fileB;
-    int hands = -1;
-    unsigned long long seed = 20240518ULL;
-    int evHands = -1;
-};
+const char* argValue(int argc, char** argv, const char* key, const char* def) {
+    for (int i = 0; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], key) == 0) return argv[i + 1];
+    }
+    return def;
+}
+
+bool hasFlag(int argc, char** argv, const char* key) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], key) == 0) return true;
+    }
+    return false;
+}
+
+int argInt(int argc, char** argv, const char* key, int def) {
+    const char* v = argValue(argc, argv, key, nullptr);
+    return v ? std::atoi(v) : def;
+}
+
+double argDouble(int argc, char** argv, const char* key, double def) {
+    const char* v = argValue(argc, argv, key, nullptr);
+    return v ? std::atof(v) : def;
+}
+
+std::string argStr(int argc, char** argv, const char* key, const std::string& def) {
+    const char* v = argValue(argc, argv, key, nullptr);
+    return v ? std::string(v) : def;
+}
 
 void usage() {
     std::printf(
-        "PerfectTexasCPP —— 德州扑克不完全信息博弈求解器（CFR / CFR+ / DCFR）\n"
+        "PerfectTexasCPP —— 单挑无限注德州的自对局强化学习（PPO + 完美信息蒸馏）\n"
         "\n"
         "用法:\n"
-        "  perfecttexas solve kuhn  [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]\n"
-        "  perfecttexas solve leduc [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]\n"
-        "  perfecttexas holdem      [--iters N] [--buckets N] [--variant dcfr|cfrplus]\n"
-        "                        [--sizes PRESET] [--no-sized-history]\n"
-        "                        [--save FILE] [--load FILE] [--seed N] [--ev-hands N]\n"
-        "  perfecttexas match --a FILE --b FILE [--hands N] [--seed N]\n"
-        "  perfecttexas equity --hero AhKh [--board QhJh2c] [--opp 1] [--iters 200000]\n"
-        "  perfecttexas demo\n"
+        "  perfecttexas train [--updates N] [--games N] [--lr F] [--hidden N] [--lstm N]\n"
+        "                     [--out DIR] [--resume DIR] [--mps] [--threads N]\n"
+        "                     [--league F] [--rule-prob F] [--oracle-iters N]\n"
+        "                     [--eval-every N] [--eval-games N]\n"
+        "                     [--oracle-coef F] [--no-oracle] [--seed N]\n"
+        "  perfecttexas eval  --resume DIR [--vs rule|random|self] [--hands N]\n"
+        "  perfecttexas probe  [--resume DIR]\n"
+        "  perfecttexas bench  [--hands N]\n"
         "\n"
-        "选项:\n"
-        "  --iters N    迭代轮数（kuhn 默认 20000，leduc 默认 10000，holdem 默认 1000000）\n"
-        "  --report M   每隔多少轮报告一次（默认 iters/10）\n"
-        "  --csv FILE   把 (iter,exploitability,value) 曲线写成 CSV\n"
-        "  --vanilla    用原始 CFR 而不是 CFR+\n"
-        "  --dump N     打印前 N 个信息集的平均策略\n"
-        "  --hero HAND  自己的两张手牌，如 AhKh\n"
-        "  --board STR  公共牌，如 QhJh2c（可空）\n"
-        "  --opp N      对手人数（默认 1）\n"
-        "  --buckets N  翻牌后分桶数（默认 20，最小 9；越大越细但收敛越慢）\n"
-        "  --variant V  遗憾累计方式：dcfr（默认）或 cfrplus\n"
-        "  --sizes P    动作抽象预设（默认 sharp，实测最强）：\n"
-        "               default（2.5x/4x + 半池/一池，历史基准，README 里的旧数字用它）\n"
-        "               one（1 档）/ three（3 档）/ nojam（去掉 all-in）\n"
-        "               small（2x/3x + 1/3,3/4 池）/ big（3x/5x + 一池,两池）\n"
-        "               wide（3x/4x/5x + 半池/一池/两池）\n"
-        "               sharp（3x/4x/5x + 2.5x 前注，默认）/ sharpest（再加 2.25x，+0.91 但慢 45%%）\n"
-        "  --no-sized-history  让应对方看不见对手的下注额（这是要复现的缺陷，不是优化）\n"
-        "  --save FILE  训练完把策略存盘，可当作以后的基准对手\n"
-        "  --load FILE  从存盘读入策略（给了就跳过训练；续训时 --variant 要与原文件一致）\n"
-        "  --seed N     随机种子（默认 20240518）\n"
-        "  --ev-hands N 对均匀随机对手的评估手数（默认 20000，0 表示跳过）\n"
-        "  --hands N    match 的对局手数（默认 150000，两个座位各打一遍）\n"
-        "  --a / --b    match 的双方策略文件（--a 为被测方，收益从它视角计）\n");
+        "说明:\n"
+        "  --league F      对手是历史快照的概率（默认 0.25）\n"
+        "  --rule-prob F   对手是规则机器人的概率（默认 0.05；1.0 等于只跟机器人打）\n"
+        "  --oracle-coef F 开天眼稠密奖励的系数（默认 0.05，0 等于关掉）\n"
+        "  --no-oracle     关闭开天眼稠密奖励（只保留 critic 的完美信息价值）\n");
 }
 
-int parseInt(const char* s, int fallback) {
-    if (!s) return fallback;
-    char* end = nullptr;
-    const long v = std::strtol(s, &end, 10);
-    if (end == s) return fallback;
-    return static_cast<int>(v);
+void saveModels(const texas::nn::Actor* actors, const texas::nn::Critic* critics,
+                const std::string& dir) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    for (int s = 0; s < 2; ++s) {
+        actors[s]->saveTo(dir + "/actor" + std::to_string(s) + ".pt");
+        critics[s]->saveTo(dir + "/critic" + std::to_string(s) + ".pt");
+    }
 }
 
-Args parseArgs(int argc, char** argv) {
-    Args a;
-    if (argc >= 2) a.cmd = argv[1];
-    if (argc >= 3 && a.cmd == "solve") a.game = argv[2];
+bool loadModels(texas::nn::Actor* actors, texas::nn::Critic* critics, const std::string& dir) {
+    if (!std::filesystem::exists(dir + "/actor0.pt")) return false;
+    bool ok = true;
+    for (int s = 0; s < 2; ++s) {
+        ok = actors[s]->loadFrom(dir + "/actor" + std::to_string(s) + ".pt") && ok;
+        ok = critics[s]->loadFrom(dir + "/critic" + std::to_string(s) + ".pt") && ok;
+    }
+    return ok;
+}
 
-    for (int i = 1; i < argc; ++i) {
-        const std::string k = argv[i];
-        const bool hasNext = (i + 1 < argc);
-        if (k == "--iters" && hasNext) {
-            a.iters = parseInt(argv[++i], a.iters);
-        } else if (k == "--report" && hasNext) {
-            a.report = parseInt(argv[++i], a.report);
-        } else if (k == "--dump" && hasNext) {
-            a.dump = parseInt(argv[++i], a.dump);
-        } else if (k == "--csv" && hasNext) {
-            a.csv = argv[++i];
-        } else if (k == "--vanilla") {
-            a.vanilla = true;
-        } else if (k == "--hero" && hasNext) {
-            a.hero = argv[++i];
-        } else if (k == "--board" && hasNext) {
-            a.board = argv[++i];
-        } else if (k == "--opp" && hasNext) {
-            a.opp = parseInt(argv[++i], a.opp);
-        } else if (k == "--buckets" && hasNext) {
-            a.buckets = parseInt(argv[++i], a.buckets);
-        } else if (k == "--variant" && hasNext) {
-            a.variant = argv[++i];
-        } else if (k == "--sizes" && hasNext) {
-            a.sizes = argv[++i];
-        } else if (k == "--no-sized-history") {
-            a.sizedHistory = false;
-        } else if (k == "--save" && hasNext) {
-            a.save = argv[++i];
-        } else if (k == "--load" && hasNext) {
-            a.load = argv[++i];
-        } else if (k == "--a" && hasNext) {
-            a.fileA = argv[++i];
-        } else if (k == "--b" && hasNext) {
-            a.fileB = argv[++i];
-        } else if (k == "--hands" && hasNext) {
-            a.hands = parseInt(argv[++i], a.hands);
-        } else if (k == "--ev-hands" && hasNext) {
-            a.evHands = parseInt(argv[++i], a.evHands);
-        } else if (k == "--seed" && hasNext) {
-            a.seed = std::strtoull(argv[++i], nullptr, 10);
+torch::Device pickDevice(int argc, char** argv) {
+    if (hasFlag(argc, argv, "--mps") && torch::mps::is_available()) return torch::kMPS;
+    return torch::kCPU;
+}
+
+// ---------------------------------------------------------------- train
+
+int cmdTrain(int argc, char** argv) {
+    const int updates = argInt(argc, argv, "--updates", 200);
+    const int games = argInt(argc, argv, "--games", 512);
+    const std::string outDir = argStr(argc, argv, "--out", "ckpt");
+    const std::string resumeDir = argStr(argc, argv, "--resume", "");
+    const int seed = argInt(argc, argv, "--seed", 20240518);
+    const int evalEvery = argInt(argc, argv, "--eval-every", 10);
+    const int evalGames = argInt(argc, argv, "--eval-games", 512);
+    const int snapshots = argInt(argc, argv, "--snapshots", 8);
+    const int hwThreads = argInt(argc, argv, "--threads", 0);
+
+    const torch::Device device = pickDevice(argc, argv);
+    if (hwThreads > 0) torch::set_num_threads(hwThreads);
+
+    texas::nn::ModelConfig mc;
+    mc.hidden = argInt(argc, argv, "--hidden", 256);
+    mc.lstmHidden = argInt(argc, argv, "--lstm", 128);
+
+    texas::ModelSet models;
+    for (int s = 0; s < 2; ++s) {
+        models.actor[s] = texas::nn::Actor(std::make_shared<texas::nn::ActorImpl>(mc));
+        models.critic[s] = texas::nn::Critic(std::make_shared<texas::nn::CriticImpl>(mc));
+    }
+
+    if (!resumeDir.empty()) {
+        if (loadModels(models.actor, models.critic, resumeDir)) {
+            std::printf("resumed from %s\n", resumeDir.c_str());
+        } else {
+            std::printf("!! resume failed: %s (starting fresh)\n", resumeDir.c_str());
         }
     }
-    return a;
-}
 
-std::vector<texas::Card> parseCards(const std::string& s) {
-    std::vector<texas::Card> out;
-    for (std::size_t i = 0; i + 1 < s.size(); i += 2) {
-        const texas::Card c = texas::parseCard(s.substr(i, 2));
-        if (c >= 0) out.push_back(c);
+    texas::ppo::Config pcfg;
+    pcfg.lr = static_cast<float>(argDouble(argc, argv, "--lr", 1e-3));
+    pcfg.clip = static_cast<float>(argDouble(argc, argv, "--clip", 0.2));
+    pcfg.entCoef = static_cast<float>(argDouble(argc, argv, "--entropy", 0.01));
+    pcfg.epochs = argInt(argc, argv, "--epochs", 4);
+    pcfg.minibatch = argInt(argc, argv, "--minibatch", 128);
+
+    std::unique_ptr<texas::Learner> learners[2];
+    for (int s = 0; s < 2; ++s) {
+        learners[s] = std::make_unique<texas::Learner>(models.actor[s], models.critic[s], pcfg, device);
+        if (!resumeDir.empty()) learners[s]->loadOptimizers(resumeDir);
     }
-    return out;
-}
 
-template <class G>
-void printStrategy(const texas::CFRSolver<G>& solver,
-                   const texas::Strategy& sigma,
-                   int maxCount) {
-    std::vector<std::pair<std::string, texas::InfoKey>> rows;
-    for (const auto& kv : solver.names()) rows.emplace_back(kv.second, kv.first);
-    std::sort(rows.begin(), rows.end());
+    texas::HistoricalPool pool;
+    texas::RolloutConfig rcfg;
+    rcfg.games = games;
+    rcfg.historicalProb = static_cast<float>(argDouble(argc, argv, "--league", 0.25));
+    rcfg.ruleProb = static_cast<float>(argDouble(argc, argv, "--rule-prob", 0.05));
+    rcfg.oracleReward = !hasFlag(argc, argv, "--no-oracle");
+    rcfg.oracleCoef = static_cast<float>(argDouble(argc, argv, "--oracle-coef", 0.05));
+    rcfg.equityIters = argInt(argc, argv, "--oracle-iters", 32);
 
-    const int limit = (maxCount < 0) ? static_cast<int>(rows.size())
-                                     : std::min<int>(maxCount, static_cast<int>(rows.size()));
-    std::printf("\n  平均策略（前 %d / %zu 个信息集）:\n", limit, rows.size());
-    for (int i = 0; i < limit; ++i) {
-        const texas::InfoKey key = rows[static_cast<std::size_t>(i)].second;
-        const auto itS = sigma.find(key);
-        const auto itI = solver.infosets().find(key);
-        if (itS == sigma.end() || itI == solver.infosets().end()) continue;
-        std::printf("    %-34s", rows[static_cast<std::size_t>(i)].first.c_str());
-        for (int j = 0; j < itI->second.n; ++j) {
-            std::printf(" %c=%.3f", itI->second.actChars[j], itS->second[static_cast<std::size_t>(j)]);
+    std::printf("PerfectTexasCPP train | 单挑 NLHE %d 筹码 | 节点特征 %d + 开天眼 %d + 序列 %d\n",
+                texas::kStartingStack, texas::kNodeInput, texas::kExtraInput, texas::kSeqInput);
+    std::printf("  hidden=%lld lstm=%lld | device=%s | games/update=%d | league=%.2f rule=%.2f oracle=%.2f\n",
+                static_cast<long long>(mc.hidden), static_cast<long long>(mc.lstmHidden),
+                device.type() == torch::kMPS ? "mps" : "cpu", games, rcfg.historicalProb,
+                rcfg.ruleProb, rcfg.oracleReward ? rcfg.oracleCoef : 0.0f);
+    std::printf("  %6s %7s %7s %6s %6s %6s %8s %8s %7s %6s %7s | %s\n", "update", "games", "sbWin%",
+                "sd%", "jam%", "fold%", "pgLoss", "vLoss", "entropy", "kl", "upd/s", "batch");
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int u = 1; u <= updates; ++u) {
+        rcfg.seed = static_cast<uint64_t>(seed) * 1000003ULL + static_cast<uint64_t>(u);
+        std::array<std::vector<texas::Transition>, 2> tr;
+        texas::RolloutStats stats;
+        texas::collectRollout(models, pool.empty() ? nullptr : &pool, rcfg, tr, stats);
+
+        double pg = 0, vl = 0, ent = 0, kl = 0, retMean = 0, retStd = 0, valMean = 0;
+        for (int s = 0; s < 2; ++s) {
+            if (tr[s].empty()) continue;
+            texas::ppo::assignEpisodeReturns(tr[s], pcfg.gamma, pcfg.lambda);
+            texas::BatchTensors batch;
+            texas::buildBatch(tr[s], batch);
+            const texas::ppo::Stats st = learners[s]->update(batch);
+            pg += st.pgLoss;
+            vl += st.vLoss;
+            ent += st.entropy;
+            kl += st.kl;
+            retMean += st.retMean;
+            retStd += st.retStd;
+            valMean += st.valueMean;
         }
-        std::printf("\n");
+
+        const auto now = std::chrono::steady_clock::now();
+        const double secs = std::chrono::duration<double>(now - t0).count();
+        const double winPct =
+            stats.games > 0 ? 100.0 * double(stats.sbWins) / double(stats.games) : 0.0;
+        const double sdPct =
+            stats.games > 0 ? 100.0 * double(stats.showdowns) / double(stats.games) : 0.0;
+        const double jamPct = stats.decisions > 0
+                                  ? 100.0 * double(stats.allinDecisions) / double(stats.decisions)
+                                  : 0.0;
+        const double foldPct = stats.decisions > 0
+                                   ? 100.0 * double(stats.folds) / double(stats.decisions)
+                                   : 0.0;
+        std::printf(
+            "  %6d %7d %7.1f %6.1f %6.1f %6.1f %8.4f %8.4f %7.3f %6.1e %7.2f | ret %.3f±%.3f val %.3f\n",
+            u, stats.games, winPct, sdPct, jamPct, foldPct, pg / 2, vl / 2, ent / 2, kl / 2,
+            double(u) / secs, retMean / 2, retStd / 2, valMean / 2);
+        std::fflush(stdout);
+
+        if (evalEvery > 0 && (u % evalEvery == 0 || u == updates)) {
+            const texas::EvalResult vr = texas::evalVsRule(models.actor, evalGames, 12345 + u);
+            const texas::EvalResult vs = texas::evalSelfPlay(models.actor, evalGames / 2, 777 + u);
+            std::printf("         [eval] vs rule %+7.2f ± %.2f 筹码/手 (%+6.1f bb/100) | self %+5.2f ± %.2f\n",
+                        vr.chipsPerHand, vr.stderr, vr.bbPer100, vs.chipsPerHand, vs.stderr);
+            std::fflush(stdout);
+
+            auto snap = std::make_shared<texas::Snapshot>();
+            snap->update = u;
+            for (int s = 0; s < 2; ++s) {
+                snap->actor[s] = texas::nn::cloneActor(models.actor[s]);
+                snap->actor[s]->eval();
+            }
+            pool.items.push_back(snap);
+            while (static_cast<int>(pool.items.size()) > snapshots) pool.items.erase(pool.items.begin());
+
+            saveModels(models.actor, models.critic, outDir);
+            for (int s = 0; s < 2; ++s) learners[s]->saveOptimizers(outDir);
+        }
     }
-}
 
-template <class G>
-int runSolve(const Args& a) {
-    using Solver = texas::CFRSolver<G>;
-    const bool isKuhn = (std::is_same<G, texas::KuhnGame>::value);
-    const int iters = (a.iters > 0) ? a.iters : (isKuhn ? 20000 : 10000);
-    const int report = (a.report > 0) ? a.report : std::max(1, iters / 10);
-    const int dump = (a.dump >= 0) ? a.dump : (isKuhn ? -1 : 24);
-
-    const typename Solver::Options opt(!a.vanilla, !a.vanilla);
-    Solver solver(opt);
-
-    std::ofstream csv;
-    if (!a.csv.empty()) {
-        csv.open(a.csv);
-        if (csv) csv << "iter,exploitability,value\n";
-    }
-
-    std::printf("\n=== %s | %s | 对手 %d 人 ===\n", isKuhn ? "Kuhn Poker" : "Leduc Hold'em",
-                a.vanilla ? "vanilla CFR" : "CFR+ (alternating, linear avg)", 1);
-    std::printf("  %10s  %14s  %12s  %10s\n", "iter", "exploitability", "value(P0)", "infosets");
-
-    int done = 0;
-    while (done < iters) {
-        const int chunk = std::min(report, iters - done);
-        solver.iterate(chunk);
-        done += chunk;
-
-        const texas::Strategy sigma = solver.averageStrategy();
-        const double expl = texas::exploitability<G>(sigma);
-        const double val = solver.expectedValue(sigma);
-        std::printf("  %10d  %14.6f  %12.6f  %10zu\n", done, expl, val, solver.numInfosets());
-        if (csv) csv << done << "," << expl << "," << val << "\n";
-    }
-
-    printStrategy(solver, solver.averageStrategy(), dump);
-    if (!a.csv.empty()) std::printf("\n  CSV 已写入 %s\n", a.csv.c_str());
+    saveModels(models.actor, models.critic, outDir);
+    for (int s = 0; s < 2; ++s) learners[s]->saveOptimizers(outDir);
+    std::printf("models saved to %s\n", outDir.c_str());
     return 0;
 }
 
-int runEquity(const Args& a) {
-    const std::vector<texas::Card> hero = parseCards(a.hero);
-    const std::vector<texas::Card> board = parseCards(a.board);
-    if (hero.size() != 2) {
-        std::printf("错误: --hero 需要正好两张牌，例如 AhKh\n");
+// ---------------------------------------------------------------- eval
+
+int cmdEval(int argc, char** argv) {
+    const std::string dir = argStr(argc, argv, "--resume", "ckpt");
+    const std::string vs = argStr(argc, argv, "--vs", "rule");
+    const int hands = argInt(argc, argv, "--hands", 2000);
+    const int seed = argInt(argc, argv, "--seed", 90001);
+
+    texas::nn::ModelConfig mc;
+    texas::nn::Actor actors[2];
+    texas::nn::Critic critics[2];
+    for (int s = 0; s < 2; ++s) {
+        actors[s] = texas::nn::Actor(std::make_shared<texas::nn::ActorImpl>(mc));
+        critics[s] = texas::nn::Critic(std::make_shared<texas::nn::CriticImpl>(mc));
+    }
+    if (!loadModels(actors, critics, dir)) {
+        std::printf("cannot load model from %s\n", dir.c_str());
         return 1;
     }
-    const int iters = (a.iters > 0) ? a.iters : 200000;
 
-    std::printf("\n=== 胜率估算 ===\n");
-    std::printf("  手牌   : %s %s\n", texas::cardToString(hero[0]).c_str(),
-                texas::cardToString(hero[1]).c_str());
-    std::printf("  公共牌 : ");
-    if (board.empty()) {
-        std::printf("(无)\n");
+    texas::EvalResult r;
+    if (vs == "random") {
+        r = texas::evalVsRandom(actors, hands, static_cast<uint64_t>(seed));
+    } else if (vs == "self") {
+        r = texas::evalSelfPlay(actors, hands, static_cast<uint64_t>(seed));
     } else {
-        for (texas::Card c : board) std::printf("%s ", texas::cardToString(c).c_str());
-        std::printf("\n");
+        r = texas::evalVsRule(actors, hands, static_cast<uint64_t>(seed));
     }
-    std::printf("  对手   : %d 人\n", a.opp);
-    std::printf("  采样   : %d 次\n", iters);
-
-    const texas::EquityResult r = texas::equityMonteCarlo(hero, board, a.opp, iters);
-    std::printf("\n  胜 %.2f%%   平 %.2f%%   负 %.2f%%   ->  equity %.2f%%\n", r.win * 100.0,
-                r.tie * 100.0, r.lose * 100.0, r.equity() * 100.0);
+    std::printf("%s: %d 手, %+0.3f ± %.3f 筹码/手, %+0.1f bb/100\n", vs.c_str(), r.hands,
+                r.chipsPerHand, r.stderr, r.bbPer100);
     return 0;
 }
 
-int runDemo() {
-    std::printf("\n########## Kuhn Poker：CFR+ 收敛过程 ##########\n");
-    {
-        texas::CFRSolver<texas::KuhnGame> solver;
-        double prevExpl = 1e9;
-        for (int step = 1; step <= 6; ++step) {
-            solver.iterate(step == 1 ? 100 : 500);
-            const texas::Strategy sigma = solver.averageStrategy();
-            const double expl = texas::exploitability<texas::KuhnGame>(sigma);
-            const double val = solver.expectedValue(sigma);
-            std::printf("  iter=%6d  expl=%.6f  value=%+.6f  (-1/18 = %.6f)\n", solver.iterations(),
-                        expl, val, -1.0 / 18.0);
-            prevExpl = expl;
-        }
-        std::printf("  最终误差: |value - (-1/18)| = %.6f\n",
-                    std::fabs(solver.expectedValue(solver.averageStrategy()) + 1.0 / 18.0));
-        (void)prevExpl;
+// ---------------------------------------------------------------- probe
+
+// 打印某个具体局面上各动作的平均策略概率。用来看"学到的策略像不像会打牌"，
+// 但注意：策略形状不是判据，对打胜率才是（见 README）。
+void probeOne(const texas::nn::Actor& actor, const char* label, const texas::HUState& st) {
+    texas::LegalMove lm[16];
+    const int n = texas::legalMoves(st, lm);
+    if (n <= 0) {
+        std::printf("  %-28s (无合法动作)\n", label);
+        return;
+    }
+    const int64_t B = 1;
+    torch::Tensor nodeT = torch::zeros({B, texas::kNodeInput}, torch::kFloat32);
+    torch::Tensor seqT = torch::zeros({B, texas::kHistSteps, texas::kHistDim}, torch::kFloat32);
+    torch::Tensor featT = torch::zeros({n, texas::kActionInput}, torch::kFloat32);
+    torch::Tensor sampleT = torch::zeros({n}, torch::kLong);
+    torch::Tensor idT = torch::zeros({n}, torch::kLong);
+
+    texas::Obs obs;
+    texas::encodeObservation(st, obs, 256);
+    std::copy(obs.node.begin(), obs.node.end(), nodeT.data_ptr<float>());
+    std::copy(obs.seq.begin(), obs.seq.end(), seqT.data_ptr<float>());
+    for (int i = 0; i < n; ++i) {
+        std::array<float, texas::kActionInput> af;
+        texas::encodeActionFeature(st, lm[i], af);
+        std::copy(af.begin(), af.end(), featT.data_ptr<float>() + i * texas::kActionInput);
+        sampleT.data_ptr<int64_t>()[i] = 0;
+        idT.data_ptr<int64_t>()[i] = lm[i].slot;
     }
 
-    std::printf("\n########## 手牌胜率 ##########\n");
-    {
-        const texas::Card aa[2] = {texas::parseCard("Ah"), texas::parseCard("As")};
-        const texas::Card kk[2] = {texas::parseCard("Kh"), texas::parseCard("Ks")};
-        const texas::Card s72[2] = {texas::parseCard("7h"), texas::parseCard("2c")};
-        const std::vector<texas::Card> none;
-        const auto rAA = texas::equityMonteCarlo({aa[0], aa[1]}, none, 1, 50000);
-        const auto rKK = texas::equityMonteCarlo({kk[0], kk[1]}, none, 1, 50000);
-        const auto r72 = texas::equityMonteCarlo({s72[0], s72[1]}, none, 1, 50000);
-        std::printf("  AA vs 随机 : %.2f%%\n", rAA.equity() * 100.0);
-        std::printf("  KK vs 随机 : %.2f%%\n", rKK.equity() * 100.0);
-        std::printf("  72o vs 随机: %.2f%%\n", r72.equity() * 100.0);
+    torch::NoGradGuard ng;
+    torch::Tensor logits = actor->forward(nodeT, seqT, featT, sampleT, idT);
+    const float* lp = logits.data_ptr<float>();
+    float probs[texas::kNumActions];
+    texas::ppo::maskedSoftmax(lp, texas::kNumActions, probs);
+
+    std::printf("  %-24s [str=%.2f eq=%.2f]", label,
+                double(obs.node[texas::kHoleDim + texas::kBoardDim + 14]),
+                double(obs.equityPerfect));
+    char buf[32];
+    for (int i = 0; i < n; ++i) {
+        const texas::Move& mv = lm[i].mv;
+        if (lm[i].slot == texas::kSlotFold) std::snprintf(buf, sizeof buf, "fold");
+        else if (lm[i].slot == texas::kSlotCheckCall) std::snprintf(buf, sizeof buf, "call");
+        else if (lm[i].slot == texas::kSlotAllIn) std::snprintf(buf, sizeof buf, "jam%d", int(mv.to));
+        else std::snprintf(buf, sizeof buf, "r%d", int(mv.to));
+        std::printf(" %s=%.2f", buf, probs[lm[i].slot]);
     }
-    return 0;
+    std::printf("\n");
 }
 
-texas::CfrVariant parseVariant(const std::string& s) {
-    if (s == "cfrplus" || s == "cfr+" || s == "plus") return texas::CfrVariant::CFRPlus;
-    return texas::CfrVariant::DCFR;
-}
-
-const char* variantName(texas::CfrVariant v) {
-    return v == texas::CfrVariant::DCFR ? "DCFR" : "CFR+";
-}
-
-// 动作抽象预设的名字表放在 holdem.hpp 里（名字↔动作集是同一个博弈的一部分，
-// 且要能被测试钉住）。这里只做 CLI 侧的两个动作：解析与展示。
-bool parseActionPreset(const std::string& name, texas::ActionSpace& sp) {
-    return texas::actionPreset(name, sp);
-}
-
-int runHoldem(const Args& a) {
-    // 默认 100 万轮。这个数不是拍脑袋：修好信息集划分后（树大了 15 倍），
-    // 以固定的旧模型为标尺测强度曲线是 12.5万+1.04 / 25万+1.78 / 50万+2.06 /
-    // 100万+2.51 / 200万+2.40（筹码每手），100 万到 200 万已经在噪声里。
-    const int iters = (a.iters > 0) ? a.iters : 1000000;
-    const int buckets = (a.buckets > 0) ? a.buckets : 20;
-    const int report = (a.report > 0) ? a.report : std::max(1, iters / 10);
-    const int evHands = (a.evHands >= 0) ? a.evHands : 20000;
-    const texas::CfrVariant variant = parseVariant(a.variant);
-
-    texas::StrengthModel::instance();  // 预热牌力表
-    texas::HoldemSolver solver(buckets, a.seed, variant, a.sizedHistory);
-    texas::ActionSpace space;
-    if (!parseActionPreset(a.sizes, space)) {
-        std::printf("错误: 不认识的动作集预设 --sizes %s\n", a.sizes.c_str());
+int cmdProbe(int argc, char** argv) {
+    const std::string dir = argStr(argc, argv, "--resume", "ckpt");
+    texas::nn::ModelConfig mc;
+    texas::nn::Actor actors[2];
+    texas::nn::Critic critics[2];
+    for (int s = 0; s < 2; ++s) {
+        actors[s] = texas::nn::Actor(std::make_shared<texas::nn::ActorImpl>(mc));
+        critics[s] = texas::nn::Critic(std::make_shared<texas::nn::CriticImpl>(mc));
+    }
+    if (!loadModels(actors, critics, dir)) {
+        std::printf("cannot load model from %s\n", dir.c_str());
         return 1;
     }
-    solver.setActionSpace(space);
 
-    std::printf("\n=== 无限注德州 Hold'em | 单挑 100BB | MCCFR (external sampling) ===\n");
-    std::printf("  翻牌后 %d 桶 | 抽象: 翻牌前 169 类全分辨率 + 翻牌后潜力修正百分位 | %s\n",
-                buckets, variantName(variant));
-
-    bool loaded = false;
-    if (!a.load.empty()) {
-        loaded = solver.load(a.load.c_str());
-        if (!loaded) {
-            std::printf("错误: 读不到策略文件 %s\n", a.load.c_str());
-            return 1;
-        }
-        std::printf("  已读入 %s：infosets=%zu 遗憾上界=%.4f（跳过训练）\n", a.load.c_str(),
-                    solver.numInfosets(), solver.regretBound());
-    }
-
-    // 放在读盘之后打印：动作集跟着模型文件走，--sizes 会被文件里的值覆盖。
-    // 名字按**实际在用的动作集**反查，不回显 a.sizes —— 覆盖之后那个字符串是假的。
-    {
-        const texas::ActionSpace& sp = solver.abstraction().actionSpace;
-        const char* actual = texas::actionSpaceName(sp);
-        std::printf("  动作集 %s：翻牌前 %d 档、翻牌后 %d 档、all-in %s | 下注额%s\n", actual,
-                    sp.preflopCount, sp.postflopCount, sp.includeAllIn ? "有" : "无",
-                    solver.abstraction().sizedHistory ? "可见" : "**不可见**（缺陷复现）");
-        if (loaded && a.sizes != actual) {
-            std::printf("  注意: --sizes %s 被模型文件覆盖，实际在用 %s\n", a.sizes.c_str(),
-                        actual);
-        }
-    }
-
-    if (!loaded) {
-        std::printf("  %10s  %10s  %10s  %12s\n", "iter", "infosets", "轮/s", "遗憾上界");
-        int done = 0;
-        while (done < iters) {
-            const int chunk = std::min(report, iters - done);
-            const auto t0 = std::chrono::steady_clock::now();
-            solver.iterate(chunk);
-            const auto t1 = std::chrono::steady_clock::now();
-            done += chunk;
-            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            std::printf("  %10d  %10zu  %10.0f  %12.4f\n", done, solver.numInfosets(),
-                        ms > 0 ? chunk / (ms / 1000.0) : 0.0, solver.regretBound());
-        }
-        if (!a.save.empty()) {
-            if (solver.save(a.save.c_str())) {
-                std::printf("\n  策略已存盘: %s\n", a.save.c_str());
-            } else {
-                std::printf("\n  错误: 存盘失败 %s\n", a.save.c_str());
-            }
-        }
-    }
-
-    std::printf("\n  翻牌前（小盲/按钮面对大盲）平均策略:\n");
-    auto show = [&](const char* label, const char* c1, const char* c2) {
-        texas::HoldemGame::State st = texas::HoldemGame::init(2);
-        st.hole[0][0] = texas::parseCard(c1);
-        st.hole[0][1] = texas::parseCard(c2);
-        const std::vector<double> p = solver.averageStrategy(st);
-        texas::Move mv[texas::HoldemGame::kMaxActions];
-        // 必须用求解器**实际在跑**的动作集来生成标签。用默认动作集会打印出
-        // 另一套尺寸的标签贴在别人的概率上——档数一变，标签就整体错位，
-        // 而且错得很像真的。
-        const int n = texas::HoldemGame::actions(st, mv, texas::HoldemGame::kMaxActions,
-                                                 solver.abstraction().actionSpace);
-        std::printf("    %-6s", label);
-        for (int i = 0; i < n && i < static_cast<int>(p.size()); ++i) {
-            if (mv[i].kind == texas::Move::Fold) {
-                std::printf("  fold=%.2f", p[static_cast<std::size_t>(i)]);
-            } else if (mv[i].kind == texas::Move::CheckCall) {
-                std::printf("  call=%.2f", p[static_cast<std::size_t>(i)]);
-            } else {
-                std::printf("  r%d=%.2f", mv[i].amount, p[static_cast<std::size_t>(i)]);
-            }
-        }
-        std::printf("\n");
+    auto C = [](const char* t) { return texas::parseCard(t); };
+    struct Case {
+        const char* label;
+        const char* a0;
+        const char* b0;
+        const char* a1;
+        const char* b1;
+        const char* board[5];
+        int boardN;
     };
-    show("AA", "Ac", "Ad");
-    show("KK", "Kc", "Kd");
-    show("AKs", "Ah", "Kh");
-    show("22", "2c", "2d");
-    show("72o", "7h", "2d");
+    const Case cases[] = {
+        {"AA 翻牌前(先行动)", "Ah", "Ad", "7c", "2d", {nullptr, nullptr, nullptr, nullptr, nullptr}, 0},
+        {"KK 翻牌前(先行动)", "Kh", "Kd", "7c", "2d", {nullptr, nullptr, nullptr, nullptr, nullptr}, 0},
+        {"AKs 翻牌前(先行动)", "Ah", "Kh", "7c", "2d", {nullptr, nullptr, nullptr, nullptr, nullptr}, 0},
+        {"72o 翻牌前(先行动)", "7h", "2d", "Ac", "Kc", {nullptr, nullptr, nullptr, nullptr, nullptr}, 0},
+        {"AA 在 K72 面(先行动)", "Ah", "Ad", "Kc", "Qd", {"Kd", "7s", "2c", nullptr, nullptr}, 3},
+        {"72o 在 K72 面(先行动)", "7h", "2d", "Ac", "Qc", {"Kd", "7s", "2c", nullptr, nullptr}, 3},
+    };
 
-    // 策略质量标尺：打均匀随机对手的平均净收益（不是可利用度，只做横向比较）
-    if (evHands > 0) {
-        const double evSb = solver.evVsUniform(evHands, 0);
-        const double evBb = solver.evVsUniform(evHands, 1);
-        std::printf("\n  对均匀随机对手的每手平均净收益（%d 手）:\n", evHands);
-        std::printf("    小盲/按钮位 %.3f 筹码 | 大盲位 %.3f 筹码\n", evSb, evBb);
+    std::printf("平均策略（动作后金额，jam=全下）:\n");
+    for (const Case& c : cases) {
+        texas::Card h0[2] = {C(c.a0), C(c.b0)};
+        texas::Card h1[2] = {C(c.a1), C(c.b1)};
+        texas::Card board[5] = {0, 0, 0, 0, 0};
+        for (int i = 0; i < 5; ++i) {
+            if (c.board[i]) board[i] = C(c.board[i]);
+        }
+        texas::HUState st = texas::makeState(h0, h1, board, c.boardN);
+        probeOne(actors[0], c.label, st);
     }
     return 0;
 }
 
-// 两个已存盘策略对打。这是唯一能验证"变强"的手段：自对局在零和对称游戏里恒为 0，
-// 打均匀随机对手又太软，只有跟一个冻结的、同量级的策略对打才有分辨力。
-int runMatch(const Args& a) {
-    if (a.fileA.empty() || a.fileB.empty()) {
-        std::printf("错误: match 需要 --a FILE 和 --b FILE\n");
-        return 1;
-    }
-    const int hands = (a.hands > 0) ? a.hands : 150000;
+// ---------------------------------------------------------------- sanity
 
-    texas::HoldemSolver A(20, a.seed);
-    texas::HoldemSolver B(20, a.seed);
-    if (!A.load(a.fileA.c_str())) {
-        std::printf("错误: 读不到策略文件 %s\n", a.fileA.c_str());
-        return 1;
+// 端到端体检：把优势换成一个已知与牌力强相关的合成信号，看 actor 能不能学会
+// "强牌加注、弱牌弃牌"。如果连这个都学不会，问题在 actor/PPO 链路；如果学得会，
+// 说明链路没问题，真实训练里的困难来自优势的噪声（下注树的方差）。
+int cmdSanity(int argc, char** argv) {
+    const int steps = argInt(argc, argv, "--steps", 300);
+    texas::nn::ModelConfig mc;
+    texas::ModelSet models;
+    for (int s = 0; s < 2; ++s) {
+        models.actor[s] = texas::nn::Actor(std::make_shared<texas::nn::ActorImpl>(mc));
+        models.critic[s] = texas::nn::Critic(std::make_shared<texas::nn::CriticImpl>(mc));
     }
-    if (!B.load(a.fileB.c_str())) {
-        std::printf("错误: 读不到策略文件 %s\n", a.fileB.c_str());
-        return 1;
-    }
+    texas::RolloutConfig rc;
+    rc.games = 256;
+    rc.seed = 4242;
+    rc.historicalProb = 0.0f;
+    rc.ruleProb = 0.0f;
+    std::array<std::vector<texas::Transition>, 2> tr;
+    texas::RolloutStats st;
+    texas::collectRollout(models, nullptr, rc, tr, st);
 
-    std::printf("\n=== 策略对打 ===\n");
-    std::printf("  A（被测）: %s  infosets=%zu 遗憾上界=%.4f\n", a.fileA.c_str(), A.numInfosets(),
-                A.regretBound());
-    std::printf("  B（基准）: %s  infosets=%zu 遗憾上界=%.4f\n", a.fileB.c_str(), B.numInfosets(),
-                B.regretBound());
-    std::printf("  手数: %d（两个座位各 %d 手，消除位置优势）\n", hands * 2, hands);
-
-    const texas::MatchResult r = texas::headToHeadBothSeats(A, B, hands, a.seed * 7919ULL + 17ULL);
-    const double ci = 1.96 * r.stderr;
-    std::printf("\n  A 每手净收益: %+0.4f 筹码  (95%% 置信区间 ±%.4f)\n", r.heroPerHand, ci);
-    if (std::fabs(r.heroPerHand) <= ci) {
-        std::printf("  结论: 差异不显著（区间含 0）\n");
-    } else {
-        std::printf("  结论: A 显著%s，约 %s %.4f 筹码/手\n", r.heroPerHand > 0 ? "更强" : "更弱",
-                    r.heroPerHand > 0 ? "多赢" : "少赢", std::fabs(r.heroPerHand));
+    // 合成优势：强牌加注给正优势、弱牌弃牌给正优势。
+    // 关键是优势必须"依赖动作"，否则每个动作被同等放大，政策学不到偏好。
+    for (int s = 0; s < 2; ++s) {
+        for (auto& t : tr[s]) {
+            const float strength = t.node[texas::kHoleDim + texas::kBoardDim + 14];
+            const float centered = 2.0f * (strength - 0.5f);
+            float adv = 0.0f;
+            for (const auto& a : t.actions) {
+                if (a.slot != t.action) continue;
+                if (a.mv.kind == texas::MK_RAISE || a.mv.kind == texas::MK_ALLIN) adv = centered;
+                else if (a.mv.kind == texas::MK_FOLD) adv = -centered;
+            }
+            t.adv = adv;
+            t.ret = adv;
+        }
     }
+    std::printf("样本 %zu / %zu，合成优势 |adv| 均值 ≈ 0.5\n", tr[0].size(), tr[1].size());
+
+    texas::ppo::Config pcfg;
+    pcfg.lr = 1e-3f;
+    texas::Learner learner(models.actor[0], models.critic[0], pcfg, torch::kCPU);
+    texas::BatchTensors batch;
+    texas::buildBatch(tr[0], batch);
+    for (int u = 0; u < steps; ++u) learner.update(batch);
+
+    std::printf("训练 %d 轮合成优势后：\n", steps);
+    auto C = [](const char* t) { return texas::parseCard(t); };
+    const char* hands[][2] = {{"Ah", "Ad"}, {"7h", "2d"}, {"Kh", "Kd"}, {"8c", "5d"}};
+    const char* names[] = {"AA", "72o", "KK", "85o"};
+    for (int i = 0; i < 4; ++i) {
+        texas::Card h0[2] = {C(hands[i][0]), C(hands[i][1])};
+        texas::Card h1[2] = {C("Qc"), C("Jc")};
+        texas::HUState state = texas::makeState(h0, h1, nullptr, 0);
+        probeOne(models.actor[0], names[i], state);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- critfit
+
+// 单独验证 critic 的拟合能力：采一批自对局数据，然后把价值网在这批固定数据上
+// 反复训练。如果 RMSE 降不下去，问题在价值网结构或优化；如果能降下去，问题
+// 就在"每次只有 2000 个新样本、目标还在漂移"的训练循环上。
+int cmdCritFit(int argc, char** argv) {
+    const int steps = argInt(argc, argv, "--steps", 1500);
+    texas::nn::ModelConfig mc;
+    mc.hidden = argInt(argc, argv, "--hidden", 256);
+    mc.lstmHidden = argInt(argc, argv, "--lstm", 128);
+
+    texas::ModelSet models;
+    for (int s = 0; s < 2; ++s) {
+        models.actor[s] = texas::nn::Actor(std::make_shared<texas::nn::ActorImpl>(mc));
+        models.critic[s] = texas::nn::Critic(std::make_shared<texas::nn::CriticImpl>(mc));
+    }
+    texas::RolloutConfig rc;
+    rc.games = argInt(argc, argv, "--games", 256);
+    rc.seed = 42;
+    rc.historicalProb = 0.0f;
+    rc.ruleProb = 0.0f;
+    std::array<std::vector<texas::Transition>, 2> tr;
+    texas::RolloutStats st;
+    texas::collectRollout(models, nullptr, rc, tr, st);
+    std::printf("transitions: %zu / %zu\n", tr[0].size(), tr[1].size());
+    texas::ppo::assignEpisodeReturns(tr[0], 1.0f, 0.95f);
+    texas::BatchTensors b;
+    texas::buildBatch(tr[0], b);
+    std::printf("ret mean %.4f std %.4f | oldValue mean %.4f std %.4f\n",
+                b.ret.mean().item<double>(), b.ret.std().item<double>(),
+                b.oldValue.mean().item<double>(), b.oldValue.std().item<double>());
+
+    auto opt = torch::optim::Adam(models.critic[0]->parameters(), torch::optim::AdamOptions(1e-3));
+    for (int it = 1; it <= steps; ++it) {
+        opt.zero_grad();
+        auto v = models.critic[0]->forward(b.node, b.seq, b.extra).squeeze(-1);
+        auto loss = 0.5 * (v - b.ret).pow(2).mean();
+        loss.backward();
+        torch::nn::utils::clip_grad_norm_(models.critic[0]->parameters(), 5.0);
+        opt.step();
+        if (it % 100 == 0) {
+            const double mse = loss.item<double>() * 2.0;
+            std::printf("  step %4d  rmse %.4f  predStd %.4f\n", it, std::sqrt(mse),
+                        v.detach().std().item<double>());
+        }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- bench
+
+int cmdBench(int argc, char** argv) {
+    const int hands = argInt(argc, argv, "--hands", 2000);
+    texas::nn::ModelConfig mc;
+    texas::nn::Actor actors[2];
+    for (int s = 0; s < 2; ++s) {
+        actors[s] = texas::nn::Actor(std::make_shared<texas::nn::ActorImpl>(mc));
+    }
+    const texas::EvalResult r = texas::evalVsRule(actors, hands, 4242);
+    std::printf("未训练策略 vs 规则机器人: %+0.3f ± %.3f 筹码/手 (%+0.1f bb/100)\n",
+                r.chipsPerHand, r.stderr, r.bbPer100);
     return 0;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    const Args a = parseArgs(argc, argv);
-
-    if (a.cmd.empty() || a.cmd == "--help" || a.cmd == "-h") {
-        usage();
-        return a.cmd.empty() ? 1 : 0;
-    }
-    if (a.cmd == "demo") return runDemo();
-    if (a.cmd == "equity") return runEquity(a);
-    if (a.cmd == "holdem") return runHoldem(a);
-    if (a.cmd == "match") return runMatch(a);
-    if (a.cmd == "solve") {
-        if (a.game == "kuhn") return runSolve<texas::KuhnGame>(a);
-        if (a.game == "leduc") return runSolve<texas::LeducGame>(a);
-        std::printf("错误: 未知游戏 '%s'（可选 kuhn / leduc）\n", a.game.c_str());
-        return 1;
-    }
-
-    std::printf("错误: 未知命令 '%s'\n\n", a.cmd.c_str());
+    const std::string cmd = argc > 1 ? argv[1] : "help";
+    if (cmd == "train") return cmdTrain(argc, argv);
+    if (cmd == "eval") return cmdEval(argc, argv);
+    if (cmd == "probe") return cmdProbe(argc, argv);
+    if (cmd == "sanity") return cmdSanity(argc, argv);
+    if (cmd == "critfit") return cmdCritFit(argc, argv);
+    if (cmd == "bench") return cmdBench(argc, argv);
     usage();
-    return 1;
+    return 0;
 }
