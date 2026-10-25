@@ -427,11 +427,20 @@ void testHoldemActionSpace() {
         three.preflopCount = 3;
         three.preflopMul1000[2] = 6000;
         const int n = texas::HoldemGame::actions(s, mv, NA, three);
-        CHECK(n == NA);  // 弃 + 跟 + 3 档 + allin 正好填满 kMaxActions
+        CHECK(n == 6);  // 弃 + 跟 + 3 档 + allin
         CHECK(mv[2].amount == 5);
         CHECK(mv[3].amount == 8);
         CHECK(mv[4].amount == 12);
         CHECK(mv[5].amount == BUY);
+
+        // 4 档才会填满 kMaxActions（弃 + 跟 + 4 档 + allin）
+        texas::ActionSpace four;
+        four.preflopCount = 4;
+        four.preflopMul1000[2] = 6000;
+        four.preflopMul1000[3] = 9000;
+        const int n4 = texas::HoldemGame::actions(s, mv, NA, four);
+        CHECK(n4 == NA);
+        CHECK(mv[NA - 1].amount == BUY);  // all-in 在最后一位
     }
 
     // 去掉独立的 all-in 动作
@@ -549,6 +558,92 @@ void testActionSpaceNaming() {
 
     std::printf("  OK 动作集命名往返（%zu 个预设 / 未知名字 / 未读槽位不影响命名）\n",
                 table.size());
+}
+
+// 存盘格式 v4 到 v5 的兼容。v4 把 kMaxActions / kMaxSizes 这两个编译期常量写死进了
+// 文件布局（每条记录 6 个动作、每个动作数组 3 个数），所以动作数上限一提就必须留一条
+// 按**当时**常量解释旧文件的路径——否则旧文件不会被拒绝，而是被错位读成别的数据。
+void testHoldemSaveV4Compat() {
+    section("无限注德州 / 旧存盘格式兼容");
+
+    const char* v4path = "texas_cfr_test_v4.bin";
+    const char* v5path = "texas_cfr_test_v5.bin";
+    {
+        std::FILE* f = std::fopen(v4path, "wb");
+        CHECK(f != nullptr);
+        if (f == nullptr) return;
+        const std::uint32_t magic = 0x54434652u;
+        const std::uint32_t ver = 4;
+        const std::uint64_t cnt = 1;
+        const std::uint64_t iters = 1000;
+        const std::int32_t buckets = 20;
+        const std::int32_t sized = 1;
+        const std::int32_t allin = 1;
+        // v4 的动作数组是 3 个数（那时 kMaxSizes = 3）
+        const std::int32_t pre[3] = {2500, 4000, 2500};
+        const std::int32_t preCount = 2;
+        const std::int32_t post[3] = {500, 1000, 500};
+        const std::int32_t postCount = 2;
+        std::fwrite(&magic, sizeof(magic), 1, f);
+        std::fwrite(&ver, sizeof(ver), 1, f);
+        std::fwrite(&cnt, sizeof(cnt), 1, f);
+        std::fwrite(&iters, sizeof(iters), 1, f);
+        std::fwrite(&buckets, sizeof(buckets), 1, f);
+        std::fwrite(&sized, sizeof(sized), 1, f);
+        std::fwrite(pre, sizeof(std::int32_t), 3, f);
+        std::fwrite(&preCount, sizeof(preCount), 1, f);
+        std::fwrite(post, sizeof(std::int32_t), 3, f);
+        std::fwrite(&postCount, sizeof(postCount), 1, f);
+        std::fwrite(&allin, sizeof(allin), 1, f);
+        // 一条记录：key + n + 6 个遗憾 + 6 个平均策略（n 只用到前 5 个）
+        const std::uint64_t key = 0x0123456789abcdefULL;
+        const std::uint32_t n = 5;
+        double regret[6] = {1.0, 2.0, 3.0, 4.0, 5.0, 999.0};
+        double avg[6] = {6.0, 7.0, 8.0, 9.0, 10.0, 999.0};
+        std::fwrite(&key, sizeof(key), 1, f);
+        std::fwrite(&n, sizeof(n), 1, f);
+        std::fwrite(regret, sizeof(double), 6, f);
+        std::fwrite(avg, sizeof(double), 6, f);
+        std::fclose(f);
+    }
+
+    texas::HoldemSolver s(20, 1ULL, texas::CfrVariant::DCFR, true);
+    CHECK(s.load(v4path));
+    CHECK(s.numInfosets() == 1);
+    // 动作集要从 3 个数的数组里正确恢复到 4 槽结构
+    CHECK(s.abstraction().actionSpace.preflopCount == 2);
+    CHECK(s.abstraction().actionSpace.postflopCount == 2);
+    CHECK(s.abstraction().actionSpace.preflopMul1000[1] == 4000);
+    CHECK(s.abstraction().actionSpace.postflopFrac1000[1] == 1000);
+
+    // 存回去必须是新版本号：读旧写新，格式不会一直背着历史
+    CHECK(s.save(v5path));
+    {
+        std::FILE* f = std::fopen(v5path, "rb");
+        CHECK(f != nullptr);
+        if (f != nullptr) {
+            std::uint32_t magic = 0;
+            std::uint32_t ver = 0;
+            CHECK(std::fread(&magic, sizeof(magic), 1, f) == 1);
+            CHECK(std::fread(&ver, sizeof(ver), 1, f) == 1);
+            CHECK(magic == 0x54434652u);
+            CHECK(ver == 5);
+            std::fclose(f);
+        }
+    }
+
+    // 反过来：v5 文件必须能被本版本读回，且动作集一致
+    {
+        texas::HoldemSolver t(20, 2ULL, texas::CfrVariant::DCFR, true);
+        CHECK(t.load(v5path));
+        CHECK(t.numInfosets() == 1);
+        CHECK(texas::sameActionSpace(t.abstraction().actionSpace,
+                                     s.abstraction().actionSpace));
+    }
+
+    std::remove(v4path);
+    std::remove(v5path);
+    std::printf("  OK 旧存盘兼容（v4 按当时的常量解释 / 读旧写新 / v5 往返）\n");
 }
 
 void testHoldemShowdown() {
@@ -1232,6 +1327,7 @@ int main() {
     testHoldemRules();
     testHoldemActionSpace();
     testActionSpaceNaming();
+    testHoldemSaveV4Compat();
     testHoldemShowdown();
     testHoldemSidePot();
     testHoldemScoreCache();

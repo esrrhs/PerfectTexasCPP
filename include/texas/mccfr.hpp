@@ -82,6 +82,12 @@ struct InfoSetData {
     int n = 0;
 };
 
+// 老存盘格式（v4）的两个长度常量：那时 kMaxActions = 6、kMaxSizes = 3。
+// 这两个数**不能**跟着现在的常量走，否则旧文件会被错位解读——v4 的布局把编译期常量
+// 写死进了文件，所以解释旧文件时必须用当时的值。
+constexpr int kV4Actions = 6;
+constexpr int kV4Sizes = 3;
+
 // 信息集键 -> InfoSetData 的平坦哈希表（线性探测）
 class InfoSetTable {
 public:
@@ -374,7 +380,12 @@ public:
         // 版本 4 起把抽象参数也写进去。必须存：信息集键是从"当前抽象"算出来的，
         // 读盘时若桶数/尺寸可见性/动作集与存盘时不同，所有键都对不上，会静默退化成
         // 均匀策略。这种错误比读不出来更难查。
-        const std::uint32_t ver = 4;
+        //
+        // 版本 5 把每条记录的长度从 kMaxActions 改成 n。v4 写的是固定 6 个数，
+        // 于是 kMaxActions 一改，所有旧文件都会被**错位**解读（不是读不出来，是读成
+        // 别的信息集的数据）——这正是"静默比报错更糟"的那种改动。记录长度自描述之后，
+        // 动作数上限就不再和文件格式绑在一起了。
+        const std::uint32_t ver = 5;
         const std::uint64_t cnt = static_cast<std::uint64_t>(isets_.size());
         const std::uint64_t iters = static_cast<std::uint64_t>(iter_);
         const std::int32_t buckets = abstraction_.buckets;
@@ -399,8 +410,8 @@ public:
             const std::uint32_t n = static_cast<std::uint32_t>(is.n);
             std::fwrite(&key, sizeof(key), 1, f);
             std::fwrite(&n, sizeof(n), 1, f);
-            std::fwrite(is.regret.data(), sizeof(double), HoldemGame::kMaxActions, f);
-            std::fwrite(is.avg.data(), sizeof(double), HoldemGame::kMaxActions, f);
+            std::fwrite(is.regret.data(), sizeof(double), n, f);
+            std::fwrite(is.avg.data(), sizeof(double), n, f);
         });
         const bool ok = (std::ferror(f) == 0);
         std::fclose(f);
@@ -418,7 +429,7 @@ public:
             std::fclose(f);
             return false;
         }
-        if (std::fread(&ver, sizeof(ver), 1, f) != 1 || ver != 4) {
+        if (std::fread(&ver, sizeof(ver), 1, f) != 1 || (ver != 4 && ver != 5)) {
             std::fclose(f);
             return false;
         }
@@ -443,8 +454,11 @@ public:
             std::fclose(f);
             return false;
         }
-        if (std::fread(space.preflopMul1000, sizeof(int), ActionSpace::kMaxSizes, f) !=
-            ActionSpace::kMaxSizes) {
+        // v4 的动作数组只有 kV4Sizes 长（那时 kMaxSizes = 3）。按现在的 kMaxSizes
+        // 去读会把后面的字段一起吞掉，所以长度也跟着版本走。
+        const int sizes = (ver == 4) ? kV4Sizes : ActionSpace::kMaxSizes;
+        if (std::fread(space.preflopMul1000, sizeof(int), static_cast<std::size_t>(sizes), f) !=
+            static_cast<std::size_t>(sizes)) {
             std::fclose(f);
             return false;
         }
@@ -452,8 +466,8 @@ public:
             std::fclose(f);
             return false;
         }
-        if (std::fread(space.postflopFrac1000, sizeof(int), ActionSpace::kMaxSizes, f) !=
-            ActionSpace::kMaxSizes) {
+        if (std::fread(space.postflopFrac1000, sizeof(int), static_cast<std::size_t>(sizes), f) !=
+            static_cast<std::size_t>(sizes)) {
             std::fclose(f);
             return false;
         }
@@ -477,14 +491,12 @@ public:
             InfoSetData is{};
             if (std::fread(&key, sizeof(key), 1, f) != 1) break;
             if (std::fread(&n, sizeof(n), 1, f) != 1) break;
-            if (std::fread(is.regret.data(), sizeof(double), HoldemGame::kMaxActions, f) !=
-                HoldemGame::kMaxActions) {
-                break;
-            }
-            if (std::fread(is.avg.data(), sizeof(double), HoldemGame::kMaxActions, f) !=
-                HoldemGame::kMaxActions) {
-                break;
-            }
+            // v4 的记录固定 kV4Actions 个动作，v5 起是 n 个
+            const std::size_t width =
+                (ver == 4) ? static_cast<std::size_t>(kV4Actions) : static_cast<std::size_t>(n);
+            if (width > static_cast<std::size_t>(HoldemGame::kMaxActions)) break;
+            if (std::fread(is.regret.data(), sizeof(double), width, f) != width) break;
+            if (std::fread(is.avg.data(), sizeof(double), width, f) != width) break;
             is.n = static_cast<int>(n);
             isets_.get(key) = is;
         }

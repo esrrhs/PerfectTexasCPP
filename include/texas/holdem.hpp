@@ -37,19 +37,21 @@ struct Move {
 // 早先尺寸是写死在 actions() 里的，于是"哪种加注尺寸更好"这件事根本测不了——
 // 一套二进制只能用一套动作集。做成参数之后可以训练多套动作集并互相对打。
 //
-// 上限由 kMaxActions 决定：弃牌 + 跟注占 2 个，all-in 占 1 个，最多剩 3 档尺寸。
+// 上限由 kMaxActions 决定：弃牌 + 跟注占 2 个，all-in 占 1 个，最多剩 4 档尺寸。
+// 翻前 4 档需要 7 个动作（有弃牌），翻后 4 档只需要 6 个（没有弃牌），所以 7 是
+// "每街都能给 4 档"的最小上限。
 struct ActionSpace {
-    static constexpr int kMaxSizes = 3;
+    static constexpr int kMaxSizes = 4;
 
     // 翻牌前：加注到 (当前最大本街投入 × mul1000 / 1000)。
     // 默认 {2500, 4000} = 2.5 倍 / 4 倍，与早期的 maxRC + (maxRC*3)/2、maxRC*4
     // 逐位等价（对奇数 maxRC 也相等：x + floor(1.5x) == floor(2.5x)）。
-    int preflopMul1000[kMaxSizes] = {2500, 4000, 2500};
+    int preflopMul1000[kMaxSizes] = {2500, 4000, 2500, 2500};
     int preflopCount = 2;
 
     // 翻牌后：加注到 (当前最大 + 底池 × frac1000 / 1000)。
     // 默认 {500, 1000} = 半池 / 一池。
-    int postflopFrac1000[kMaxSizes] = {500, 1000, 500};
+    int postflopFrac1000[kMaxSizes] = {500, 1000, 500, 500};
     int postflopCount = 2;
 
     // all-in 单独算一个动作，避免被比例尺寸吞掉
@@ -138,6 +140,22 @@ inline const std::vector<ActionPreset>& actionPresets() {
             s.postflopFrac1000[2] = 2000;
             t.push_back({"wide", s});
         }
+        // 翻前第四档。翻前没有牌力分桶（169 类全分辨率），动作粒度是唯一的抽象，
+        // 所以这里加档还在赚钱；翻后加第四档相反——树炸 7 倍（111 万 → 781 万信息集）
+        // 只换到 +0.48，等预算下不值。实测相对 wide +0.83~+1.01。
+        {
+            ActionSpace s;
+            s.preflopCount = 4;
+            s.preflopMul1000[0] = 2500;
+            s.preflopMul1000[1] = 3000;
+            s.preflopMul1000[2] = 4000;
+            s.preflopMul1000[3] = 5000;
+            s.postflopCount = 3;
+            s.postflopFrac1000[0] = 500;
+            s.postflopFrac1000[1] = 1000;
+            s.postflopFrac1000[2] = 2000;
+            t.push_back({"sharp", s});
+        }
         return t;
     }();
     return table;
@@ -170,7 +188,7 @@ struct HoldemGame {
     static constexpr int kBigBlind = 2;
     static constexpr int kBuyIn = 200;    // 100BB
     static constexpr int kMaxRaises = 3;  // 每条街最多 3 次加注（够打到 4-bet）
-    static constexpr int kMaxActions = 6;
+    static constexpr int kMaxActions = 7;
 
     struct State {
         int numPlayers = 2;
@@ -353,7 +371,14 @@ struct HoldemGame {
                 if (roundTarget <= maxRC) roundTarget = maxRC + kBigBlind;
                 const int total = s.contrib[p] + (roundTarget - s.roundContrib[p]);
                 if (total <= s.contrib[p]) return;
-                out[n++] = Move{Move::Raise, std::min(kBuyIn, total)};
+                const int amt = std::min(kBuyIn, total);
+                // 去重：尺寸表一多，比例尺寸就容易在小底池里撞成同一个金额
+                // （或者被 kBuyIn 一起截断）。两个一模一样的动作会让策略把质量
+                // 分到两个看不出区别的槽里，白白浪费动作位，也让"每街 4 档"变成谎话。
+                for (int i = 0; i < n; ++i) {
+                    if (out[i].kind == Move::Raise && out[i].amount == amt) return;
+                }
+                out[n++] = Move{Move::Raise, amt};
             };
 
             if (s.street == 0) {
@@ -367,7 +392,13 @@ struct HoldemGame {
                 }
             }
             if (space.includeAllIn && n < maxOut && s.contrib[p] < kBuyIn) {
-                out[n++] = Move{Move::Raise, kBuyIn};
+                // 同一个去重：比例尺寸吃掉整个筹码时会正好落在 kBuyIn 上，
+                // 不查就会和 all-in 变成两个一模一样的动作位。
+                bool dup = false;
+                for (int i = 0; i < n; ++i) {
+                    if (out[i].kind == Move::Raise && out[i].amount == kBuyIn) dup = true;
+                }
+                if (!dup) out[n++] = Move{Move::Raise, kBuyIn};
             }
         }
         return n;

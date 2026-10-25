@@ -53,7 +53,9 @@ struct Args {
     int opp = 1;
     int buckets = -1;
     std::string variant = "dcfr";
-    std::string sizes = "default";
+    // 默认用实测最强的 sharp（前 4 档 + 后 3 档），不是历史的那套 2 档。
+    // 历史数字全部是用 --sizes default 测的，为了能复现，那套动作集仍然保留。
+    std::string sizes = "sharp";
     bool sizedHistory = true;
     std::string save;
     std::string load;
@@ -89,7 +91,8 @@ void usage() {
         "  --opp N      对手人数（默认 1）\n"
         "  --buckets N  翻牌后分桶数（默认 20，最小 9；越大越细但收敛越慢）\n"
         "  --variant V  遗憾累计方式：dcfr（默认）或 cfrplus\n"
-        "  --sizes P    动作抽象预设：default（2.5x/4x + 半池/一池）\n"
+        "  --sizes P    动作抽象预设（默认 sharp，实测最强）：\n"
+        "               default（2.5x/4x + 半池/一池，历史基准，README 里的旧数字用它）\n"
         "               one（1 档）/ three（3 档）/ nojam（去掉 all-in）\n"
         "               small（2x/3x + 1/3,3/4 池）/ big（3x/5x + 一池,两池）\n"
         "               wide（3x/4x/5x + 半池/一池/两池，占满 6 个动作，实测最强）\n"
@@ -388,7 +391,11 @@ int runHoldem(const Args& a) {
         st.hole[0][1] = texas::parseCard(c2);
         const std::vector<double> p = solver.averageStrategy(st);
         texas::Move mv[texas::HoldemGame::kMaxActions];
-        const int n = texas::HoldemGame::actions(st, mv, texas::HoldemGame::kMaxActions);
+        // 必须用求解器**实际在跑**的动作集来生成标签。用默认动作集会打印出
+        // 另一套尺寸的标签贴在别人的概率上——档数一变，标签就整体错位，
+        // 而且错得很像真的。
+        const int n = texas::HoldemGame::actions(st, mv, texas::HoldemGame::kMaxActions,
+                                                 solver.abstraction().actionSpace);
         std::printf("    %-6s", label);
         for (int i = 0; i < n && i < static_cast<int>(p.size()); ++i) {
             if (mv[i].kind == texas::Move::Fold) {
