@@ -92,6 +92,7 @@ void usage() {
         "  --sizes P    动作抽象预设：default（2.5x/4x + 半池/一池）\n"
         "               one（1 档）/ three（3 档）/ nojam（去掉 all-in）\n"
         "               small（2x/3x + 1/3,3/4 池）/ big（3x/5x + 一池,两池）\n"
+        "               wide（3x/4x/5x + 半池/一池/两池，占满 6 个动作，实测最强）\n"
         "  --no-sized-history  让应对方看不见对手的下注额（这是要复现的缺陷，不是优化）\n"
         "  --save FILE  训练完把策略存盘，可当作以后的基准对手\n"
         "  --load FILE  从存盘读入策略（给了就跳过训练；续训时 --variant 要与原文件一致）\n"

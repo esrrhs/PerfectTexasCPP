@@ -123,6 +123,21 @@ inline const std::vector<ActionPreset>& actionPresets() {
             s.postflopFrac1000[1] = 2000;
             t.push_back({"big", s});
         }
+        // 六动作集的上限：弃 + 跟 + 3 档 + all-in = kMaxActions。
+        // 前后各加一档，实测 +1.30 +- 0.22（见 README）。在动作数被 kMaxActions
+        // 卡住之前，这是加大动作抽象能拿到的全部收益。
+        {
+            ActionSpace s;
+            s.preflopCount = 3;
+            s.preflopMul1000[0] = 3000;
+            s.preflopMul1000[1] = 4000;
+            s.preflopMul1000[2] = 5000;
+            s.postflopCount = 3;
+            s.postflopFrac1000[0] = 500;
+            s.postflopFrac1000[1] = 1000;
+            s.postflopFrac1000[2] = 2000;
+            t.push_back({"wide", s});
+        }
         return t;
     }();
     return table;
