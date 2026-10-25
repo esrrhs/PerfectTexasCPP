@@ -133,9 +133,12 @@ bool isRaisePossible(const HUState& s, int seat) {
 
 bool canRaiseTo(const HUState& s, int to, int seat) {
     if (!isRaisePossible(s, seat)) return false;
-    const int lo = minRaiseTo(s, seat);
     const int hi = maxRaiseTo(s, seat);
-    return to >= lo && to <= hi;
+    if (to < 1 || to > hi) return false;
+    // ACPC：把对手打全下的加注只要"加注额 >= 1"就合法，不要求够到最小加注。
+    // 所以顶到全部筹码那一档永远合法（单挑里这会让本街不再重新开火，因为对手已 all-in）。
+    if (to == hi) return true;
+    return to >= minRaiseTo(s, seat);
 }
 
 int amountInBand(int lo, int hi, double u) {

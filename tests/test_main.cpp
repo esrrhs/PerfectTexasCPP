@@ -557,6 +557,21 @@ void testAnyAmount() {
         CHECK(!texas::canRaiseTo(g, nextMin - 1));
     }
 
+    // 3b) ACPC 的"短全下"：加注额不够最小加注时，把全部筹码推进去仍然合法
+    {
+        texas::HUState g = s;
+        texas::applyMove(g, texas::makeRaise(g, 15000), rng);  // 小盲加到 15000
+        CHECK(g.toAct == 1);
+        const int hi = texas::maxRaiseTo(g);
+        const int lo = texas::minRaiseTo(g);
+        CHECK(lo == hi);              // 凑不出完整最小加注 -> 最小加注被钳到全部筹码
+        CHECK(texas::isRaisePossible(g));
+        CHECK(texas::canRaiseTo(g, hi));   // 全下这一档仍然合法（ACPC 的短全下）
+        CHECK(!texas::canRaiseTo(g, hi - 1));
+        CHECK(texas::makeRaise(g, hi).kind == texas::MK_ALLIN);
+        CHECK(texas::makeRaise(g, hi).to == hi);
+    }
+
     // 4) makeRaise 的钳位与全下退化
     CHECK(texas::makeRaise(s, 1).to == 2 * texas::kBigBlind);
     CHECK(texas::makeRaise(s, texas::kStartingStack).kind == texas::MK_ALLIN);
