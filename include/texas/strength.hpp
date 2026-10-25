@@ -91,12 +91,12 @@ public:
         return percentileOfScore(bestHandScore(all, n), n);
     }
 
-    // 听牌出路：只看"补成同花 / 补成顺子"这两类，它们是当前百分位最严重的低估项
-    static DrawOuts computeOuts(const Card* hole, const Card* board, int boardCount) {
+    // 听牌出路：只看"补成同花 / 补成顺子"这两类，它们是当前百分位最严重的低估项。
+    // cat 由调用方传入——牌力评估是热点，算一次就够了，不要在这里再评一遍。
+    static DrawOuts computeOutsWithCat(const Card* hole, const Card* board, int boardCount, int cat) {
         int sc[4] = {};
         int rc[13] = {};
         std::uint64_t used = 0;
-        const int n = 2 + boardCount;
         for (int i = 0; i < 2; ++i) {
             ++rc[cardRank(hole[i])];
             ++sc[cardSuit(hole[i])];
@@ -107,13 +107,6 @@ public:
             ++sc[cardSuit(board[i])];
             used |= 1ULL << board[i];
         }
-
-        Card all[7];
-        int m = 0;
-        all[m++] = hole[0];
-        all[m++] = hole[1];
-        for (int i = 0; i < boardCount; ++i) all[m++] = board[i];
-        const int cat = handCategoryOf(bestHandScore(all, n));
 
         std::uint64_t flushCards = 0;
         std::uint64_t straightCards = 0;
@@ -164,6 +157,15 @@ public:
         return out;
     }
 
+    static DrawOuts computeOuts(const Card* hole, const Card* board, int boardCount) {
+        Card all[7];
+        int n = 0;
+        all[n++] = hole[0];
+        all[n++] = hole[1];
+        for (int i = 0; i < boardCount; ++i) all[n++] = board[i];
+        return computeOutsWithCat(hole, board, boardCount, handCategoryOf(bestHandScore(all, n)));
+    }
+
     // t 张牌到来时至少命中一次的概率（超几何，outs 视为不变）
     static double hitProbability(int outs, int unseen, int toCome) {
         if (outs <= 0 || unseen <= 0 || toCome <= 0) return 0.0;
@@ -177,14 +179,20 @@ public:
 
     // 潜力修正后的牌力，0~1。河牌没有后续牌，直接退化成百分位。
     double postflopStrength(const Card* hole, const Card* board, int boardCount) const {
-        const double pct = postflopPercentile(hole, board, boardCount);
+        // 牌力评估是整个求解器的第一热点，这里只评一次，百分位和出路共用同一个分数
+        Card all[7];
+        int n = 0;
+        all[n++] = hole[0];
+        all[n++] = hole[1];
+        for (int i = 0; i < boardCount; ++i) all[n++] = board[i];
+        const int score = bestHandScore(all, n);
+        const double pct = percentileOfScore(score, n);
         const int toCome = 5 - boardCount;
         if (toCome <= 0) return pct;
 
-        const DrawOuts outs = computeOuts(hole, board, boardCount);
+        const DrawOuts outs = computeOutsWithCat(hole, board, boardCount, handCategoryOf(score));
         if (outs.total <= 0) return pct;
 
-        const int n = std::clamp(2 + boardCount, 5, 7);
         const int unseen = kNumCards - (2 + boardCount);
         const double pAny = hitProbability(outs.total, unseen, toCome);
         // 命中之后，牌力落在"该牌型的区间中段"（区间边界来自真实分布，不是拍脑袋）

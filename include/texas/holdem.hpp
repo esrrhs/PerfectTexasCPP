@@ -304,6 +304,17 @@ struct HoldemGame {
         return std::vector<Card>(buf, buf + n);
     }
 
+    // 机会节点收尾：这一街的牌发完了，决定下一个行动者或直接结束
+    static void finishChance(State& s) {
+        s.pendingDeal = 0;
+        if (numCanAct(s) <= 1) {
+            s.finished = true;
+            s.player = -1;
+        } else {
+            s.player = nextPlayer(s, 0);  // 翻牌后由大盲先行动（单挑时小盲/按钮在后）
+        }
+    }
+
     template <class Rng>
     static void deal(State& s, Rng& rng) {
         // 发牌是每轮必经的热点，这里不碰堆：定长数组 + 部分 Fisher-Yates
@@ -315,13 +326,20 @@ struct HoldemGame {
             std::swap(deck[i], deck[j]);
             s.board[s.boardCount++] = deck[i];
         }
-        s.pendingDeal = 0;
-        if (numCanAct(s) <= 1) {
-            s.finished = true;
-            s.player = -1;
-        } else {
-            s.player = nextPlayer(s, 0);  // 翻牌后由大盲先行动（单挑时小盲/按钮在后）
+        finishChance(s);
+    }
+
+    // 按"预先抽好的一整副公共牌"揭示接下来该发的牌，不重新抽。
+    //
+    // 这和逐街抽牌的联合分布完全一致（先均匀抽出 5 张、再逐街揭示，与逐街条件抽样
+    // 等价），但整棵搜索树因此共用同一副公共牌——求解器可以据此缓存牌力桶。
+    static void reveal(State& s, const Card* fullBoard) {
+        const int need = s.pendingDeal;
+        for (int i = 0; i < need && s.boardCount < 5; ++i) {
+            s.board[s.boardCount] = fullBoard[s.boardCount];
+            ++s.boardCount;
         }
+        finishChance(s);
     }
 
     // ---------- 摊牌与边池 ----------
