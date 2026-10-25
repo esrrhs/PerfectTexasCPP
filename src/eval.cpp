@@ -40,6 +40,7 @@ EvalResult runBenchmark(const nn::Actor actors[2], int games, uint64_t seed, int
         cfg.seed = seed + static_cast<uint64_t>(pass) * 7919u;
         cfg.historicalProb = 0.0f;
         cfg.ruleProb = 0.0f;
+        cfg.randomProb = 0.0f;
         cfg.oracleReward = false;
         cfg.equityIters = equityIters;
         cfg.forceRuleSeat = (ruleSeat >= 0) ? (pass == 0 ? 1 : 0) : -1;
@@ -74,6 +75,7 @@ EvalResult evalSelfPlay(const nn::Actor actors[2], int games, uint64_t seed, int
     cfg.seed = seed;
     cfg.historicalProb = 0.0f;
     cfg.ruleProb = 0.0f;
+    cfg.randomProb = 0.0f;
     cfg.oracleReward = false;
     cfg.equityIters = equityIters;
     cfg.handScores = &scores;

@@ -17,6 +17,7 @@ enum RoleType : uint8_t { ROLE_LATEST = 0, ROLE_SNAPSHOT = 1, ROLE_RULE = 2, ROL
 struct GameCtx {
     HUState st;
     uint8_t role[2] = {ROLE_LATEST, ROLE_LATEST};
+    uint8_t snapTier[2] = {0, 0};  // 0 = recent, 1 = archive
     int snapIdx[2] = {-1, -1};
     int lastIdx[2] = {-1, -1};
     float phi[2] = {0.0f, 0.0f};  // 上次开天眼势能
@@ -91,6 +92,30 @@ void writeTensors(const std::vector<Transition>& tmp, torch::Tensor& nodeT, torc
 }
 
 }  // namespace
+
+const Snapshot* HistoricalPool::at(int tier, int index) const {
+    if (tier != 0 && tier != 1) return nullptr;
+    const std::vector<std::shared_ptr<Snapshot>>& v = (tier == 0) ? recent : archive;
+    if (index < 0 || index >= static_cast<int>(v.size())) return nullptr;
+    return v[static_cast<size_t>(index)].get();
+}
+
+void HistoricalPool::push(const std::shared_ptr<Snapshot>& snap, int recentCap, int archiveCap) {
+    if (!snap) return;
+    recent.push_back(snap);
+    if (recentCap < 0) recentCap = 0;
+    while (static_cast<int>(recent.size()) > recentCap) recent.erase(recent.begin());
+
+    archive.push_back(snap);
+    if (archiveCap < 1) archiveCap = 1;
+    // 满了隔一个丢一个：保留的间隔翻倍，越老越稀疏但永不整体消失。
+    while (static_cast<int>(archive.size()) > archiveCap) {
+        std::vector<std::shared_ptr<Snapshot>> thinned;
+        thinned.reserve(archive.size() / 2 + 1);
+        for (size_t i = 0; i < archive.size(); i += 2) thinned.push_back(archive[i]);
+        archive.swap(thinned);
+    }
+}
 
 std::pair<int, float> sampleAction(const float* logits, const std::vector<ActionOption>& acts,
                                    Rng& rng) {
@@ -197,27 +222,91 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
     out[0].clear();
     out[1].clear();
 
+    // ---------------------------------------------------------------- 联赛
+    //
+    // 按**局**分配对手，而不是按座位各自独立抽。两个理由：
+    //
+    // 1. 独立抽会浪费算力。机器人 0.5 / 快照 0.3 时，约 (0.5)^2 + (0.3)^2 ≈ 34%
+    //    的牌局两边都不是当前策略，整局跑完一条样本都采不到。
+    // 2. 独立抽没法控制配比。要让"每局都有一个学习座位"，就只能按局指定。
+    //
+    // 所以每局先抽一类对手和一个座位，另一个座位固定是 ROLE_LATEST。
+    // 座位左右各半，位置优势自然不会偏。
+    const bool hasPool = pool != nullptr && !pool->empty();
+    float wHist = hasPool ? std::max(0.0f, cfg.historicalProb) : 0.0f;
+    const float wRule = std::max(0.0f, cfg.ruleProb);
+    const float wRand = std::max(0.0f, cfg.randomProb);
+    const float wSelf = std::max(0.0f, 1.0f - (wHist + wRule + wRand));
+    const float wSum = wSelf + wHist + wRule + wRand;
+
+    // 评估路径：强制某个座位是固定对手，另一个座位就是被测策略。
+    int forcedSeat = -1;
+    uint8_t forcedRole = ROLE_LATEST;
+    if (cfg.forceRuleSeat >= 0) {
+        forcedSeat = cfg.forceRuleSeat;
+        forcedRole = ROLE_RULE;
+    } else if (cfg.forceRandomSeat >= 0) {
+        forcedSeat = cfg.forceRandomSeat;
+        forcedRole = ROLE_RANDOM;
+    }
+
     for (int i = 0; i < N; ++i) {
         GameCtx& g = gs[static_cast<size_t>(i)];
         g.st = dealNewHand(rng);
+
+        int oppSeat = -1;
+        uint8_t oppRole = ROLE_LATEST;
+        int oppTier = 0;
+        int oppIdx = -1;
+
+        if (forcedSeat >= 0) {
+            oppSeat = forcedSeat;
+            oppRole = forcedRole;
+        } else if (wSum > 0.0f) {
+            const float r = u(rng) * wSum;
+            if (r < wHist) {
+                oppRole = ROLE_SNAPSHOT;
+                // 抽哪个快照：archive 占 archiveProb。recent 管近期战术，
+                // archive 管远期记忆，两者都要有。
+                const bool wantArchive =
+                    !pool->archive.empty() &&
+                    (pool->recent.empty() || u(rng) < cfg.archiveProb);
+                const std::vector<std::shared_ptr<Snapshot>>& v =
+                    wantArchive ? pool->archive : pool->recent;
+                oppTier = wantArchive ? 1 : 0;
+                oppIdx = static_cast<int>(rng() % v.size());
+            } else if (r < wHist + wRule) {
+                oppRole = ROLE_RULE;
+            } else if (r < wHist + wRule + wRand) {
+                oppRole = ROLE_RANDOM;
+            }
+            if (oppRole != ROLE_LATEST) oppSeat = static_cast<int>(rng() & 1u);
+        }
+
         for (int seat = 0; seat < 2; ++seat) {
-            g.role[seat] = ROLE_LATEST;
-            if (cfg.forceRuleSeat == seat) {
-                g.role[seat] = ROLE_RULE;
-                continue;
-            }
-            if (cfg.forceRandomSeat == seat) {
-                g.role[seat] = ROLE_RANDOM;
-                continue;
-            }
-            const float r = u(rng);
-            if (pool && !pool->empty() && r < cfg.historicalProb) {
-                g.role[seat] = ROLE_SNAPSHOT;
-                g.snapIdx[seat] = static_cast<int>(rng() % pool->items.size());
-            } else if (r < cfg.historicalProb + cfg.ruleProb) {
-                g.role[seat] = ROLE_RULE;
+            if (seat == oppSeat && oppRole != ROLE_LATEST) {
+                g.role[seat] = oppRole;
+                g.snapTier[seat] = static_cast<uint8_t>(oppTier);
+                g.snapIdx[seat] = oppIdx;
+            } else {
+                g.role[seat] = ROLE_LATEST;
+                g.snapTier[seat] = 0;
+                g.snapIdx[seat] = -1;
             }
         }
+
+        if (forcedSeat >= 0) {
+            if (forcedRole == ROLE_RULE) ++stats.vsRule; else ++stats.vsRandom;
+        } else if (oppRole == ROLE_SNAPSHOT) {
+            if (oppTier == 1) ++stats.vsArchive; else ++stats.vsRecent;
+        } else if (oppRole == ROLE_RULE) {
+            ++stats.vsRule;
+        } else if (oppRole == ROLE_RANDOM) {
+            ++stats.vsRandom;
+        } else {
+            ++stats.vsLatest;
+        }
+
         for (int seat = 0; seat < 2; ++seat) {
             g.phi[seat] = phiOf(g.st, seat, equityFor(g, seat, cfg.equityIters));
         }
@@ -359,7 +448,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
     while (remaining > 0) {
         for (int seat = 0; seat < 2; ++seat) {
             std::vector<int> latestIdx;
-            std::map<int, std::vector<int>> snapIdx;
+            std::map<std::pair<int, int>, std::vector<int>> snapIdx;  // (tier, index)
             std::vector<int> ruleIdx;
             std::vector<int> randomIdx;
 
@@ -368,19 +457,23 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
                 if (!g.active || g.st.toAct != seat) continue;
                 switch (g.role[seat]) {
                     case ROLE_LATEST: latestIdx.push_back(i); break;
-                    case ROLE_SNAPSHOT: snapIdx[g.snapIdx[seat]].push_back(i); break;
+                    case ROLE_SNAPSHOT:
+                        snapIdx[{int(g.snapTier[seat]), g.snapIdx[seat]}].push_back(i);
+                        break;
                     case ROLE_RANDOM: randomIdx.push_back(i); break;
                     default: ruleIdx.push_back(i); break;
                 }
             }
 
             runBatch(latest.actor[seat], &latest.critic[seat], seat, latestIdx);
-            for (auto& [sidx, idx] : snapIdx) {
-                if (sidx < 0 || sidx >= static_cast<int>(pool->items.size())) {
+            for (auto& [key, idx] : snapIdx) {
+                const Snapshot* snap = pool ? pool->at(key.first, key.second) : nullptr;
+                if (snap == nullptr) {
+                    // 池子被裁剪过，退化成本策略自己打，不要丢样本。
                     runBatch(latest.actor[seat], nullptr, seat, idx);
                     continue;
                 }
-                runBatch(pool->items[static_cast<size_t>(sidx)]->actor[seat], nullptr, seat, idx);
+                runBatch(snap->actor[seat], nullptr, seat, idx);
             }
             runRule(seat, ruleIdx);
             runRandom(seat, randomIdx);

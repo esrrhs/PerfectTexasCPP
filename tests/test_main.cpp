@@ -405,6 +405,77 @@ void testNetwork() {
     CHECK(maxDiff < 1e-6);
 }
 
+// 两级历史池：recent 滚动淘汰，archive 几何间隔保留。
+// 这里只验结构性质，不建真网络（Snapshot 里的 actor 留空即可）。
+void testLeague() {
+    section("两级历史池");
+    using texas::HistoricalPool;
+    using texas::Snapshot;
+
+    auto mk = [](int u) {
+        auto s = std::make_shared<Snapshot>();
+        s->update = u;
+        return s;
+    };
+
+    // 1) recent 严格只留最后 recentCap 个，且保持时间顺序
+    HistoricalPool pool;
+    const int recentCap = 8;
+    const int archiveCap = 16;
+    for (int u = 1; u <= 40; ++u) pool.push(mk(u), recentCap, archiveCap);
+    CHECK(int(pool.recent.size()) == recentCap);
+    CHECK(int(pool.archive.size()) <= archiveCap);
+    CHECK(!pool.archive.empty());
+    CHECK(pool.size() == pool.recent.size() + pool.archive.size());
+    bool recentOrdered = true;
+    for (size_t i = 1; i < pool.recent.size(); ++i) {
+        if (pool.recent[i]->update <= pool.recent[i - 1]->update) recentOrdered = false;
+    }
+    CHECK(recentOrdered);
+    CHECK(pool.recent.back()->update == 40);
+    CHECK(pool.recent.front()->update == 40 - recentCap + 1);
+
+    // 2) archive 永不整体丢弃最老的快照，且时刻递增
+    CHECK(pool.archive.front()->update == 1);
+    CHECK(pool.archive.back()->update == 40);
+    bool archiveOrdered = true;
+    for (size_t i = 1; i < pool.archive.size(); ++i) {
+        if (pool.archive[i]->update <= pool.archive[i - 1]->update) archiveOrdered = false;
+    }
+    CHECK(archiveOrdered);
+
+    // 3) 隔一个丢一个 = 保留间隔翻倍：archive 从老到新是"越老越稀、越新越密"，
+    //    所以相邻时间差序列应当非递增（8,8,4,4,2,2,1,1,…），而不是均匀间隔。
+    bool gapsNonIncreasing = true;
+    for (size_t i = 2; i < pool.archive.size(); ++i) {
+        const int g1 = pool.archive[i - 1]->update - pool.archive[i - 2]->update;
+        const int g2 = pool.archive[i]->update - pool.archive[i - 1]->update;
+        if (g2 > g1) gapsNonIncreasing = false;
+    }
+    CHECK(gapsNonIncreasing);
+
+    // 4) at() 的边界必须是 nullptr，不能越界读
+    CHECK(pool.at(0, 0) == pool.recent[0].get());
+    CHECK(pool.at(1, 0) == pool.archive[0].get());
+    CHECK(pool.at(0, -1) == nullptr);
+    CHECK(pool.at(0, recentCap) == nullptr);
+    CHECK(pool.at(1, int(pool.archive.size())) == nullptr);
+    CHECK(pool.at(7, 0) == nullptr);
+
+    // 5) recentCap = 0 时只有 archive
+    HistoricalPool onlyArchive;
+    for (int u = 1; u <= 5; ++u) onlyArchive.push(mk(u), 0, archiveCap);
+    CHECK(onlyArchive.recent.empty());
+    CHECK(onlyArchive.archive.size() == 5);
+    CHECK(!onlyArchive.empty());
+
+    // 6) 空池
+    HistoricalPool emptyPool;
+    CHECK(emptyPool.empty());
+    CHECK(emptyPool.size() == 0);
+    CHECK(emptyPool.at(0, 0) == nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -413,6 +484,7 @@ int main() {
     testFeatures();
     testPpo();
     testNetwork();
+    testLeague();
     std::printf("\n%d 通过, %d 失败\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

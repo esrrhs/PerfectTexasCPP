@@ -68,7 +68,9 @@ void usage() {
         "用法:\n"
         "  perfecttexas train [--updates N] [--games N] [--lr F] [--hidden N] [--lstm N]\n"
         "                     [--out DIR] [--resume DIR] [--mps] [--threads N]\n"
-        "                     [--league F] [--rule-prob F] [--oracle-iters N]\n"
+        "                     [--league F] [--rule-prob F] [--random-prob F]\n"
+        "                     [--archive-ratio F] [--recent N] [--archive N]\n"
+        "                     [--oracle-iters N]\n"
         "                     [--eval-every N] [--eval-games N]\n"
         "                     [--oracle-coef F] [--no-oracle] [--seed N]\n"
         "  perfecttexas eval  --resume DIR [--vs rule|random|self] [--hands N]\n"
@@ -76,8 +78,12 @@ void usage() {
         "  perfecttexas bench  [--hands N]\n"
         "\n"
         "说明:\n"
-        "  --league F      对手是历史快照的概率（默认 0.25）\n"
-        "  --rule-prob F   对手是规则机器人的概率（默认 0.05；1.0 等于只跟机器人打）\n"
+        "  --league F      一局里对手是历史快照的概率（默认 0.30）\n"
+        "  --rule-prob F   一局里对手是规则机器人的概率（默认 0.15）\n"
+        "  --random-prob F 一局里对手是均匀随机的概率（默认 0.05）\n"
+        "  --archive-ratio F 抽历史对手时用归档快照的比例（默认 0.30）\n"
+        "  --recent N      历史池的滚动窗口容量（默认 8）\n"
+        "  --archive N     历史池的归档容量，满了隔一个丢一个（默认 16）\n"
         "  --oracle-coef F 开天眼稠密奖励的系数（默认 0.05，0 等于关掉）\n"
         "  --no-oracle     关闭开天眼稠密奖励（只保留 critic 的完美信息价值）\n");
 }
@@ -117,7 +123,8 @@ int cmdTrain(int argc, char** argv) {
     const int seed = argInt(argc, argv, "--seed", 20240518);
     const int evalEvery = argInt(argc, argv, "--eval-every", 10);
     const int evalGames = argInt(argc, argv, "--eval-games", 512);
-    const int snapshots = argInt(argc, argv, "--snapshots", 8);
+    const int recentCap = argInt(argc, argv, "--recent", 8);    // 历史池：滚动窗口
+    const int archiveCap = argInt(argc, argv, "--archive", 16); // 历史池：几何间隔存档
     const int hwThreads = argInt(argc, argv, "--threads", 0);
 
     const torch::Device device = pickDevice(argc, argv);
@@ -157,18 +164,27 @@ int cmdTrain(int argc, char** argv) {
     texas::HistoricalPool pool;
     texas::RolloutConfig rcfg;
     rcfg.games = games;
-    rcfg.historicalProb = static_cast<float>(argDouble(argc, argv, "--league", 0.25));
-    rcfg.ruleProb = static_cast<float>(argDouble(argc, argv, "--rule-prob", 0.05));
+    rcfg.historicalProb = static_cast<float>(argDouble(argc, argv, "--league", 0.30));
+    rcfg.ruleProb = static_cast<float>(argDouble(argc, argv, "--rule-prob", 0.15));
+    rcfg.randomProb = static_cast<float>(argDouble(argc, argv, "--random-prob", 0.05));
+    rcfg.archiveProb = static_cast<float>(argDouble(argc, argv, "--archive-ratio", 0.30));
     rcfg.oracleReward = !hasFlag(argc, argv, "--no-oracle");
     rcfg.oracleCoef = static_cast<float>(argDouble(argc, argv, "--oracle-coef", 0.05));
     rcfg.equityIters = argInt(argc, argv, "--oracle-iters", 32);
 
+    const float selfProb = std::max(
+        0.0f, 1.0f - (rcfg.historicalProb + rcfg.ruleProb + rcfg.randomProb));
     std::printf("PerfectTexasCPP train | 单挑 NLHE %d 筹码 | 节点特征 %d + 开天眼 %d + 序列 %d\n",
                 texas::kStartingStack, texas::kNodeInput, texas::kExtraInput, texas::kSeqInput);
-    std::printf("  hidden=%lld lstm=%lld | device=%s | games/update=%d | league=%.2f rule=%.2f oracle=%.2f\n",
+    std::printf("  hidden=%lld lstm=%lld | device=%s | games/update=%d | oracle=%.2f\n",
                 static_cast<long long>(mc.hidden), static_cast<long long>(mc.lstmHidden),
-                device.type() == torch::kMPS ? "mps" : "cpu", games, rcfg.historicalProb,
-                rcfg.ruleProb, rcfg.oracleReward ? rcfg.oracleCoef : 0.0f);
+                device.type() == torch::kMPS ? "mps" : "cpu", games,
+                rcfg.oracleReward ? rcfg.oracleCoef : 0.0f);
+    // 联赛配比：每局只有一个座位是对手，另一个一定是当前策略。
+    std::printf("  league: 自对局 %.2f | 历史快照 %.2f (archive %.2f) | 规则 %.2f | 随机 %.2f"
+                "  [池 recent=%d archive=%d]\n",
+                selfProb, rcfg.historicalProb, rcfg.archiveProb, rcfg.ruleProb, rcfg.randomProb,
+                recentCap, archiveCap);
     std::printf("  %6s %7s %7s %6s %6s %6s %8s %8s %7s %6s %7s | %s\n", "update", "games", "sbWin%",
                 "sd%", "jam%", "fold%", "pgLoss", "vLoss", "entropy", "kl", "upd/s", "batch");
 
@@ -215,9 +231,17 @@ int cmdTrain(int argc, char** argv) {
 
         if (evalEvery > 0 && (u % evalEvery == 0 || u == updates)) {
             const texas::EvalResult vr = texas::evalVsRule(models.actor, evalGames, 12345 + u);
+            const texas::EvalResult vn = texas::evalVsRandom(models.actor, evalGames, 54321 + u);
             const texas::EvalResult vs = texas::evalSelfPlay(models.actor, evalGames / 2, 777 + u);
-            std::printf("         [eval] vs rule %+7.2f ± %.2f 筹码/手 (%+6.1f bb/100) | self %+5.2f ± %.2f\n",
-                        vr.chipsPerHand, vr.stderr, vr.bbPer100, vs.chipsPerHand, vs.stderr);
+            // 两个基准一起报：只报 vs 规则机器人时，一个不看牌的固定下注模式也能刷到
+            // +11.5 筹码/手（见 README 第五节）。
+            const int g = std::max(1, stats.games);
+            std::printf("         [eval] rule %+6.2f±%.2f | random %+6.2f±%.2f | self %+5.2f±%.2f"
+                        " | 对手 自%3d%% 近%2d%% 档%2d%% 规%2d%% 随%2d%%\n",
+                        vr.chipsPerHand, vr.stderr, vn.chipsPerHand, vn.stderr, vs.chipsPerHand,
+                        vs.stderr, 100 * stats.vsLatest / g, 100 * stats.vsRecent / g,
+                        100 * stats.vsArchive / g, 100 * stats.vsRule / g,
+                        100 * stats.vsRandom / g);
             std::fflush(stdout);
 
             auto snap = std::make_shared<texas::Snapshot>();
@@ -226,8 +250,9 @@ int cmdTrain(int argc, char** argv) {
                 snap->actor[s] = texas::nn::cloneActor(models.actor[s]);
                 snap->actor[s]->eval();
             }
-            pool.items.push_back(snap);
-            while (static_cast<int>(pool.items.size()) > snapshots) pool.items.erase(pool.items.begin());
+            // 快照同时进 recent（滚动）和 archive（几何间隔）。recent 让对手记得
+            // 自己最近什么样，archive 防止策略跑偏后再也遇不到早期的自己。
+            pool.push(snap, recentCap, archiveCap);
 
             saveModels(models.actor, models.critic, outDir);
             for (int s = 0; s < 2; ++s) learners[s]->saveOptimizers(outDir);
@@ -389,6 +414,7 @@ int cmdSanity(int argc, char** argv) {
     rc.seed = 4242;
     rc.historicalProb = 0.0f;
     rc.ruleProb = 0.0f;
+    rc.randomProb = 0.0f;
     std::array<std::vector<texas::Transition>, 2> tr;
     texas::RolloutStats st;
     texas::collectRollout(models, nullptr, rc, tr, st);
@@ -452,6 +478,7 @@ int cmdCritFit(int argc, char** argv) {
     rc.seed = 42;
     rc.historicalProb = 0.0f;
     rc.ruleProb = 0.0f;
+    rc.randomProb = 0.0f;
     std::array<std::vector<texas::Transition>, 2> tr;
     texas::RolloutStats st;
     texas::collectRollout(models, nullptr, rc, tr, st);
