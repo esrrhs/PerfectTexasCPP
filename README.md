@@ -29,7 +29,9 @@
 
 ### 规则口径：对齐 ACPC
 
-规则不再是自定的，全套按 ACPC（Annual Computer Poker Competition）的 HUNL 配置来：
+规则不再是自定的，全套按 ACPC（Annual Computer Poker Competition）的 HUNL 配置来。
+完整的规则说明（牌局流程、合法动作、结算、边界情况、逐条对账）在 **[docs/RULES.md](docs/RULES.md)**，
+这一节只放结论：
 
 | | ACPC（`holdem.nolimit.2p.reverse_blinds.game`） | 本引擎 |
 |---|---|---|
@@ -314,7 +316,9 @@ include/texas/
 src/
   hu.cpp features.cpp nn.cpp rollout.cpp learner.cpp eval.cpp main.cpp
 tests/
-  test_main.cpp 209 条断言
+  test_main.cpp 216 条断言
+docs/
+  RULES.md      规则文档：牌局流程 / 合法动作 / 结算 / 与 ACPC 的逐条对账
 ```
 
 LibTorch 默认找 `~/libtorch`，也可以显式指定：
