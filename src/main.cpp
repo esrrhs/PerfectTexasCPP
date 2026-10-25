@@ -1,4 +1,4 @@
-// texas_cfr 命令行入口。
+// PerfectTexasCPP 命令行入口。
 //
 //   texas_cli solve kuhn  [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]
 //   texas_cli solve leduc [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]
@@ -68,7 +68,7 @@ struct Args {
 
 void usage() {
     std::printf(
-        "texas_cfr —— 德州扑克不完全信息博弈求解器（CFR / CFR+ / DCFR）\n"
+        "PerfectTexasCPP —— 德州扑克不完全信息博弈求解器（CFR / CFR+ / DCFR）\n"
         "\n"
         "用法:\n"
         "  texas_cli solve kuhn  [--iters N] [--report M] [--csv FILE] [--vanilla] [--dump N]\n"

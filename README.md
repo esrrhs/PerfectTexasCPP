@@ -1,4 +1,4 @@
-# texas_cfr
+# PerfectTexasCPP
 
 德州扑克不完全信息博弈求解器，C++17 实现，无第三方依赖。
 

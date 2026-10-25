@@ -1316,7 +1316,7 @@ void testHoldemMCCFR() {
 }  // namespace
 
 int main() {
-    std::printf("texas_cfr 自测开始\n");
+    std::printf("PerfectTexasCPP 自测开始\n");
     std::printf("================================================\n");
 
     testCards();
