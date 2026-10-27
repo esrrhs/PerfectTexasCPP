@@ -24,8 +24,30 @@ void putCard(float* plane, Card c) {
 }  // namespace
 
 float handStrength(const Card* hole, const Card* board, int boardN) {
-    if (boardN <= 0) return float(StrengthModel::instance().preflopEquity(hole[0], hole[1]));
-    return float(StrengthModel::instance().postflopPercentile(hole, board, boardN));
+    const StrengthModel& model = StrengthModel::instance();
+    if (boardN <= 0) return float(model.preflopEquity(hole[0], hole[1]));
+
+    const double pct = model.postflopPercentile(hole, board, boardN);
+    const DrawOuts outs = StrengthModel::computeOuts(hole, board, boardN);
+    if (outs.total <= 0 || boardN >= 5) return float(pct);
+
+    // 把听牌出路折成"命中后的期望百分位"：当前最佳五张的排名对花听/顺听
+    // 严重低估（花听现在只是高牌），只看百分位的机器人会直接弃掉它们。
+    // 命中概率用超几何分布精确算：翻牌还有两张，转牌还有一张。
+    const int unseen = kNumCards - 2 - boardN;
+    double pHit = 0.0;
+    if (boardN == 3) {
+        const int miss = unseen - outs.total;
+        if (miss < 2) {
+            pHit = 1.0;
+        } else {
+            pHit = 1.0 - double(miss * (miss - 1)) / double(unseen * (unseen - 1));
+        }
+    } else if (boardN == 4) {
+        pHit = double(outs.total) / double(unseen);
+    }
+    const double hitPct = (outs.flush > 0) ? 0.94 : 0.89;
+    return float((1.0 - pHit) * pct + pHit * hitPct);
 }
 
 float oracleEquity(const HUState& s, int seat, int iters) {

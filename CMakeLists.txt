@@ -26,6 +26,7 @@ if(NOT DEFINED Torch_DIR AND EXISTS "$ENV{HOME}/libtorch/share/cmake/Torch")
 endif()
 find_package(Torch REQUIRED)
 find_package(Threads REQUIRED)
+find_package(CURL REQUIRED)
 
 add_library(perfecttexas_core STATIC
   src/hu.cpp
@@ -34,11 +35,12 @@ add_library(perfecttexas_core STATIC
   src/rollout.cpp
   src/learner.cpp
   src/eval.cpp
+  src/slumbot.cpp
 )
 target_include_directories(perfecttexas_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${TORCH_INCLUDE_DIRS})
-target_link_libraries(perfecttexas_core PUBLIC ${TORCH_LIBRARIES} Threads::Threads)
+target_link_libraries(perfecttexas_core PUBLIC ${TORCH_LIBRARIES} Threads::Threads CURL::libcurl)
 target_compile_options(perfecttexas_core PUBLIC ${TORCH_CXX_FLAGS})
 
 add_executable(perfecttexas src/main.cpp)

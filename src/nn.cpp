@@ -22,17 +22,36 @@ ActorImpl::ActorImpl(const ModelConfig& cfg) : config(cfg) {
     l4 = register_module("l4", torch::nn::Linear(cfg.hidden, cfg.hidden * 2));
     head = register_module("head", torch::nn::Linear(cfg.hidden * 2, 1));
 
+    // 范围胜率信念头：把"对手底牌"从输入里拿掉，只靠公开信息回归开天眼胜率。
+    // 线上部署时它就是在估计"我的牌 vs 对手范围"的胜率，是策略最缺的那个量。
+    aux1 = register_module("aux1", torch::nn::Linear(nodeDim, 128));
+    aux2 = register_module("aux2", torch::nn::Linear(128, 1));
+    torch::nn::init::normal_(aux2->weight, 0.0, 0.01);
+    torch::nn::init::zeros_(aux2->bias);
+
+    // 信念残差支路：把 eqHat 与动作特征一起过一个小 MLP，直接给每个动作
+    // 加一个分数修正（"胜率这么低还打这么大"）。末层零初始化 => 旧模型不变。
+    auxAct1 = register_module("aux_act1", torch::nn::Linear(kActionInput + 1, 64));
+    auxAct2 = register_module("aux_act2", torch::nn::Linear(64, 1));
+    torch::nn::init::zeros_(auxAct2->weight);
+    torch::nn::init::zeros_(auxAct2->bias);
+
     // 最后一层零初始化：开局所有动作分数相同，策略从均匀分布出发
     torch::nn::init::zeros_(head->weight);
     torch::nn::init::zeros_(head->bias);
 }
 
-torch::Tensor ActorImpl::forward(const torch::Tensor& node, const torch::Tensor& seq,
-                                 const torch::Tensor& actFeat, const torch::Tensor& actSample,
-                                 const torch::Tensor& actId) const {
+std::pair<torch::Tensor, torch::Tensor> ActorImpl::forwardWithAux(
+    const torch::Tensor& node, const torch::Tensor& seq, const torch::Tensor& actFeat,
+    const torch::Tensor& actSample, const torch::Tensor& actId) const {
     auto lstmOut = lstm->forward(seq);
     torch::Tensor hLast = std::get<0>(std::get<1>(lstmOut)).squeeze(0);
     torch::Tensor x = torch::cat({node, hLast}, /*dim=*/1);
+
+    // 不完全信息胜率预测（detach 后进残差支路：信念头只由回归损失塑形，
+    // 策略梯度不去扭曲校准）。
+    torch::Tensor eqHat = torch::sigmoid(aux2->forward(torch::relu(aux1->forward(x))))
+                              .squeeze(-1);
 
     const int64_t nodeDim = kNodeInput + config.lstmHidden;
     torch::Tensor wNode = l1->weight.slice(1, 0, nodeDim);
@@ -49,11 +68,24 @@ torch::Tensor ActorImpl::forward(const torch::Tensor& node, const torch::Tensor&
     torch::Tensor f4 = torch::relu(l4->forward(f3));
     torch::Tensor scores = head->forward(f4).squeeze(-1);
 
+    // 残差支路：eqHat 是这个动作所属样本的预测胜率；与动作特征拼接后
+    // 给出每动作一个标量修正。eqHat.detach() 保证校准目标不被策略梯度污染。
+    torch::Tensor eqPerAction =
+        eqHat.detach().index_select(0, sampleIdx).unsqueeze(1);
+    torch::Tensor aj = torch::cat({actFeat, eqPerAction}, /*dim=*/1);
+    scores = scores + auxAct2->forward(torch::relu(auxAct1->forward(aj))).squeeze(-1);
+
     const int64_t B = node.size(0);
     torch::Tensor logits = torch::full({B, kNumActions}, -1e9f,
                                        torch::TensorOptions().dtype(torch::kFloat32).device(node.device()));
     logits.index_put_({sampleIdx, actId.to(torch::kLong)}, scores);
-    return logits;
+    return {logits, eqHat};
+}
+
+torch::Tensor ActorImpl::forward(const torch::Tensor& node, const torch::Tensor& seq,
+                                 const torch::Tensor& actFeat, const torch::Tensor& actSample,
+                                 const torch::Tensor& actId) const {
+    return forwardWithAux(node, seq, actFeat, actSample, actId).first;
 }
 
 void ActorImpl::saveTo(const std::string& path) const {
@@ -63,12 +95,45 @@ void ActorImpl::saveTo(const std::string& path) const {
 }
 
 bool ActorImpl::loadFrom(const std::string& path) {
-    try {
+    // 新检查点：参数齐全，走严格加载（递归子模块）。
+    // 旧检查点：没有 aux_* 子模块，严格加载会抛异常；此时按旧架构的固定
+    // 子模块名逐个读取，缺的 aux_* 保留初始化值（残差支路末层为零 =>
+    // 旧模型行为与改动前完全一致）。
+    {
         torch::serialize::InputArchive archive;
-        archive.load_from(path);
-        Module::load(archive);
-        return true;
+        try {
+            archive.load_from(path);
+            Module::load(archive);
+            return true;
+        } catch (const std::exception&) {
+            // fall through
+        }
+    }
+    try {
+        torch::NoGradGuard ng;
+        torch::serialize::InputArchive old;
+        old.load_from(path);
+        int loaded = 0;
+        auto loadMod = [&](const std::string& name, const torch::nn::Module& m) {
+            torch::serialize::InputArchive sub;
+            old.read(name, sub);
+            for (const auto& p : m.named_parameters()) {
+                torch::Tensor t = p.value().clone();
+                sub.read(p.key(), t);
+                p.value().copy_(t);
+                ++loaded;
+            }
+        };
+        loadMod("lstm", *lstm);
+        loadMod("l1", *l1);
+        loadMod("l2", *l2);
+        loadMod("l3", *l3);
+        loadMod("l4", *l4);
+        loadMod("head", *head);
+        std::printf("  actor: 旧检查点兼容加载 %d 个参数（aux_* 保持初始值）\n", loaded);
+        return loaded > 0;
     } catch (const std::exception& e) {
+        std::printf("  actor loadFrom 失败: %s\n", e.what());
         return false;
     }
 }

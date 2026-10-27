@@ -16,6 +16,7 @@
 #include <torch/torch.h>
 
 #include <string>
+#include <utility>
 
 #include "texas/features.hpp"
 
@@ -38,12 +39,24 @@ public:
                           const torch::Tensor& actFeat, const torch::Tensor& actSample,
                           const torch::Tensor& actId) const;
 
+    // 训练用：同时返回策略 logits 与"对手范围胜率"预测 eqHat [B]。
+    // eqHat 只用不完全信息（node + 序列）估计，标签是开天眼的真实胜率；
+    // 另有一条残差支路把 eqHat 与动作特征结合，直接修正每个动作的分数。
+    std::pair<torch::Tensor, torch::Tensor> forwardWithAux(
+        const torch::Tensor& node, const torch::Tensor& seq, const torch::Tensor& actFeat,
+        const torch::Tensor& actSample, const torch::Tensor& actId) const;
+
     void saveTo(const std::string& path) const;
+    // 旧检查点没有 aux_* 参数：严格加载失败后按参数名逐个读取，缺的跳过。
     bool loadFrom(const std::string& path);
 
     ModelConfig config;
     mutable torch::nn::LSTM lstm{nullptr};
     mutable torch::nn::Linear l1{nullptr}, l2{nullptr}, l3{nullptr}, l4{nullptr}, head{nullptr};
+    // 范围胜率信念头 + 信念残差评分支路（新参数，旧检查点加载时保持初始值，
+    // 残差支路末层零初始化，所以旧模型的行为与改动前完全一致）。
+    mutable torch::nn::Linear aux1{nullptr}, aux2{nullptr};
+    mutable torch::nn::Linear auxAct1{nullptr}, auxAct2{nullptr};
 };
 TORCH_MODULE(Actor);
 
