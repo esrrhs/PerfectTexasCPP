@@ -6,6 +6,7 @@
 // 每个基准跑两遍（模型坐小盲 / 坐大盲），合并成模型每手净收益。
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "texas/rollout.hpp"
@@ -52,6 +53,30 @@ struct EvalTeam {
     float preflopRaiseMult = 1.0f;
     // 后翻牌下注/加注尺寸放大系数（部署剥削用，默认 1）。
     float postflopBetMult = 1.0f;
+    // rangeEq 特征采样数（必须与训练时一致，否则残差支路输入分布不同）。
+    int rangeEqSamples = 0;
+    int rangeEqIters = 48;
+    // 河牌范围条件化搜索的对手底牌样本数（0 = 关）。见 policySearchMove。
+    int rangeSearchSamples = 0;
+    // 消融：河牌搜索不按对手动作似然加权（均匀隐藏牌）。
+    bool rangeSearchUniform = false;
+    // 鲁棒范围搜索：根动作 EV 取"自身 actor / solid / shark"三种对手模型的最坏情况。
+    bool robustSearch = false;
+    bool robustMean = false;
+    // 河牌搜索的最小底池（筹码，0 = 全部）。
+    int rangeSearchMinPot = 0;
+    // 只在要跟注的河牌决策上用搜索（面对下注的防守）。
+    bool rangeSearchDefenseOnly = false;
+    // 河牌 CFR+ 子博弈求解器（README #105）：>0 = 河牌决策改用范围均衡动作。
+    int riverCfrIters = 0;
+    int riverCfrMinPot = 0;
+    int riverCfrMaxRaises = 1;
+    bool riverCfrAllin = true;
+    // 「读范围机器人」的对手范围里空气（诈唬）占比，见 RolloutConfig::rangerAir。
+    float rangerAir = 0.28f;
+    // 对手座位用河牌 CFR 均衡回应（见 RolloutConfig::oppCfrProb）。0 = 关。
+    int oppCfrIters = 0;
+    int oppCfrMinPot = 1500;
 
     // 单模型团队：和原来的 evalVs* 行为完全一致。
     static EvalTeam of(const nn::Actor actors[2]) {
@@ -71,6 +96,10 @@ EvalResult evalVsSearch(const nn::Actor actors[2], int games, uint64_t seed, int
 // 这是比单个脚本更接近"成熟 AI 组合"的评估，不需要配对发牌。
 EvalResult evalVsMix(const nn::Actor actors[2], int games, uint64_t seed, int equityIters = 24);
 EvalResult evalSelfPlay(const nn::Actor actors[2], int games, uint64_t seed, int equityIters = 24);
+// 团队版自对局：温度 / 集成 / rangeEq 等开关都会生效（否则 --vs self 会
+// 静默忽略 --range-eq，诊断时容易把"关了特征"的数当成"开了特征"）。
+EvalResult evalTeamSelfPlay(const EvalTeam& team, int games, uint64_t seed,
+                            int equityIters = 24);
 
 // 动作级集成的评估入口：语义与上面完全相同，只是被测策略换成 EvalTeam。
 EvalResult evalTeamVsRule(const EvalTeam& team, int games, uint64_t seed, int equityIters = 24);
@@ -86,6 +115,35 @@ EvalResult evalSearchTeamVsRule(const EvalTeam& team, int games, uint64_t seed, 
                                 int equityIters = 24);
 EvalResult evalSearchTeamVsMix(const EvalTeam& team, int games, uint64_t seed, int samples,
                                int equityIters = 24);
+
+// 摊牌诊断（README #107）。外部 12000 手上，赤字全部来自摊牌：摊牌只赢 20.4%、
+// 每手 −1574 筹码，而我们摊牌时 22% 是高牌（对手 7%）。这个结构在 12000 手
+// 外部采样里是 6σ 级，但外部测量慢、方差大。这里把它做成**内部**可复现的
+// 测量：对任意脚本对手打 N 手，按"摊牌/非摊牌"拆收益，并统计双方牌型分布。
+// 9 个桶对应 `handCategoryOf`：0 高牌、1 一对、2 两对、3 三条、4 顺子、
+// 5 同花、6 葫芦、7 四条、8 同花顺。
+struct ShowdownStats {
+    int hands = 0;
+    int showdowns = 0;
+    int wins = 0;
+    int ties = 0;
+    double sdSum = 0.0;      // 摊牌手的净收益和
+    double sdSumSq = 0.0;
+    double nsdSum = 0.0;     // 非摊牌手的净收益和
+    double nsdSumSq = 0.0;
+    int myCat[9] = {};
+    int oppCat[9] = {};
+    // 按终局底池分桶的摊牌收益（0: <1500, 1: 1500-4000, 2: >=4000）。
+    int bucketSd[3] = {};
+    double bucketSdSum[3] = {};
+    double bucketSdSumSq[3] = {};
+    void print(const char* tag, int writtenHands) const;
+};
+
+// 对指定脚本对手（rule/random/pro/solid/search）打 games 手（两个座位各一遍），
+// 同时输出常规 EvalResult 与摊牌诊断。opp 不合法时 out 保持空、返回 EV 为 0。
+EvalResult evalShowdownVs(const EvalTeam& team, const std::string& opp, int games,
+                          uint64_t seed, int equityIters, ShowdownStats& out);
 
 // 两个检查点对打（同牌对调）：返回 a 对 b 的每手净收益。
 // 只适合同一套特征口径的检查点（特征改过之后旧 ckpt 的语义会变）。

@@ -17,6 +17,7 @@
 
 #include "texas/hu.hpp"
 #include "texas/nn.hpp"
+#include "texas/rollout.hpp"
 
 namespace texas {
 
@@ -61,6 +62,12 @@ struct SlumbotConfig {
     // 的第二大来源。
     float flopAggroPct = 0.0f;      // 0 = 关闭
     float allinGuardMinRisk = 0.5f;  // 跟注额 >= 剩余筹码的这个比例才触发
+    // 部署一致性：训练 rollout 每个决策都会算 rangeEq 并喂给范围残差支路，
+    // 而部署路径早先固定喂 0.5 —— 同一份权重在两边看到的输入不同。>0 时
+    // 按训练同一口径（对手最近动作似然 + 采样底牌 + 摊牌胜率）真算。
+    // 对手模型用我们自己（训练里也是"对手=当前策略"）。
+    int rangeEqSamples = 0;  // 0 = 关闭（喂中性 0.5）
+    int rangeEqIters = 48;
 };
 
 struct SlumbotResult {
@@ -70,6 +77,7 @@ struct SlumbotResult {
     int allinGuardFolds = 0;  // 全下纪律 guard 强制弃牌次数（诊断用）
     int preflopAggroCapped = 0;  // 翻前进攻上限触发次数（诊断用）
     int flopAggroCapped = 0;     // 翻牌进攻上限触发次数（诊断用）
+    int rangeEqDecisions = 0;    // 真实算过 rangeEq 的决策数（诊断用）
     long long winnings = 0;  // 净筹码（正 = 我们赢）
     double chipsStderr = 0.0;  // 每手净收益的标准误（按逐手结果算）
     // 河牌前全下的手用全下时胜率折算底池（"EV 调整"），剔掉发牌运气。
@@ -98,6 +106,12 @@ bool allinAdjustedWinnings(const std::string& action, const Card mine[2], const 
 bool buildSlumbotState(const std::string& action, const std::string& hole0,
                        const std::string& hole1, const std::vector<std::string>& board,
                        int clientPos, Rng& rng, HUState& out);
+
+// 重建"对手（clientPos 座位）最近一次决策"：动作前状态 + 动作槽。
+// 部署时算 rangeEq 需要它（与训练 rollout 的 g.lastAct 同一口径）。
+bool slumbotLastOppDecision(const std::string& action, const std::string& hole0,
+                            const std::string& hole1, const std::vector<std::string>& board,
+                            int clientPos, Rng& rng, RangeObs& out);
 
 // 全下纪律：面对会打光筹码的全下，且跟注额 >= minRisk * 剩余筹码时，
 // 手牌百分位低于阈值就返回 true（应当弃牌）。翻前用 prePct（对随机胜率），

@@ -30,6 +30,8 @@ struct BatchTensors {
     torch::Tensor teacherQ;    // [B, kNumActions] 脚本教师动作价值
     torch::Tensor teacherValid;  // [B] 1 = 该样本有教师标注
     torch::Tensor auxLabel;    // [B] 开天眼真实胜率（范围胜率信念头的回归标签）
+    torch::Tensor oppLabel;    // [B] 对手当前牌力百分位（对手建模头标签）
+    torch::Tensor rangeEq;     // [B] 动作条件化的 vs-range 胜率（rollout 组合级计算）
     torch::Tensor ruleSlot;    // [B] 规则教师目标槽位，-1 = 无
 };
 
@@ -42,6 +44,7 @@ struct TeacherSample {
     std::array<float, kNodeInput> node{};
     std::array<float, kSeqInput> seq{};
     std::array<float, kNumActions> q{};
+    float rangeEq = 0.5f;  // 采集时算好的范围胜率特征（与 PPO 前向口径一致）
     std::vector<ActionOption> actions;
 };
 

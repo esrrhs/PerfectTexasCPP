@@ -27,6 +27,8 @@ void buildBatch(const std::vector<Transition>& tr, BatchTensors& batch, float ad
     batch.teacherQ = torch::zeros({N, kNumActions}, torch::kFloat32);
     batch.teacherValid = torch::zeros({N}, torch::kFloat32);
     batch.auxLabel = torch::zeros({N}, torch::kFloat32);
+    batch.oppLabel = torch::zeros({N}, torch::kFloat32);
+    batch.rangeEq = torch::zeros({N}, torch::kFloat32);
     batch.ruleSlot = torch::full({N}, -1, torch::kLong);
 
     float* pNode = batch.node.data_ptr<float>();
@@ -43,6 +45,8 @@ void buildBatch(const std::vector<Transition>& tr, BatchTensors& batch, float ad
     float* pTq = batch.teacherQ.data_ptr<float>();
     float* pTv = batch.teacherValid.data_ptr<float>();
     float* pAux = batch.auxLabel.data_ptr<float>();
+    float* pOpp = batch.oppLabel.data_ptr<float>();
+    float* pRq = batch.rangeEq.data_ptr<float>();
     int64_t* pRule = batch.ruleSlot.data_ptr<int64_t>();
 
     int64_t off = 0;
@@ -69,6 +73,8 @@ void buildBatch(const std::vector<Transition>& tr, BatchTensors& batch, float ad
         pRet[i] = t.ret;
         pVal[i] = t.value;
         pAux[i] = t.extra[kHoleDim];  // 开天眼胜率（对手底牌之后第 0 个标量）
+        pOpp[i] = t.oppPct;
+        pRq[i] = t.rangeEq;
         pRule[i] = t.ruleSlot;
         sum += t.adv;
         sq += double(t.adv) * double(t.adv);
@@ -142,6 +148,7 @@ ppo::Stats Learner::update(BatchTensors& batch) {
     double pgSum = 0, vSum = 0, entSum = 0, klSum = 0, clipSum = 0;
     double teaSum = 0, teaMaxSum = 0, teaEntSum = 0;
     double auxSum = 0, auxMaeSum = 0, auxPredSum = 0, auxLabSum = 0;
+    double oppSum = 0, oppMaeSum = 0, oppPredSum = 0, oppLabSum = 0;
     int teaTotal = 0;
     int total = 0;
     int vTotal = 0;
@@ -164,6 +171,7 @@ ppo::Stats Learner::update(BatchTensors& batch) {
             torch::Tensor oldLogpMb = batch.oldLogp.index_select(0, mbIdx).to(device);
             torch::Tensor advMb = batch.adv.index_select(0, mbIdx).to(device);
             torch::Tensor retMb = batch.ret.index_select(0, mbIdx).to(device);
+            torch::Tensor rangeEqMb = batch.rangeEq.index_select(0, mbIdx).to(device);
 
             // 动作特征按线性表映射到 minibatch 内的样本号
             torch::Tensor lookup = torch::full({N}, -1, torch::TensorOptions().dtype(torch::kLong));
@@ -180,8 +188,14 @@ ppo::Stats Learner::update(BatchTensors& batch) {
             // ---- actor ----
             torch::Tensor logits;
             torch::Tensor eqHat;
-            std::tie(logits, eqHat) =
-                actor->forwardWithAux(nodeMb, seqMb, actFeatMb, actSampleMb, actIdMb);
+            torch::Tensor oppHat;
+            {
+                auto auxOut =
+                    actor->forwardAll(nodeMb, seqMb, actFeatMb, actSampleMb, actIdMb, rangeEqMb);
+                logits = auxOut.logits;
+                eqHat = auxOut.eqHat;
+                oppHat = auxOut.oppHat;
+            }
             torch::Tensor logProbs = torch::log_softmax(logits, 1);
             torch::Tensor probs = torch::softmax(logits, 1);
             torch::Tensor curLogp = logProbs.gather(1, actMb.unsqueeze(1)).squeeze(1);
@@ -208,7 +222,8 @@ ppo::Stats Learner::update(BatchTensors& batch) {
                 torch::Tensor aLogits;
                 {
                     torch::NoGradGuard ng;
-                    aLogits = (*anchor)->forward(nodeMb, seqMb, actFeatMb, actSampleMb, actIdMb);
+                    aLogits = (*anchor)->forward(nodeMb, seqMb, actFeatMb, actSampleMb, actIdMb,
+                                                 rangeEqMb);
                 }
                 torch::Tensor aLogp = torch::log_softmax(aLogits, 1);
                 torch::Tensor kl = (probs.detach() * (logProbs - aLogp)).sum(1);
@@ -245,6 +260,21 @@ ppo::Stats Learner::update(BatchTensors& batch) {
                 auxMaeSum += diff.abs().mean().item<double>() * double(curB);
                 auxPredSum += eqHat.mean().item<double>() * double(curB);
                 auxLabSum += auxReal.mean().item<double>() * double(curB);
+            }
+
+            // ---- 对手建模头 ----
+            // 目标 = 对手当前牌力百分位。与上面的"我的胜率"互补：这里学的是
+            // 对手范围本身（行动序列 -> 对手有多强），残差支路再把它接进动作
+            // 打分。外部赤字集中在翻后大池的"能不能继续"，正是这个量的用途。
+            if (config.oppModelCoef > 0.0f) {
+                torch::Tensor oppReal = batch.oppLabel.index_select(0, mbIdx).to(device);
+                torch::Tensor odiff = oppHat - oppReal;
+                torch::Tensor oppLoss = odiff.pow(2).mean();
+                actorLoss = actorLoss + config.oppModelCoef * oppLoss;
+                oppSum += config.oppModelCoef * oppLoss.item<double>() * double(curB);
+                oppMaeSum += odiff.abs().mean().item<double>() * double(curB);
+                oppPredSum += oppHat.mean().item<double>() * double(curB);
+                oppLabSum += oppReal.mean().item<double>() * double(curB);
             }
 
             // ---- 脚本教师蒸馏 ----
@@ -349,6 +379,10 @@ ppo::Stats Learner::update(BatchTensors& batch) {
         stats.auxMae = auxMaeSum / double(total);
         stats.auxPred = auxPredSum / double(total);
         stats.auxLabel = auxLabSum / double(total);
+        stats.oppLoss = oppSum / double(total);
+        stats.oppMae = oppMaeSum / double(total);
+        stats.oppPred = oppPredSum / double(total);
+        stats.oppLabel = oppLabSum / double(total);
     }
     return stats;
 }
@@ -381,6 +415,7 @@ ppo::Stats Learner::updateActorOnly(BatchTensors& batch) {
     double pgSum = 0, entSum = 0, klSum = 0, clipSum = 0;
     double teaSum = 0, teaMaxSum = 0, teaEntSum = 0;
     double auxSum = 0, auxMaeSum = 0, auxPredSum = 0, auxLabSum = 0;
+    double oppSum = 0, oppMaeSum = 0, oppPredSum = 0, oppLabSum = 0;
     int teaTotal = 0, total = 0;
 
     for (int epoch = 0; epoch < config.epochs; ++epoch) {
@@ -399,6 +434,7 @@ ppo::Stats Learner::updateActorOnly(BatchTensors& batch) {
             torch::Tensor actMb = batch.actions.index_select(0, mbIdx).to(device);
             torch::Tensor oldLogpMb = batch.oldLogp.index_select(0, mbIdx).to(device);
             torch::Tensor advMb = batch.adv.index_select(0, mbIdx).to(device);
+            torch::Tensor rangeEqMb = batch.rangeEq.index_select(0, mbIdx).to(device);
 
             torch::Tensor lookup = torch::full({N}, -1, torch::TensorOptions().dtype(torch::kLong));
             lookup.index_put_({mbIdx.cpu()}, torch::arange(curB, torch::TensorOptions().dtype(torch::kLong)));
@@ -413,8 +449,14 @@ ppo::Stats Learner::updateActorOnly(BatchTensors& batch) {
 
             torch::Tensor logits;
             torch::Tensor eqHat;
-            std::tie(logits, eqHat) =
-                actor->forwardWithAux(nodeMb, seqMb, actFeatMb, actSampleMb, actIdMb);
+            torch::Tensor oppHat;
+            {
+                auto auxOut =
+                    actor->forwardAll(nodeMb, seqMb, actFeatMb, actSampleMb, actIdMb, rangeEqMb);
+                logits = auxOut.logits;
+                eqHat = auxOut.eqHat;
+                oppHat = auxOut.oppHat;
+            }
             torch::Tensor logProbs = torch::log_softmax(logits, 1);
             torch::Tensor probs = torch::softmax(logits, 1);
             torch::Tensor curLogp = logProbs.gather(1, actMb.unsqueeze(1)).squeeze(1);
@@ -440,7 +482,8 @@ ppo::Stats Learner::updateActorOnly(BatchTensors& batch) {
                 torch::Tensor aLogits;
                 {
                     torch::NoGradGuard ng;
-                    aLogits = (*anchor)->forward(nodeMb, seqMb, actFeatMb, actSampleMb, actIdMb);
+                    aLogits = (*anchor)->forward(nodeMb, seqMb, actFeatMb, actSampleMb, actIdMb,
+                                                 rangeEqMb);
                 }
                 torch::Tensor aLogp = torch::log_softmax(aLogits, 1);
                 torch::Tensor kl = (probs.detach() * (logProbs - aLogp)).sum(1);
@@ -464,6 +507,21 @@ ppo::Stats Learner::updateActorOnly(BatchTensors& batch) {
                 auxMaeSum += diff.abs().mean().item<double>() * double(curB);
                 auxPredSum += eqHat.mean().item<double>() * double(curB);
                 auxLabSum += auxReal.mean().item<double>() * double(curB);
+            }
+
+            // ---- 对手建模头 ----
+            // 目标 = 对手当前牌力百分位。与上面的"我的胜率"互补：这里学的是
+            // 对手范围本身（行动序列 -> 对手有多强），残差支路再把它接进动作
+            // 打分。外部赤字集中在翻后大池的"能不能继续"，正是这个量的用途。
+            if (config.oppModelCoef > 0.0f) {
+                torch::Tensor oppReal = batch.oppLabel.index_select(0, mbIdx).to(device);
+                torch::Tensor odiff = oppHat - oppReal;
+                torch::Tensor oppLoss = odiff.pow(2).mean();
+                actorLoss = actorLoss + config.oppModelCoef * oppLoss;
+                oppSum += config.oppModelCoef * oppLoss.item<double>() * double(curB);
+                oppMaeSum += odiff.abs().mean().item<double>() * double(curB);
+                oppPredSum += oppHat.mean().item<double>() * double(curB);
+                oppLabSum += oppReal.mean().item<double>() * double(curB);
             }
 
             if (config.teacherCoef > 0.0f && batch.teacherValid.numel() > 0) {
@@ -522,6 +580,10 @@ ppo::Stats Learner::updateActorOnly(BatchTensors& batch) {
         stats.auxMae = auxMaeSum / double(total);
         stats.auxPred = auxPredSum / double(total);
         stats.auxLabel = auxLabSum / double(total);
+        stats.oppLoss = oppSum / double(total);
+        stats.oppMae = oppMaeSum / double(total);
+        stats.oppPred = oppPredSum / double(total);
+        stats.oppLabel = oppLabSum / double(total);
     }
     return stats;
 }
@@ -545,6 +607,7 @@ double Learner::updateCriticOnly(BatchTensors& batch, int epochs) {
                                 batch.extra.index_select(0, mbIdx))
                     .squeeze(-1);
             torch::Tensor retMb = batch.ret.index_select(0, mbIdx).to(device);
+            torch::Tensor rangeEqMb = batch.rangeEq.index_select(0, mbIdx).to(device);
             torch::Tensor vLoss = config.vfCoef * 0.5f * (values - retMb).pow(2).mean();
             criticOpt->zero_grad();
             vLoss.backward();
@@ -574,6 +637,7 @@ double Learner::distill(const std::deque<TeacherSample>& samples, int steps, flo
     torch::Tensor actFeatT = torch::empty({static_cast<int64_t>(L), kActionInput}, f32);
     torch::Tensor actSampleT = torch::empty({static_cast<int64_t>(L)}, torch::kLong);
     torch::Tensor actIdT = torch::empty({static_cast<int64_t>(L)}, torch::kLong);
+    torch::Tensor rangeEqT = torch::empty({B}, f32);
 
     float* pNode = nodeT.data_ptr<float>();
     float* pSeq = seqT.data_ptr<float>();
@@ -582,6 +646,7 @@ double Learner::distill(const std::deque<TeacherSample>& samples, int steps, flo
     float* pFeat = actFeatT.data_ptr<float>();
     int64_t* pSample = actSampleT.data_ptr<int64_t>();
     int64_t* pId = actIdT.data_ptr<int64_t>();
+    float* pRq = rangeEqT.data_ptr<float>();
 
     int64_t off = 0;
     int64_t i = 0;
@@ -589,6 +654,7 @@ double Learner::distill(const std::deque<TeacherSample>& samples, int steps, flo
         std::copy(s.node.begin(), s.node.end(), pNode + i * kNodeInput);
         std::copy(s.seq.begin(), s.seq.end(), pSeq + i * kSeqInput);
         std::copy(s.q.begin(), s.q.end(), pQ + i * kNumActions);
+        pRq[i] = s.rangeEq;
         for (const ActionOption& a : s.actions) {
             std::copy(a.feat.begin(), a.feat.end(), pFeat + off * kActionInput);
             pSample[off] = i;
@@ -627,7 +693,9 @@ double Learner::distill(const std::deque<TeacherSample>& samples, int steps, flo
             torch::Tensor actSampleMb = mapped.index_select(0, actIdx).to(device);
             torch::Tensor actIdMb = actIdT.index_select(0, actIdx).to(device);
 
-            torch::Tensor logits = actor->forward(nodeMb, seqMb, actFeatMb, actSampleMb, actIdMb);
+            torch::Tensor rangeEqMb = rangeEqT.index_select(0, mbIdx).to(device);
+            torch::Tensor logits = actor->forward(nodeMb, seqMb, actFeatMb, actSampleMb, actIdMb,
+                                                  rangeEqMb);
             torch::Tensor logProbs = torch::log_softmax(logits, 1);
 
             torch::Tensor legalF = legalT.index_select(0, mbIdx).to(device);

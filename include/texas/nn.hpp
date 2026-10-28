@@ -34,17 +34,35 @@ public:
 
     // node: [B, kNodeInput]  seq: [B, kHistSteps, kHistDim]
     // actFeat: [L, kActionInput]  actSample: [L]  actId: [L]
+    // rangeEq: [B] 动作条件化的"我方 vs 对手范围"胜率（rollout 组合级计算）。
+    //          未提供时按 0.5 中性值喂入；新支路末层零初始化，所以旧检查点
+    //          行为不变。部署/评估路径如果要复现训练时的输入，必须显式传入。
     // 返回 logits: [B, kNumActions]
     torch::Tensor forward(const torch::Tensor& node, const torch::Tensor& seq,
                           const torch::Tensor& actFeat, const torch::Tensor& actSample,
-                          const torch::Tensor& actId) const;
+                          const torch::Tensor& actId,
+                          const torch::Tensor& rangeEq = torch::Tensor()) const;
 
     // 训练用：同时返回策略 logits 与"对手范围胜率"预测 eqHat [B]。
     // eqHat 只用不完全信息（node + 序列）估计，标签是开天眼的真实胜率；
     // 另有一条残差支路把 eqHat 与动作特征结合，直接修正每个动作的分数。
     std::pair<torch::Tensor, torch::Tensor> forwardWithAux(
         const torch::Tensor& node, const torch::Tensor& seq, const torch::Tensor& actFeat,
-        const torch::Tensor& actSample, const torch::Tensor& actId) const;
+        const torch::Tensor& actSample, const torch::Tensor& actId,
+        const torch::Tensor& rangeEq = torch::Tensor()) const;
+
+    // 对手建模头的三个输出：logits [B, kNumActions]、eqHat [B]、oppHat [B]。
+    // oppHat 同样只用不完全信息，回归标签是"对手当前牌力百分位"——这是策略
+    // 在翻后大池最缺的量（我的手牌 vs 对手范围），不是我自己牌力的重复。
+    struct AuxOutputs {
+        torch::Tensor logits;
+        torch::Tensor eqHat;
+        torch::Tensor oppHat;
+    };
+    AuxOutputs forwardAll(const torch::Tensor& node, const torch::Tensor& seq,
+                          const torch::Tensor& actFeat, const torch::Tensor& actSample,
+                          const torch::Tensor& actId,
+                          const torch::Tensor& rangeEq = torch::Tensor()) const;
 
     void saveTo(const std::string& path) const;
     // 旧检查点没有 aux_* 参数：严格加载失败后按参数名逐个读取，缺的跳过。
@@ -57,6 +75,14 @@ public:
     // 残差支路末层零初始化，所以旧模型的行为与改动前完全一致）。
     mutable torch::nn::Linear aux1{nullptr}, aux2{nullptr};
     mutable torch::nn::Linear auxAct1{nullptr}, auxAct2{nullptr};
+    // 对手建模头：预测"对手当前牌力百分位"。残差支路把 oppHat 与动作特征
+    // 拼接后加到动作分数上（末层零初始化，旧检查点行为不变）。
+    mutable torch::nn::Linear opp1{nullptr}, opp2{nullptr};
+    mutable torch::nn::Linear oppAct1{nullptr}, oppAct2{nullptr};
+    // 范围胜率残差支路：输入的 rangeEq 由 rollout 在组合级算出（按对手最近
+    // 动作做贝叶斯更新 + 我方的摊牌胜率），不是网络自己回归出来的标量。
+    // 与动作特征拼接后修正动作分数；末层零初始化，旧检查点行为不变。
+    mutable torch::nn::Linear rngAct1{nullptr}, rngAct2{nullptr};
 };
 TORCH_MODULE(Actor);
 

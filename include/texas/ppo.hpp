@@ -42,6 +42,9 @@ struct Config {
     // 范围胜率辅助头：用不完全信息回归开天眼胜率，MSE 系数。0 = 关闭
     // （关闭时信念头仍参与前向，但残差支路末层零初始化，策略等价于旧模型）。
     float auxEquityCoef = 0.0f;
+    // 对手建模头：用不完全信息回归"对手当前牌力百分位"，MSE 系数。0 = 关闭。
+    // 只塑形信念头与残差支路；策略梯度不会被校准目标污染（输入已 detach）。
+    float oppModelCoef = 0.0f;
     // 状态条件信任域：对 pot < anchorMaxPot 的样本加 KL(新策略 || 冻结基座)。
     // 大池教师只会改大池，中池/小池保持基座，避免第 75 条那种"大池赚、
     // 中池亏"的风格漂移。
@@ -71,6 +74,10 @@ struct Stats {
     double auxMae = 0;       // 平均绝对误差（和胜率同量纲，便于看校准）
     double auxPred = 0;      // 预测均值
     double auxLabel = 0;     // 标签均值（两者接近说明没有系统性偏移）
+    double oppLoss = 0;      // 对手牌力回归 MSE
+    double oppMae = 0;
+    double oppPred = 0;
+    double oppLabel = 0;
     int epochsCompleted = 0;
 };
 

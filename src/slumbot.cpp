@@ -307,9 +307,13 @@ bool allinGuardFold(const HUState& st, float prePct, int postCat, float minRisk)
     return allinGuardFoldImpl(st, prePct, postCat, minRisk);
 }
 
-bool buildSlumbotState(const std::string& action, const std::string& hole0,
-                       const std::string& hole1, const std::vector<std::string>& board,
-                       int clientPos, Rng& rng, HUState& out) {
+namespace {
+
+// 重放动作串。lastOpp 非空时，把"对手（clientPos 座位）最近一次决策"的
+// 动作前状态与实际动作槽记下来 —— rangeEq 的似然要在这个状态上算。
+bool buildStateImpl(const std::string& action, const std::string& hole0,
+                    const std::string& hole1, const std::vector<std::string>& board,
+                    int clientPos, Rng& rng, HUState& out, RangeObs* lastOpp) {
     if (hole0.empty() || hole1.empty()) return false;
     const Card mine[2] = {parseCard(hole0.c_str()), parseCard(hole1.c_str())};
     if (mine[0] < 0 || mine[1] < 0 || mine[0] == mine[1]) return false;
@@ -344,6 +348,7 @@ bool buildSlumbotState(const std::string& action, const std::string& hole0,
 
     HUState st = (clientPos == 0) ? makeState(opp, mine, boardCards, boardN)
                                   : makeState(mine, opp, boardCards, boardN);
+    if (lastOpp != nullptr) *lastOpp = RangeObs{};
     size_t i = 0;
     while (i < action.size()) {
         const char c = action[i++];
@@ -371,11 +376,35 @@ bool buildSlumbotState(const std::string& action, const std::string& hole0,
         } else {
             return false;
         }
+        // 座位约定：clientPos = 0 时我们是 BB（seat 1），对手是 seat 0。
+        if (lastOpp != nullptr && st.toAct == clientPos) {
+            lastOpp->pre = st;
+            lastOpp->slot = slotOfMove(st, m);
+            lastOpp->valid = lastOpp->slot >= 0;
+        }
         applyMove(st, m, rng);
         if (st.finished) break;
     }
     out = st;
     return true;
+}
+
+}  // namespace
+
+bool buildSlumbotState(const std::string& action, const std::string& hole0,
+                       const std::string& hole1, const std::vector<std::string>& board,
+                       int clientPos, Rng& rng, HUState& out) {
+    return buildStateImpl(action, hole0, hole1, board, clientPos, rng, out, nullptr);
+}
+
+bool slumbotLastOppDecision(const std::string& action, const std::string& hole0,
+                            const std::string& hole1, const std::vector<std::string>& board,
+                            int clientPos, Rng& rng, RangeObs& out) {
+    HUState st;
+    RangeObs last;
+    if (!buildStateImpl(action, hole0, hole1, board, clientPos, rng, st, &last)) return false;
+    out = last;
+    return last.valid;
 }
 
 SlumbotResult playSlumbot(const nn::Actor actors[2], const SlumbotConfig& cfg) {
@@ -556,7 +585,20 @@ SlumbotResult playSlumbot(const nn::Actor actors[2], const SlumbotConfig& cfg) {
                     mv.to = static_cast<int16_t>(amountInBand(int(mv.to), lm[pick].toHi, u01(rng)));
                 }
             } else {
-                mv = policyMove(&actors[0], &actors[1], st, rng, cfg.temp);
+                // rangeEq：与训练同一口径。训练时每个决策都真算并喂给范围残差
+                // 支路，部署若固定喂 0.5，同一份权重看到的输入就和训练不同。
+                float rq = 0.5f;
+                if (cfg.rangeEqSamples > 0) {
+                    RangeObs last;
+                    if (slumbotLastOppDecision(action, hole[0], hole[1], board, int(clientPos),
+                                               rng, last)) {
+                        rq = rangeEquityAt(st, 1 - int(clientPos), last,
+                                           &actors[int(clientPos)], cfg.rangeEqSamples,
+                                           cfg.rangeEqIters, rng);
+                        ++res.rangeEqDecisions;
+                    }
+                }
+                mv = policyMove(&actors[0], &actors[1], st, rng, cfg.temp, rq);
                 // 河牌大注剥削：无人下注且底池够大时，直接按 1.5x 池下注。
                 // 这是外部范围诊断给出的最高 EV 动作（第 87 条）。
                 if (cfg.riverOverbetPot > 0.0f && st.street == ST_RIVER &&

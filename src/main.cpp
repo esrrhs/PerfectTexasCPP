@@ -88,7 +88,8 @@ void usage() {
         "                     [--workers N] [--league F] [--rule-prob F] [--random-prob F]\n"
         "                     [--pro-prob F] [--search-prob F] [--search-samples N]\n"
         "                     [--solid-prob F] [--tight-prob F] [--trapper-prob F]\n"
-        "                     [--shark-prob F] [--spammer-prob F]\n"
+        "                     [--shark-prob F] [--spammer-prob F] [--maniac-prob F] [--ranger-prob F]\n"
+        "                     [--ranger-air F]\n"
         "                     [--archive-ratio F] [--recent N] [--archive N]\n"
         "                     [--max-raises N] [--oracle-iters N]\n"
         "                     [--eval-every N] [--eval-games N]\n"
@@ -101,11 +102,16 @@ void usage() {
         "                     [--critic-replay N] [--critic-replay-epochs N]\n"
         "                     [--critic-weight-decay F] [--critic-extra-epochs N]\n"
         "                     [--critic-info-set]\n"
+        "                     [--range-eq N] [--range-eq-iters N]\n"
+        "                     [--search-opp-prob F] [--search-opp-samples N]\n"
+        "                     [--expert-prob F] [--expert-samples N]\n"
         "  perfecttexas eval  --resume DIR [--ensemble DIR]... [--vs rule|random|pro|search|solid|mix|self]\n"
-        "                     [--hands N] [--seed N] [--policy-search N] [--temp F] [--greedy]\n"
+        "                     [--hands N] [--seed N] [--policy-search N] [--range-search N]\n"
+        "                     [--temp F] [--greedy]\n"
         "                     [--amount-mid] [--hidden N] [--lstm N]\n"
         "  perfecttexas match  --a DIR [--ensemble DIR]... --b DIR [--hands N] [--seed N]\n"
-        "                     [--search-a N] [--a-temp F] [--a-greedy] [--b-temp F] [--b-greedy]\n"
+        "                     [--search-a N] [--range-search N]\n"
+        "                     [--a-temp F] [--a-greedy] [--b-temp F] [--b-greedy]\n"
         "                     [--a-amount-mid] [--a-sb DIR] [--a-bb DIR] [--hidden N] [--lstm N]\n"
         "                     [--b-hidden N] [--b-lstm N]（B 侧网络尺寸，默认同 A）\n"
         "  perfecttexas soup   --a DIR --b DIR --out DIR [--alpha F]\n"
@@ -115,8 +121,13 @@ void usage() {
         "  perfecttexas slumbot [--resume DIR] [--hands N] [--temp F] [--seed N] [--delay-ms N]\n"
         "                       [--policy actor|fold|random] [--log FILE.csv]\n"
         "                       [--allin-guard-pre F] [--allin-guard-post F]\n"
+        "                       [--range-eq N] [--range-eq-iters N]\n"
         "  perfecttexas slumbot-analyze --csv FILE.csv  逐决策算事后胜率，定位漏点\n"
         "  perfecttexas allin-audit --csv FILE.csv...  全下决策审计（按座位/街/推接）\n"
+        "  perfecttexas showdown --resume DIR --vs solid|rule|pro|search|random|ranger|cfr\n"
+        "                     [--hands N] [--seed N] [--temp F] [--range-eq N]\n"
+        "                     [--ranger-air F] [--opp-cfr-iters N] [--opp-cfr-min-pot N]\n"
+        "                     摊牌诊断：按摊牌/非摊牌拆收益 + 双方摊牌牌型分布\n"
         "  perfecttexas slumbot-fit --csv FILE.csv [--csv ...] --out DIR [--resume DIR]\n"
         "                     [--epochs N] [--lr F] [--holdout-every N]\n"
         "                     用日志里 Slumbot 的动作做行为克隆，得到它的对手模型\n"
@@ -136,13 +147,26 @@ void usage() {
         "  --solid-prob F  一局里对手是「跟注型稳健机器人」的概率（默认 0）\n"
         "                  （宽跟注、少诈唬、只用强牌加注；补上被跟注的对抗压力）\n"
         "  --spammer-prob F 一局里对手是「小注骚扰机器人」的概率（默认 0）\n"
-        "                  （翻后高频 1/3 池下注，逼策略防守小注）\n"        "  --trapper-prob F 一局里对手是「陷阱机器人」的概率（默认 0）\n"
+        "                  （翻后高频 1/3 池下注，逼策略防守小注）\n"
+        "  --maniac-prob F 一局里对手是「过度下注机器人」的概率（默认 0）\n"
+        "                  （翻后 1.5~3 倍池超大尺寸开火含诈唬、宽跟，惩罚\n"
+        "                   把大加注当坚果 + 用弱牌超池诈唬）\n"
+        "  --trapper-prob F 一局里对手是「陷阱机器人」的概率（默认 0）\n"
         "                  （强牌只跟注/过牌，河牌才发力；惩罚用中等牌建大池）\n"
         "  --tight-prob F  一局里对手是「紧全下机器人」的概率（默认 0）\n"
         "                  （只用顶范围推/接全下，教策略面对全下收紧）\n"
         "  --shark-prob F  一局里对手是「价值型强对手」的概率（默认 0）\n"
         "                  （翻前紧凶、翻后只用两对+ 建池；惩罚中等牌建大池）\n"
+        "  --ranger-prob F 一局里对手是「读范围机器人」的概率（默认 0）\n"
+        "                  （跟注/弃牌按对手范围 = 当前牌面最强 keep%% 组件的条件\n"
+        "                   胜率；惩罚薄价值下注与宽跟注，补上其余脚本的范围盲）\n"
+        "  --ranger-air F  读范围机器人假设我们范围里的空气（诈唬）占比（默认 0.28；\n"
+        "                  0 = 纯强牌范围，会让它过度弃牌、教出「多诈唬」）\n"
         "  --folder-prob F 一局里对手是「按尺寸弃牌机器人」的概率（默认 0）\n"
+        "  --opp-cfr-prob F 一局里对手是「河牌 CFR 均衡回应」的概率（默认 0；其它街按\n"
+        "                   当前策略采样，河牌按范围均衡解，成本随 --opp-cfr-iters 线性）\n"
+        "  --opp-cfr-iters N 对手河牌求解的迭代次数（默认 120；0 = 关闭）\n"
+        "  --opp-cfr-min-pot N 只有底池 >= 该值才求解（默认 1500）\n"
         "  --big-pot-opponent DIR 底池 >= --big-pot-threshold（默认 4000）时改用该模型\n"
         "                     当对手（只换对手座位，用于压制大池赤字）\n"
         "  --self-sharp-prob F 一局里对手是**当前策略按部署温度**（默认 T=0.1）的概率\n"
@@ -157,7 +181,16 @@ void usage() {
         "  --archive N     历史池的归档容量，满了隔一个丢一个（默认 16）\n"
         "  --max-raises N  每街加注次数上限（默认 0 = 无上限，对齐 ACPC）\n"
         "  --oracle-coef F 开天眼稠密奖励的系数（默认 0.05，0 等于关掉）\n"
-        "  --aux-equity-coef F 范围胜率信念头的回归系数（默认 0 = 关闭）\n"        "  --teacher-min-pot F 只对底池 >= F 的决策做教师标注（默认 0 = 全部）\n"        "  --anchor-model DIR --anchor-coef F 非大池状态对冻结基座加 KL 信任域\n"        "  --river-rule-coef F --river-rule-min-pot N 河牌大池 -> 1.5x 下注的规则蒸馏\n"        "  --preflop-raise-mult F / --a-... / --b-... 翻前加注额放大系数（部署剥削）\n"        "  --postflop-bet-mult F / --a-... / --b-... 后翻牌下注额放大系数（部署剥削）\n"
+        "  --aux-equity-coef F 范围胜率信念头的回归系数（默认 0 = 关闭）\n"
+        "  --opp-model-coef F 对手牌力建模头的回归系数（默认 0 = 关闭）\n"
+        "  --range-eq N    范围胜率特征：每个决策采样 N 个对手组合，按对手最近动作\n"
+        "                  的策略似然重加权后算 vs-range 摊牌胜率（默认 0 = 关闭）\n"
+        "  --range-eq-iters N rangeEq 摊牌胜率的蒙特卡洛次数（默认 48；转/河精确）\n"
+        "  --teacher-min-pot F 只对底池 >= F 的决策做教师标注（默认 0 = 全部）\n"
+        "  --anchor-model DIR --anchor-coef F 非大池状态对冻结基座加 KL 信任域\n"
+        "  --river-rule-coef F --river-rule-min-pot N 河牌大池 -> 1.5x 下注的规则蒸馏\n"
+        "  --preflop-raise-mult F / --a-... / --b-... 翻前加注额放大系数（部署剥削）\n"
+        "  --postflop-bet-mult F / --a-... / --b-... 后翻牌下注额放大系数（部署剥削）\n"
         "  --no-oracle     关闭开天眼稠密奖励（只保留 critic 的完美信息价值）\n"
         "  --teacher-coef F 脚本教师蒸馏系数（默认 0 = 关；>0 时启用教师）\n"
         "  --teacher-temp F 教师动作价值的 softmax 温度（默认 0.5；Q 已按状态标准化）\n"
@@ -181,6 +214,22 @@ void usage() {
         "  --workers N     采样线程数（默认 1；按局并行；瓶颈在学习器，实测约 1.4×）\n"
         "  --policy-search N / --search-a N  策略内搜索：每步抽 N 组隐藏牌，用当前策略\n"
         "                  把每个合法动作续演到底，取期望回报最大的动作（部署用）\n"
+        "  --range-search N  河牌范围条件化搜索：只在河牌上用 N 组对手底牌做一步前瞻，\n"
+        "                  样本按对手最近动作的策略似然加权（后验范围），比均匀\n"
+        "                  隐藏牌搜索更接近 vs 范围的 EV；其它街仍用原策略\n"
+        "  --robust-search  鲁棒范围搜索：同一批对手底牌分别按自身/solid/shark 三种\n"
+        "                  模型续演，每个根动作取最坏情况 EV（配合 --range-search N）\n"
+        "  --robust-mean    把上面的最坏情况换成三模型等权平均 EV\n"
+        "  --range-search-min-pot N  河牌搜索只对底池 >= N 筹码的决策生效（0=全部）\n"
+        "  --range-search-defense-only  河牌搜索只用于面对下注（toCall>0）的防守决策\n"
+        "  --river-cfr N     河牌 CFR+ 子博弈：迭代 N 轮求范围均衡，用自己这张牌的\n"
+        "                  均衡动作替换网络动作（对手范围 = 1081 个组合按对手最近\n"
+        "                  动作的策略似然加权）。minimax 口径，和上面的剥削搜索互补\n"
+        "  --river-cfr-min-pot N  只在底池 >= N 筹码的河牌决策上求解（0=全部）\n"
+        "  --river-cfr-raises N   抽象树里首次下注后的加注次数（默认 1）\n"
+        "  --river-cfr-no-allin   抽象树里去掉全下尺寸\n"
+        "  --expert-prob F / --expert-samples N  专家迭代：自对局的河牌决策按概率 F 用\n"
+        "                  范围搜索的 Q 当教师标签，经 --teacher-coef 蒸馏回策略\n"
         "  --temp F / --a-temp F  评估时把动作 logits 除以 F（<1 更尖，默认 1）\n"
         "  --greedy / --a-greedy  评估时直接取 argmax（不采样）\n"
         "  --b-temp F / --b-greedy  对打时对手侧的动作选择（默认与训练一致）\n"
@@ -408,6 +457,7 @@ int cmdTrain(int argc, char** argv) {
     pcfg.teacherCoef = static_cast<float>(argDouble(argc, argv, "--teacher-coef", 0.0));
     pcfg.teacherTemp = static_cast<float>(argDouble(argc, argv, "--teacher-temp", 0.5));
     pcfg.auxEquityCoef = static_cast<float>(argDouble(argc, argv, "--aux-equity-coef", 0.0));
+    pcfg.oppModelCoef = static_cast<float>(argDouble(argc, argv, "--opp-model-coef", 0.0));
     pcfg.anchorCoef = static_cast<float>(argDouble(argc, argv, "--anchor-coef", 0.0));
     pcfg.anchorMaxPot = static_cast<float>(argDouble(argc, argv, "--anchor-max-pot", 1500.0));
     pcfg.ruleCoef = static_cast<float>(argDouble(argc, argv, "--river-rule-coef", 0.0));
@@ -460,6 +510,12 @@ int cmdTrain(int argc, char** argv) {
     rcfg.trapperProb = static_cast<float>(argDouble(argc, argv, "--trapper-prob", 0.0));
     rcfg.sharkProb = static_cast<float>(argDouble(argc, argv, "--shark-prob", 0.0));
     rcfg.spammerProb = static_cast<float>(argDouble(argc, argv, "--spammer-prob", 0.0));
+    rcfg.maniacProb = static_cast<float>(argDouble(argc, argv, "--maniac-prob", 0.0));
+    rcfg.rangerProb = static_cast<float>(argDouble(argc, argv, "--ranger-prob", 0.0));
+    rcfg.rangerAir = static_cast<float>(argDouble(argc, argv, "--ranger-air", 0.28));
+    rcfg.oppCfrProb = static_cast<float>(argDouble(argc, argv, "--opp-cfr-prob", 0.0));
+    rcfg.oppCfrIters = argInt(argc, argv, "--opp-cfr-iters", 120);
+    rcfg.oppCfrMinPot = argInt(argc, argv, "--opp-cfr-min-pot", 1500);
     rcfg.folderProb = static_cast<float>(argDouble(argc, argv, "--folder-prob", 0.0));
     rcfg.searchSamples = argInt(argc, argv, "--search-samples", 8);
     // 大池对手：把底池 >= 阈值的对手决策换成指定的克隆模型。
@@ -492,6 +548,16 @@ int cmdTrain(int argc, char** argv) {
     rcfg.criticOracleExtra = !hasFlag(argc, argv, "--critic-info-set");
     rcfg.oracleCoef = static_cast<float>(argDouble(argc, argv, "--oracle-coef", 0.05));
     rcfg.equityIters = argInt(argc, argv, "--oracle-iters", 32);
+    // 范围胜率特征：组合级计算（对手底牌采样 + 动作似然重加权 + 摊牌胜率）。
+    rcfg.rangeEqSamples = argInt(argc, argv, "--range-eq", 0);
+    rcfg.rangeEqIters = argInt(argc, argv, "--range-eq-iters", 48);
+    // 范围搜索剥削者：对手座位按概率换成"用最新策略做河牌后验加权前瞻"的
+    // 近似 BR。这是相对当前策略的近似 best response，用来压缩可利用空间。
+    rcfg.searchOppProb = static_cast<float>(argDouble(argc, argv, "--search-opp-prob", 0.0));
+    rcfg.searchOppSamples = argInt(argc, argv, "--search-opp-samples", 4);
+    // 专家迭代：河牌把范围条件化搜索的 Q 当教师标签蒸馏回策略（只标自对局）。
+    rcfg.expertProb = static_cast<float>(argDouble(argc, argv, "--expert-prob", 0.0));
+    rcfg.expertSamples = argInt(argc, argv, "--expert-samples", 8);
     rcfg.learnerBBProb = static_cast<float>(argDouble(argc, argv, "--learner-bb-prob", 0.5));
     if (hasFrozen) {
         rcfg.historicalProb = 0.0f;
@@ -504,6 +570,7 @@ int cmdTrain(int argc, char** argv) {
         rcfg.trapperProb = 0.0f;
         rcfg.sharkProb = 0.0f;
         rcfg.spammerProb = 0.0f;
+        rcfg.maniacProb = 0.0f;
         rcfg.selfSharpProb = 0.0f;
         rcfg.fixedOpponent[0] = &frozenActor[0];
         rcfg.fixedOpponent[1] = &frozenActor[1];
@@ -529,7 +596,10 @@ int cmdTrain(int argc, char** argv) {
     // 训练采样温度：默认 1.0（重要性比值要求行为策略=待优化策略）。
     // 改它等于把"待优化的策略"换成 τ 温度版本——部署用 τ 时可以试同温度训练。
     rcfg.policyTemp = static_cast<float>(argDouble(argc, argv, "--policy-temp", 1.0));
-    rcfg.teacher = pcfg.teacherCoef > 0.0f;
+    // 专家迭代用河牌搜索标签，与脚本教师共用同一条蒸馏损失。打开专家时
+    // 脚本教师整体关掉（含翻前），这样实验里只有"搜索改进"这一个标签来源，
+    // 归因不会和脚本教师混在一起；需要两者叠加时把 --teacher-coef 单独设。
+    rcfg.teacher = pcfg.teacherCoef > 0.0f && rcfg.expertProb <= 0.0f;
     rcfg.teacherProb = static_cast<float>(argDouble(argc, argv, "--teacher-prob", 1.0));
     rcfg.teacherSamples = argInt(argc, argv, "--teacher-samples", 8);
     rcfg.teacherStyles = argInt(argc, argv, "--teacher-styles", 3);
@@ -546,7 +616,10 @@ int cmdTrain(int argc, char** argv) {
                                                   rcfg.searchProb + rcfg.solidProb +
                                                   rcfg.tightProb + rcfg.trapperProb +
                                                   rcfg.sharkProb +
-                                                  rcfg.spammerProb + rcfg.folderProb +
+                                                  rcfg.spammerProb + rcfg.maniacProb +
+                                                  rcfg.rangerProb +
+                                                  rcfg.oppCfrProb +
+                                                  rcfg.folderProb +
                                                   rcfg.selfSharpProb +
                                                   rcfg.extraOpponentProb));
     const std::string capText =
@@ -560,6 +633,18 @@ int cmdTrain(int argc, char** argv) {
     if (pcfg.auxEquityCoef > 0.0f) {
         std::printf("  aux equity head: coef=%.3f（不完全信息 -> 开天眼胜率）\n",
                     pcfg.auxEquityCoef);
+    }
+    if (pcfg.oppModelCoef > 0.0f) {
+        std::printf("  opp model head: coef=%.3f（不完全信息 -> 对手牌力百分位）\n",
+                    pcfg.oppModelCoef);
+    }
+    if (rcfg.rangeEqSamples > 0) {
+        std::printf("  rangeEq: samples=%d iters=%d（组合级后验范围胜率，作为输入特征）\n",
+                    rcfg.rangeEqSamples, rcfg.rangeEqIters);
+    }
+    if (rcfg.searchOppProb > 0.0f) {
+        std::printf("  search opponent: prob=%.3f samples=%d（河牌范围条件化搜索，近似 BR）\n",
+                    rcfg.searchOppProb, rcfg.searchOppSamples);
     }
     std::printf("  hidden=%lld lstm=%lld | device=%s | games/update=%d | workers=%d\n",
                 static_cast<long long>(mc.hidden), static_cast<long long>(mc.lstmHidden),
@@ -580,6 +665,13 @@ int cmdTrain(int argc, char** argv) {
                         teacherReplaySteps, teacherReplayCoef);
         }
     }
+    if (rcfg.expertProb > 0.0f) {
+        std::printf("  expert iteration: prob=%.2f samples=%d coef=%.2f temp=%.2f（只标自对局河牌）\n",
+                    rcfg.expertProb, rcfg.expertSamples, pcfg.teacherCoef, pcfg.teacherTemp);
+        if (pcfg.teacherCoef <= 0.0f) {
+            std::printf("  [警告] --expert-prob>0 但 --teacher-coef=0，蒸馏损失不会生效\n");
+        }
+    }
     std::array<std::deque<texas::TeacherSample>, 2> replay;
     std::array<std::deque<texas::CriticSample>, 2> criticMemory;
     if (criticReplay > 0) {
@@ -594,12 +686,12 @@ int cmdTrain(int argc, char** argv) {
             "  league: 自对局 %.2f | 尖自对局 %.2f(T=%.2f) | 冻结 %.2f(T=%.2f)"
             " | 历史快照 %.2f (archive %.2f) | 规则 %.2f | 随机 %.2f | 胜率 %.2f"
             " | 搜索 %.2f | 稳健 %.2f | 紧全下 %.2f | 陷阱 %.2f | 强价值 %.2f"
-            " | 小注骚扰 %.2f | 按尺寸弃牌 %.2f  [池 recent=%d archive=%d]\n",
+            " | 小注骚扰 %.2f | 过度下注 %.2f | 读范围 %.2f | 按尺寸弃牌 %.2f | 河牌CFR %.2f  [池 recent=%d archive=%d]\n",
             selfProb, rcfg.selfSharpProb, rcfg.selfSharpTemp, rcfg.extraOpponentProb,
             rcfg.fixedOpponentTemp, rcfg.historicalProb, rcfg.archiveProb, rcfg.ruleProb,
             rcfg.randomProb, rcfg.proProb, rcfg.searchProb, rcfg.solidProb, rcfg.tightProb,
-            rcfg.trapperProb, rcfg.sharkProb, rcfg.spammerProb, rcfg.folderProb, recentCap,
-            archiveCap);
+            rcfg.trapperProb, rcfg.sharkProb, rcfg.spammerProb, rcfg.maniacProb,
+            rcfg.rangerProb, rcfg.folderProb, rcfg.oppCfrProb, recentCap, archiveCap);
     }
     std::printf("  %6s %7s %7s %6s %6s %6s %8s %8s %7s %6s %7s | %s\n", "update", "games", "sbWin%",
                 "sd%", "jam%", "fold%", "pgLoss", "vLoss", "entropy", "kl", "upd/s", "batch");
@@ -635,6 +727,7 @@ int cmdTrain(int argc, char** argv) {
         a.vsTrapper += b.vsTrapper;
         a.vsShark += b.vsShark;
         a.vsSpammer += b.vsSpammer;
+        a.vsManiac += b.vsManiac;
         a.vsFolder += b.vsFolder;
         a.vsSelfSharp += b.vsSelfSharp;
         a.vsExtra += b.vsExtra;
@@ -700,6 +793,7 @@ int cmdTrain(int argc, char** argv) {
         double pg = 0, vl = 0, ent = 0, kl = 0, tea = 0, teaH = 0, teaM = 0, rtea = 0, retMean = 0,
                retStd = 0, valMean = 0, valStd = 0, valCorr = 0, rcrit = 0;
         double auxMse = 0, auxMae = 0, auxPred = 0, auxLab = 0;
+        double oppMse = 0, oppMae = 0, oppPred = 0, oppLab = 0;
 
         std::array<texas::BatchTensors, 2> batches;
         std::array<texas::ppo::Stats, 2> sts;
@@ -732,6 +826,7 @@ int cmdTrain(int argc, char** argv) {
                         ts.node = t.node;
                         ts.seq = t.seq;
                         ts.q = t.teacherQ;
+                        ts.rangeEq = t.rangeEq;
                         ts.actions = t.actions;
                         replay[0].push_back(std::move(ts));
                         while (static_cast<int>(replay[0].size()) > teacherReplay * 2) {
@@ -791,6 +886,7 @@ int cmdTrain(int argc, char** argv) {
                         ts.node = t.node;
                         ts.seq = t.seq;
                         ts.q = t.teacherQ;
+                        ts.rangeEq = t.rangeEq;
                         ts.actions = t.actions;
                         replay[s].push_back(std::move(ts));
                         while (static_cast<int>(replay[s].size()) > teacherReplay) {
@@ -825,6 +921,10 @@ int cmdTrain(int argc, char** argv) {
             auxMae += st.auxMae;
             auxPred += st.auxPred;
             auxLab += st.auxLabel;
+            oppMse += st.oppLoss;
+            oppMae += st.oppMae;
+            oppPred += st.oppPred;
+            oppLab += st.oppLabel;
         }
 
         const auto now = std::chrono::steady_clock::now();
@@ -841,11 +941,13 @@ int cmdTrain(int argc, char** argv) {
                                    : 0.0;
         std::printf(
             "  %6d %7d %7.1f %6.1f %6.1f %6.1f %8.4f %8.4f %7.3f %6.1e %7.2f | ret %.3f±%.3f"
-            " val %.3f±%.3f c%.2f tea %.2f/%.2f/%.2f rce %.2f cr %.3f aux %.4f/%.3f %.2f/%.2f\n",
+            " val %.3f±%.3f c%.2f tea %.2f/%.2f/%.2f rce %.2f cr %.3f aux %.4f/%.3f %.2f/%.2f"
+            " opp %.4f/%.3f %.2f/%.2f\n",
             u, stats.games, winPct, sdPct, jamPct, foldPct, pg / 2, vl / 2, ent / 2, kl / 2,
             double(u) / secs, retMean / 2, retStd / 2, valMean / 2, valStd / 2, valCorr / 2,
             tea / 2, teaH / 2, teaM / 2, rtea / 2, rcrit / 2,
-            auxMse / 2, auxMae / 2, auxPred / 2, auxLab / 2);
+            auxMse / 2, auxMae / 2, auxPred / 2, auxLab / 2,
+            oppMse / 2, oppMae / 2, oppPred / 2, oppLab / 2);
         std::fflush(stdout);
 
         if (evalEvery > 0 && (u % evalEvery == 0 || u == updates)) {
@@ -936,6 +1038,18 @@ int cmdEval(int argc, char** argv) {
         static_cast<float>(argDouble(argc, argv, "--preflop-raise-mult", 1.0));
     team.postflopBetMult =
         static_cast<float>(argDouble(argc, argv, "--postflop-bet-mult", 1.0));
+    team.rangeEqSamples = argInt(argc, argv, "--range-eq", 0);
+    team.rangeEqIters = argInt(argc, argv, "--range-eq-iters", 48);
+    team.rangeSearchSamples = argInt(argc, argv, "--range-search", 0);
+    team.rangeSearchUniform = hasFlag(argc, argv, "--range-search-uniform");
+    team.robustSearch = hasFlag(argc, argv, "--robust-search");
+    team.robustMean = hasFlag(argc, argv, "--robust-mean");
+    team.rangeSearchMinPot = argInt(argc, argv, "--range-search-min-pot", 0);
+    team.rangeSearchDefenseOnly = hasFlag(argc, argv, "--range-search-defense-only");
+    team.riverCfrIters = argInt(argc, argv, "--river-cfr", 0);
+    team.riverCfrMinPot = argInt(argc, argv, "--river-cfr-min-pot", 0);
+    team.riverCfrMaxRaises = argInt(argc, argv, "--river-cfr-raises", 1);
+    if (hasFlag(argc, argv, "--river-cfr-no-allin")) team.riverCfrAllin = false;
 
     texas::EvalResult r;
     if (policySearch > 0) {
@@ -950,7 +1064,7 @@ int cmdEval(int argc, char** argv) {
     } else if (vs == "random") {
         r = texas::evalTeamVsRandom(team, hands, static_cast<uint64_t>(seed));
     } else if (vs == "self") {
-        r = texas::evalSelfPlay(actors, hands, static_cast<uint64_t>(seed));
+        r = texas::evalTeamSelfPlay(team, hands, static_cast<uint64_t>(seed));
     } else if (vs == "pro") {
         r = texas::evalTeamVsPro(team, hands, static_cast<uint64_t>(seed));
     } else if (vs == "search") {
@@ -969,6 +1083,15 @@ int cmdEval(int argc, char** argv) {
     if (policySearch > 0) {
         label += "+search" + std::to_string(policySearch);
     }
+    if (team.rangeSearchSamples > 0) {
+        label += "+rsearch" + std::to_string(team.rangeSearchSamples);
+    }
+    if (team.robustSearch) label += "+robust";
+    if (team.robustMean) label += "mean";
+    if (team.rangeSearchMinPot > 0) label += "+minpot" + std::to_string(team.rangeSearchMinPot);
+    if (team.rangeSearchDefenseOnly) label += "+defonly";
+    if (team.riverCfrIters > 0) label += "+rcfr" + std::to_string(team.riverCfrIters);
+    if (team.riverCfrMinPot > 0) label += "+rcfrmin" + std::to_string(team.riverCfrMinPot);
     if (team.policyGreedy) {
         label += "+greedy";
     } else if (team.policyTemp != 1.0f) {
@@ -1051,6 +1174,18 @@ int cmdMatch(int argc, char** argv) {
         static_cast<float>(argDouble(argc, argv, "--a-preflop-raise-mult", 1.0));
     team.postflopBetMult =
         static_cast<float>(argDouble(argc, argv, "--a-postflop-bet-mult", 1.0));
+    team.rangeEqSamples = argInt(argc, argv, "--range-eq", 0);
+    team.rangeEqIters = argInt(argc, argv, "--range-eq-iters", 48);
+    team.rangeSearchSamples = argInt(argc, argv, "--range-search", 0);
+    team.rangeSearchUniform = hasFlag(argc, argv, "--range-search-uniform");
+    team.robustSearch = hasFlag(argc, argv, "--robust-search");
+    team.robustMean = hasFlag(argc, argv, "--robust-mean");
+    team.rangeSearchMinPot = argInt(argc, argv, "--range-search-min-pot", 0);
+    team.rangeSearchDefenseOnly = hasFlag(argc, argv, "--range-search-defense-only");
+    team.riverCfrIters = argInt(argc, argv, "--river-cfr", 0);
+    team.riverCfrMinPot = argInt(argc, argv, "--river-cfr-min-pot", 0);
+    team.riverCfrMaxRaises = argInt(argc, argv, "--river-cfr-raises", 1);
+    if (hasFlag(argc, argv, "--river-cfr-no-allin")) team.riverCfrAllin = false;
 
     texas::MatchLog mlog;
     const texas::EvalResult r =
@@ -1084,6 +1219,14 @@ int cmdMatch(int argc, char** argv) {
     if (searchA > 0) {
         labelA += "+search" + std::to_string(searchA);
     }
+    if (team.rangeSearchSamples > 0) {
+        labelA += "+rsearch" + std::to_string(team.rangeSearchSamples);
+    }
+    if (team.robustSearch) labelA += "+robust";
+    if (team.robustMean) labelA += "mean";
+    if (team.rangeSearchMinPot > 0) labelA += "+minpot" + std::to_string(team.rangeSearchMinPot);
+    if (team.rangeSearchDefenseOnly) labelA += "+defonly";
+    if (team.riverCfrIters > 0) labelA += "+rcfr" + std::to_string(team.riverCfrIters);
     if (team.policyGreedy) {
         labelA += "+greedy";
     } else if (team.policyTemp != 1.0f) {
@@ -2338,6 +2481,54 @@ int cmdAllinAudit(int argc, char** argv) {
 //   2) 看我们自己面对下注时，弃牌/跟注的牌力是否错位
 //      （大池摊牌亏损的直接来源）。
 // 百分位来自 handStrength(hole, board, 5)，是精确排名，不是分位点近似。
+// 摊牌诊断：对我们的模型 vs 某个脚本对手打 N 手，按"摊牌/非摊牌"拆收益，
+// 并给出双方的摊牌牌型分布。外部 12000 手（README #107）显示赤字全部来自
+// 摊牌（胜率 20.4%、我们 22% 是高牌），但外部一轮要跑几小时。这个子命令把
+// 同一测量搬到本地：几十秒就出数，用来当后续改动的闸门指标。
+int cmdShowdown(int argc, char** argv) {
+    const std::string dir = argStr(argc, argv, "--resume", "");
+    const std::string opp = argStr(argc, argv, "--vs", "solid");
+    const int hands = argInt(argc, argv, "--hands", 2000);
+    const int seed = argInt(argc, argv, "--seed", 90001);
+    texas::EvalTeam team;
+    texas::nn::ModelConfig mc;
+    mc.hidden = argInt(argc, argv, "--hidden", 256);
+    mc.lstmHidden = argInt(argc, argv, "--lstm", 128);
+    static texas::nn::Actor actors[2];
+    if (!dir.empty()) {
+        for (int s = 0; s < 2; ++s) {
+            actors[s] = texas::nn::Actor(std::make_shared<texas::nn::ActorImpl>(mc));
+        }
+        if (!loadActors(actors, dir)) {
+            std::printf("cannot load actors from %s\n", dir.c_str());
+            return 1;
+        }
+        team.actor[0] = &actors[0];
+        team.actor[1] = &actors[1];
+    }
+    team.policyTemp = static_cast<float>(argDouble(argc, argv, "--temp", 0.5));
+    team.policyGreedy = hasFlag(argc, argv, "--greedy");
+    team.amountMid = hasFlag(argc, argv, "--amount-mid");
+    team.rangeEqSamples = argInt(argc, argv, "--range-eq", 0);
+    team.rangeEqIters = argInt(argc, argv, "--range-eq-iters", 48);
+    team.rangerAir = static_cast<float>(argDouble(argc, argv, "--ranger-air", 0.28));
+    if (opp == "cfr") {
+        team.oppCfrIters = argInt(argc, argv, "--opp-cfr-iters", 120);
+        team.oppCfrMinPot = argInt(argc, argv, "--opp-cfr-min-pot", 1500);
+    }
+
+    texas::ShowdownStats sd;
+    const texas::EvalResult r = texas::evalShowdownVs(team, opp, hands,
+                                                     static_cast<uint64_t>(seed),
+                                                     argInt(argc, argv, "--equity-iters", 24),
+                                                     sd);
+    std::printf("showdown %s vs %s | T=%.2f\n", dir.c_str(), opp.c_str(), team.policyTemp);
+    std::printf("  总 EV %+0.1f ± %.1f 筹码/手 (%.1f BB/100)\n", r.chipsPerHand, r.stderr,
+                r.bbPer100);
+    sd.print(opp.c_str(), r.hands);
+    return 0;
+}
+
 int cmdRiverRanges(int argc, char** argv) {
     const std::vector<std::string> csvs = argValues(argc, argv, "--csv");
     if (csvs.empty()) {
@@ -3041,6 +3232,8 @@ int cmdSlumbot(int argc, char** argv) {
         static_cast<float>(argDouble(argc, argv, "--preflop-aggro-pct", 0.0));
     cfg.preflopAggroMaxRaises = argInt(argc, argv, "--preflop-aggro-max-raises", 2);
     cfg.flopAggroPct = static_cast<float>(argDouble(argc, argv, "--flop-aggro-pct", 0.0));
+    cfg.rangeEqSamples = argInt(argc, argv, "--range-eq", 0);
+    cfg.rangeEqIters = argInt(argc, argv, "--range-eq-iters", 48);
 
     texas::nn::ModelConfig mc;
     mc.hidden = argInt(argc, argv, "--hidden", 256);
@@ -3074,11 +3267,12 @@ int cmdSlumbot(int argc, char** argv) {
     const double adjSeBb100 = r.adjustedStderr / double(texas::kBigBlind) * 100.0;
     std::printf(
         "\nslumbot 结果: %d/%d 手完成（中止 %d，错误 %d，河牌大注 %d，全下 guard %d，"
-        "翻前限攻 %d，翻牌限攻 %d）\n"
+        "翻前限攻 %d，翻牌限攻 %d，rangeEq 决策 %d）\n"
                 "  净收益 %+lld 筹码 | %+0.1f ± %.1f 筹码/手 | %+0.1f ± %.1f bb/100 | "
                 "胜 %d 负 %d 平 %d | %.1f 手/s\n",
                 r.hands, r.attempted, r.attempted - r.hands, r.errors, r.riverOverbets,
-                r.allinGuardFolds, r.preflopAggroCapped, r.flopAggroCapped, r.winnings, per,
+                r.allinGuardFolds, r.preflopAggroCapped, r.flopAggroCapped,
+                r.rangeEqDecisions, r.winnings, per,
                 r.chipsStderr, per / double(texas::kBigBlind) * 100.0, seBb100, r.wins, r.losses,
                 r.pushes, double(r.hands) / std::max(secs, 1e-6));
     std::printf("  全下调整: %+0.1f ± %.1f 筹码/手 | %+0.1f ± %.1f bb/100 | 调整 %d 手（%.0f%%）\n",
@@ -3107,6 +3301,7 @@ int main(int argc, char** argv) {
     if (cmd == "slumbot-analyze") return cmdSlumbotAnalyze(argc, argv);
     if (cmd == "allin-audit") return cmdAllinAudit(argc, argv);
     if (cmd == "river-ranges") return cmdRiverRanges(argc, argv);
+    if (cmd == "showdown") return cmdShowdown(argc, argv);
     if (cmd == "slumbot-fit") return cmdSlumbotFit(argc, argv);
     usage();
     return 0;

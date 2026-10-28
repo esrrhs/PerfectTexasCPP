@@ -36,6 +36,26 @@ ActorImpl::ActorImpl(const ModelConfig& cfg) : config(cfg) {
     torch::nn::init::zeros_(auxAct2->weight);
     torch::nn::init::zeros_(auxAct2->bias);
 
+    // 对手建模头：与信念头同构，但回归标签是"对手当前牌力百分位"。
+    // 残差支路独立一条（不扩 aux_act1 的输入维度），这样带 aux 的旧检查点
+    // 仍然能按原形状加载；所有新参数都在零初始化路径上（末层为零）。
+    opp1 = register_module("opp1", torch::nn::Linear(nodeDim, 128));
+    opp2 = register_module("opp2", torch::nn::Linear(128, 1));
+    torch::nn::init::normal_(opp2->weight, 0.0, 0.01);
+    torch::nn::init::zeros_(opp2->bias);
+    oppAct1 = register_module("opp_act1", torch::nn::Linear(kActionInput + 1, 32));
+    oppAct2 = register_module("opp_act2", torch::nn::Linear(32, 1));
+    torch::nn::init::zeros_(oppAct2->weight);
+    torch::nn::init::zeros_(oppAct2->bias);
+
+    // 范围胜率残差支路：rangeEq 由 rollout 采样对手底牌、按对手最近动作做
+    // 贝叶斯重加权后算出（组合级计算，网络自己做不到）。这里只负责把
+    // "动作 x 胜率"接进打分。末层零初始化 => 旧检查点行为逐位不变。
+    rngAct1 = register_module("rng_act1", torch::nn::Linear(kActionInput + 1, 32));
+    rngAct2 = register_module("rng_act2", torch::nn::Linear(32, 1));
+    torch::nn::init::zeros_(rngAct2->weight);
+    torch::nn::init::zeros_(rngAct2->bias);
+
     // 最后一层零初始化：开局所有动作分数相同，策略从均匀分布出发
     torch::nn::init::zeros_(head->weight);
     torch::nn::init::zeros_(head->bias);
@@ -43,7 +63,16 @@ ActorImpl::ActorImpl(const ModelConfig& cfg) : config(cfg) {
 
 std::pair<torch::Tensor, torch::Tensor> ActorImpl::forwardWithAux(
     const torch::Tensor& node, const torch::Tensor& seq, const torch::Tensor& actFeat,
-    const torch::Tensor& actSample, const torch::Tensor& actId) const {
+    const torch::Tensor& actSample, const torch::Tensor& actId,
+    const torch::Tensor& rangeEq) const {
+    AuxOutputs out = forwardAll(node, seq, actFeat, actSample, actId, rangeEq);
+    return {out.logits, out.eqHat};
+}
+
+ActorImpl::AuxOutputs ActorImpl::forwardAll(
+    const torch::Tensor& node, const torch::Tensor& seq, const torch::Tensor& actFeat,
+    const torch::Tensor& actSample, const torch::Tensor& actId,
+    const torch::Tensor& rangeEq) const {
     auto lstmOut = lstm->forward(seq);
     torch::Tensor hLast = std::get<0>(std::get<1>(lstmOut)).squeeze(0);
     torch::Tensor x = torch::cat({node, hLast}, /*dim=*/1);
@@ -75,17 +104,39 @@ std::pair<torch::Tensor, torch::Tensor> ActorImpl::forwardWithAux(
     torch::Tensor aj = torch::cat({actFeat, eqPerAction}, /*dim=*/1);
     scores = scores + auxAct2->forward(torch::relu(auxAct1->forward(aj))).squeeze(-1);
 
+    // 对手建模残差支路：同一个动作在"对手范围很强"和"对手范围很弱"两种
+    // 判断下应该得到不同的分数（对手强 -> 大注更差）。oppHat 同样 detach。
+    torch::Tensor oppHat = torch::sigmoid(opp2->forward(torch::relu(opp1->forward(x))))
+                               .squeeze(-1);
+    torch::Tensor oppPerAction =
+        oppHat.detach().index_select(0, sampleIdx).unsqueeze(1);
+    torch::Tensor oj = torch::cat({actFeat, oppPerAction}, /*dim=*/1);
+    scores = scores + oppAct2->forward(torch::relu(oppAct1->forward(oj))).squeeze(-1);
+
+    // 范围胜率残差支路：rangeEq 是 rollout 用"对手最近动作 + 采样底牌"算出的
+    // vs-range 摊牌胜率（组合级后验加权），随状态变化。它不参与梯度（是输入
+    // 特征），与动作特征拼接后给每个动作一个修正。
+    torch::Tensor rngPerAction;
+    if (rangeEq.defined() && rangeEq.numel() == node.size(0)) {
+        rngPerAction = rangeEq.to(node.device()).index_select(0, sampleIdx).unsqueeze(1);
+    } else {
+        rngPerAction = torch::full({actFeat.size(0), 1}, 0.5f,
+                                   torch::TensorOptions().dtype(torch::kFloat32).device(node.device()));
+    }
+    torch::Tensor rj = torch::cat({actFeat, rngPerAction}, /*dim=*/1);
+    scores = scores + rngAct2->forward(torch::relu(rngAct1->forward(rj))).squeeze(-1);
+
     const int64_t B = node.size(0);
     torch::Tensor logits = torch::full({B, kNumActions}, -1e9f,
                                        torch::TensorOptions().dtype(torch::kFloat32).device(node.device()));
     logits.index_put_({sampleIdx, actId.to(torch::kLong)}, scores);
-    return {logits, eqHat};
+    return AuxOutputs{logits, eqHat, oppHat};
 }
 
 torch::Tensor ActorImpl::forward(const torch::Tensor& node, const torch::Tensor& seq,
                                  const torch::Tensor& actFeat, const torch::Tensor& actSample,
-                                 const torch::Tensor& actId) const {
-    return forwardWithAux(node, seq, actFeat, actSample, actId).first;
+                                 const torch::Tensor& actId, const torch::Tensor& rangeEq) const {
+    return forwardWithAux(node, seq, actFeat, actSample, actId, rangeEq).first;
 }
 
 void ActorImpl::saveTo(const std::string& path) const {
@@ -115,13 +166,17 @@ bool ActorImpl::loadFrom(const std::string& path) {
         old.load_from(path);
         int loaded = 0;
         auto loadMod = [&](const std::string& name, const torch::nn::Module& m) {
-            torch::serialize::InputArchive sub;
-            old.read(name, sub);
-            for (const auto& p : m.named_parameters()) {
-                torch::Tensor t = p.value().clone();
-                sub.read(p.key(), t);
-                p.value().copy_(t);
-                ++loaded;
+            try {
+                torch::serialize::InputArchive sub;
+                old.read(name, sub);
+                for (const auto& p : m.named_parameters()) {
+                    torch::Tensor t = p.value().clone();
+                    sub.read(p.key(), t);
+                    p.value().copy_(t);
+                    ++loaded;
+                }
+            } catch (const std::exception&) {
+                // 该子模块在旧检查点里不存在：保留初始化值（新增支路末层为零）。
             }
         };
         loadMod("lstm", *lstm);
@@ -130,7 +185,17 @@ bool ActorImpl::loadFrom(const std::string& path) {
         loadMod("l3", *l3);
         loadMod("l4", *l4);
         loadMod("head", *head);
-        std::printf("  actor: 旧检查点兼容加载 %d 个参数（aux_* 保持初始值）\n", loaded);
+        loadMod("aux1", *aux1);
+        loadMod("aux2", *aux2);
+        loadMod("aux_act1", *auxAct1);
+        loadMod("aux_act2", *auxAct2);
+        loadMod("opp1", *opp1);
+        loadMod("opp2", *opp2);
+        loadMod("opp_act1", *oppAct1);
+        loadMod("opp_act2", *oppAct2);
+        loadMod("rng_act1", *rngAct1);
+        loadMod("rng_act2", *rngAct2);
+        std::printf("  actor: 旧检查点兼容加载 %d 个参数（缺失的新支路保持初始值）\n", loaded);
         return loaded > 0;
     } catch (const std::exception& e) {
         std::printf("  actor loadFrom 失败: %s\n", e.what());

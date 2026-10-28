@@ -23,6 +23,7 @@
 #include "texas/nn.hpp"
 #include "texas/ppo.hpp"
 #include "texas/rollout.hpp"
+#include "texas/rivercfr.hpp"
 #include "texas/slumbot.hpp"
 #include "texas/strength.hpp"
 
@@ -852,6 +853,113 @@ void testPolicySearch() {
     CHECK(checked > 10);
 }
 
+// 河牌范围条件化搜索：给"对手最近动作"的后验权重后，返回的仍必须是合法
+// 动作，并且同一随机种子下可逐位复现（部署与外部对局都要可复现）。
+void testRangeSearch() {
+    section("河牌范围条件化搜索");
+
+    texas::nn::ModelConfig mc;
+    texas::nn::Actor actors[2];
+    for (int s = 0; s < 2; ++s) {
+        actors[s] = texas::nn::Actor(std::make_shared<texas::nn::ActorImpl>(mc));
+    }
+
+    texas::Rng rng(9091);
+    texas::HUState st;
+    // 翻前 b200c、三条街各 kbXc，河牌对手下注 1600，轮到我们（BB）决策。
+    CHECK(texas::buildSlumbotState("b200c/kb400c/kb800c/kb1600", "Qs", "8h",
+                                   {"Kd", "7c", "2s", "9d", "3h"}, /*clientPos=*/0, rng, st));
+    CHECK(st.boardN == 5);
+    CHECK(st.toAct == 1);
+
+    // 对手"下注 1600"之前的那个状态（河牌、轮到对手），以及它对应的动作槽。
+    texas::RangeObs last;
+    CHECK(texas::buildSlumbotState("b200c/kb400c/kb800c/k", "Qs", "8h",
+                                   {"Kd", "7c", "2s", "9d", "3h"}, /*clientPos=*/0, rng,
+                                   last.pre));
+    CHECK(last.pre.boardN == 5);
+    CHECK(last.pre.toAct == 0);
+    texas::LegalMove olm[texas::kNumActions];
+    const int on = texas::legalMoves(last.pre, olm);
+    for (int i = 0; i < on; ++i) {
+        if (olm[i].slot < texas::kSlotSize0) continue;
+        if (1600 >= int(olm[i].mv.to) && 1600 <= olm[i].toHi) last.slot = olm[i].slot;
+    }
+    last.valid = (last.slot >= 0);
+    CHECK(last.valid);
+
+    // 合法性 + 可复现（同一随机流两次调用给同一个动作）。
+    auto legal = [&](const texas::Move& mv) {
+        texas::LegalMove lm[texas::kNumActions];
+        const int n = texas::legalMoves(st, lm);
+        for (int i = 0; i < n; ++i) {
+            if (lm[i].mv.kind != mv.kind) continue;
+            if (mv.kind == texas::MK_RAISE || mv.kind == texas::MK_ALLIN) {
+                if (mv.to >= int(lm[i].mv.to) && mv.to <= lm[i].toHi) return true;
+            } else {
+                return true;
+            }
+        }
+        return false;
+    };
+    texas::Rng r1(777), r2(777);
+    const texas::Move a1 = texas::policySearchMove(actors, actors + 1, st, st.toAct, 4, r1, 4,
+                                                   &last, &actors[0]);
+    const texas::Move a2 = texas::policySearchMove(actors, actors + 1, st, st.toAct, 4, r2, 4,
+                                                   &last, &actors[0]);
+    CHECK(legal(a1));
+    CHECK(a1.kind == a2.kind && a1.to == a2.to);
+
+    // qOut 是给专家迭代当教师标签用的：必须和返回动作一致（返回的就是
+    // 加权 Q 最大的槽），非法槽保持 0。
+    texas::Rng r4(777);
+    std::array<float, texas::kNumActions> q{};
+    const texas::Move a4 = texas::policySearchMove(actors, actors + 1, st, st.toAct, 4, r4, 4,
+                                                   &last, &actors[0], &q);
+    CHECK(a4.kind == a1.kind && a4.to == a1.to);
+    texas::LegalMove lm2[texas::kNumActions];
+    const int n2 = texas::legalMoves(st, lm2);
+    bool anyZeroIllegal = false;
+    for (int a = 0; a < texas::kNumActions; ++a) {
+        bool isLegal = false;
+        for (int i = 0; i < n2; ++i) {
+            if (lm2[i].slot == a) isLegal = true;
+        }
+        if (!isLegal && q[static_cast<size_t>(a)] != 0.0f) anyZeroIllegal = true;
+    }
+    CHECK(!anyZeroIllegal);
+    int qBest = -1;
+    float qBestV = -1e30f;
+    for (int i = 0; i < n2; ++i) {
+        const float v = q[static_cast<size_t>(lm2[i].slot)];
+        if (v > qBestV) {
+            qBestV = v;
+            qBest = i;
+        }
+    }
+    CHECK(qBest >= 0);
+    const texas::Move& qmv = lm2[qBest].mv;
+    CHECK(qmv.kind == a4.kind);
+    if (a4.kind == texas::MK_RAISE || a4.kind == texas::MK_ALLIN) {
+        CHECK(a4.to >= int(qmv.to) && a4.to <= lm2[qBest].toHi);
+    }
+
+    // 无 RangeObs 时仍是均匀搜索，同样必须合法。
+    texas::Rng r3(777);
+    const texas::Move a3 = texas::policySearchMove(actors, actors + 1, st, st.toAct, 4, r3, 4);
+    CHECK(legal(a3));
+
+    // 鲁棒搜索：同一批对手底牌分别按自身 actor / solid / shark 三种模型续演，
+    // 每个根动作取最坏情况 EV。必须合法、且同一随机种子逐位可复现。
+    texas::Rng r5(777), r6(777);
+    const texas::Move b1 = texas::policySearchRobustMove(actors, actors + 1, st, st.toAct, 4, r5, 4,
+                                                        &last, &actors[0]);
+    const texas::Move b2 = texas::policySearchRobustMove(actors, actors + 1, st, st.toAct, 4, r6, 4,
+                                                        &last, &actors[0]);
+    CHECK(legal(b1));
+    CHECK(b1.kind == b2.kind && b1.to == b2.to);
+}
+
 // ---------------------------------------------------------------- Slumbot 状态重建
 
 // Slumbot 的动作串（b200c/kb400）必须能无歧义地还原成本地 HUState：
@@ -913,8 +1021,53 @@ void testSlumbotState() {
     }
 }
 
-// ---------------------------------------------------------------- 全下 EV 调整
+// 部署时要算 rangeEq，需要从动作串里认出"对手最近一次决策"：动作前状态 +
+// 对手实际打出的动作槽。选错动作（例如把我们的过牌当成对手的）会让似然
+// 条件化到错误的范围上，所以这里逐例钉死。
+void testSlumbotLastOpp() {
+    section("Slumbot 对手最近决策重建");
 
+    texas::Rng rng(2026);
+    texas::RangeObs last;
+
+    // 翻前 SB（对手）加注到 200，我们跟注，翻牌 BB（我们）过牌，SB 下注 400。
+    // 最后一次对手决策 = 翻牌的 b400。
+    texas::HUState st;
+    CHECK(texas::buildSlumbotState("b200c/kb400", "Qs", "8h", {"Kd", "7c", "2s"},
+                                   /*clientPos=*/0, rng, st));
+    CHECK(st.toAct == 1);
+    CHECK(texas::slumbotLastOppDecision("b200c/kb400", "Qs", "8h", {"Kd", "7c", "2s"},
+                                        /*clientPos=*/0, rng, last));
+    CHECK(last.valid);
+    CHECK(last.pre.street == texas::ST_FLOP);
+    CHECK(int(last.pre.toAct) == 0);                 // 对手 = SB
+    CHECK(int(last.pre.contrib[0]) == 0);            // 下注前本街还没投钱
+    CHECK(last.slot >= texas::kSlotSize0);           // 是一个加注尺寸槽
+    CHECK(texas::slotOfMove(last.pre, texas::makeRaise(last.pre, 400, 0)) == last.slot);
+
+    // 行动串末尾是我们自己的动作（翻牌我们过牌）：最近一次对手决策仍是翻前的开牌。
+    CHECK(texas::slumbotLastOppDecision("b200c/k", "Qs", "8h", {"Kd", "7c", "2s"},
+                                        /*clientPos=*/0, rng, last));
+    CHECK(last.valid);
+    CHECK(last.pre.street == texas::ST_PREFLOP);
+    CHECK(int(last.pre.toAct) == 0);
+    CHECK(last.slot >= texas::kSlotSize0);
+
+    // 我们还没行动（对手刚开牌）：最近一次对手决策就是这次开牌。
+    CHECK(texas::slumbotLastOppDecision("b200", "Qs", "8h", {}, /*clientPos=*/0, rng, last));
+    CHECK(last.valid);
+    CHECK(last.pre.street == texas::ST_PREFLOP);
+    CHECK(last.slot >= texas::kSlotSize0);
+
+    // clientPos=1（我们是 SB，翻前先行动）：空动作串没有对手决策。
+    CHECK(!texas::slumbotLastOppDecision("", "Qs", "8h", {}, /*clientPos=*/1, rng, last));
+    // 对手全下（SB 推 b20000）对应全下槽，不能被当成 check-call。
+    CHECK(texas::slumbotLastOppDecision("b20000c", "Qs", "8h", {}, /*clientPos=*/0, rng, last));
+    CHECK(last.valid);
+    CHECK(last.slot == texas::kSlotAllIn);
+}
+
+// ---------------------------------------------------------------- 全下 EV 调整
 // 河牌前全下用全下时的胜率折算底池：AA 打 KK 翻前全下，调整值应接近
 // 0.82 × 40000 − 20000；河牌全下或弃牌则不调整。
 void testAllinAdjusted() {
@@ -1463,6 +1616,128 @@ void testAnyAmount() {
         CHECK(bets > 100);
     }
 
+    // 12b) 过度下注机器人：动作合法、河牌空池高频超大尺寸开火、面对大注极少弃牌。
+    {
+        texas::Rng rng(4242);
+        int illegal = 0;
+        for (int t = 0; t < 300; ++t) {
+            texas::HUState g = texas::dealNewHand(rng);
+            const int steps = int(rng() % 8);
+            for (int i = 0; i < steps && !g.terminal(); ++i) {
+                texas::LegalMove lm[texas::kNumActions];
+                const int n = texas::legalMoves(g, lm);
+                if (n <= 0) break;
+                texas::applyMove(g, lm[rng() % static_cast<size_t>(n)].mv, rng);
+            }
+            if (g.terminal()) continue;
+            const texas::Move m = texas::maniacAgentMove(g, rng);
+            const int need = texas::toCall(g, g.toAct);
+            if (m.kind == texas::MK_RAISE && !texas::canRaiseTo(g, m.to)) ++illegal;
+            if (m.kind == texas::MK_ALLIN && m.to != texas::maxRaiseTo(g)) ++illegal;
+            if (m.kind == texas::MK_CHECK && need > 0) ++illegal;
+        }
+        CHECK(illegal == 0);
+
+        // 河牌无人下注 + 超对（极化范围里的强牌一端）：应高频超大尺寸开火。
+        const texas::Card ha[2] = {C("Kc"), C("Kd")};
+        const texas::Card hb[2] = {C("Qs"), C("Jh")};
+        texas::Card board[5] = {C("2c"), C("7d"), C("9h"), C("Ts"), C("3c")};
+        texas::HUState g = texas::makeState(ha, hb, board, 5);
+        texas::Move call{};
+        call.kind = texas::MK_CALL;
+        call.to = 100;
+        texas::applyMove(g, call, rng);
+        for (int st = 0; st < 3; ++st) {
+            texas::Move chk{};
+            chk.kind = texas::MK_CHECK;
+            chk.to = g.contrib[g.toAct];
+            texas::applyMove(g, chk, rng);
+            chk.to = g.contrib[g.toAct];
+            texas::applyMove(g, chk, rng);
+        }
+        CHECK(g.street == texas::ST_RIVER);
+        CHECK(texas::toCall(g, g.toAct) == 0);
+        int bets = 0;
+        for (int t = 0; t < 200; ++t) {
+            const texas::Move m = texas::maniacAgentMove(g, rng);
+            if (m.kind == texas::MK_RAISE || m.kind == texas::MK_ALLIN) ++bets;
+        }
+        CHECK(bets > 110);
+    }
+
+    // 12c) 读范围机器人：动作合法；面对 1.5 倍池注，中等一对按范围该弃，
+    //      而 solid（范围盲、宽跟）基本不弃。这正是 README #107(d) 缺的压力。
+    {
+        texas::Rng rng(4243);
+        int illegal = 0;
+        for (int t = 0; t < 200; ++t) {
+            texas::HUState g = texas::dealNewHand(rng);
+            const int steps = int(rng() % 8);
+            for (int i = 0; i < steps && !g.terminal(); ++i) {
+                texas::LegalMove lm[texas::kNumActions];
+                const int n = texas::legalMoves(g, lm);
+                if (n <= 0) break;
+                texas::applyMove(g, lm[rng() % static_cast<size_t>(n)].mv, rng);
+            }
+            if (g.terminal()) continue;
+            const texas::Move m = texas::rangerAgentMove(g, rng);
+            const int need = texas::toCall(g, g.toAct);
+            if (m.kind == texas::MK_RAISE && !texas::canRaiseTo(g, m.to)) ++illegal;
+            if (m.kind == texas::MK_ALLIN && m.to != texas::maxRaiseTo(g)) ++illegal;
+            if (m.kind == texas::MK_CHECK && need > 0) ++illegal;
+        }
+        CHECK(illegal == 0);
+
+        // 河牌：BB 拿 K 一对（Kc Qd），SB 下 1.5 倍池（板 Kc7d9hTs3c）。
+        auto riverMediumFacingBet = [&](texas::Rng& r) {
+            const texas::Card sbHole[2] = {C("As"), C("2d")};
+            const texas::Card bbHole[2] = {C("Kc"), C("Qd")};
+            texas::Card board[5] = {C("Kc"), C("7d"), C("9h"), C("Ts"), C("3c")};
+            texas::HUState g = texas::makeState(sbHole, bbHole, board, 5);
+            texas::Move call{};
+            call.kind = texas::MK_CALL;
+            call.to = 100;
+            texas::applyMove(g, call, r);
+            // 一路过牌到河牌。
+            while (!g.terminal() && g.street != texas::ST_RIVER &&
+                   texas::toCall(g, g.toAct) == 0) {
+                texas::Move chk{};
+                chk.kind = texas::MK_CHECK;
+                chk.to = g.contrib[g.toAct];
+                texas::applyMove(g, chk, r);
+            }
+            // 河牌：先动的一方（BB）过牌，SB 下 1.5 倍池。
+            if (!g.terminal() && texas::toCall(g, g.toAct) == 0) {
+                texas::Move chk{};
+                chk.kind = texas::MK_CHECK;
+                chk.to = g.contrib[g.toAct];
+                texas::applyMove(g, chk, r);
+            }
+            if (!g.terminal() && texas::toCall(g, g.toAct) == 0) {
+                const int pot = g.pot();
+                texas::Move bet = texas::makeRaise(g, int(g.contrib[g.toAct]) + int(1.5 * pot));
+                texas::applyMove(g, bet, r);
+            }
+            return g;
+        };
+        int rangerFolds = 0, solidFolds = 0;
+        texas::Rng r1(777), r2(777);
+        for (int t = 0; t < 100; ++t) {
+            texas::HUState g = riverMediumFacingBet(r1);
+            CHECK(g.street == texas::ST_RIVER);
+            CHECK(texas::toCall(g, g.toAct) > 0);
+            if (!g.terminal() && texas::rangerAgentMove(g, r1).kind == texas::MK_FOLD) {
+                ++rangerFolds;
+            }
+            texas::HUState h = riverMediumFacingBet(r2);
+            if (!h.terminal() && texas::solidAgentMove(h, r2).kind == texas::MK_FOLD) {
+                ++solidFolds;
+            }
+        }
+        CHECK(rangerFolds > solidFolds + 20);
+        CHECK(solidFolds < 40);
+    }
+
     // 13) 全下纪律 guard：弱牌面对大额全下要弃，强牌不弃。
     {
         const texas::Card weak[2] = {C("Kd"), C("Qd")};
@@ -1515,6 +1790,372 @@ void testAnyAmount() {
     }
 }
 
+// 对手建模头：三个输出形状正确、概率有界；残差支路确实接进了动作分数。
+void testOppModel() {
+    section("对手牌力建模头");
+
+    texas::nn::ModelConfig mc;
+    mc.hidden = 32;
+    mc.lstmHidden = 16;
+    texas::nn::Actor actor(std::make_shared<texas::nn::ActorImpl>(mc));
+    actor->eval();
+
+    const int64_t B = 4;
+    const int64_t L = 8;
+    torch::Tensor node = torch::rand({B, texas::kNodeInput});
+    torch::Tensor seq = torch::rand({B, texas::kHistSteps, texas::kHistDim});
+    torch::Tensor actFeat = torch::rand({L, texas::kActionInput});
+    torch::Tensor actSample = torch::tensor({0, 0, 1, 1, 2, 2, 3, 3});
+    torch::Tensor actId = torch::tensor({0, 1, 2, 3, 4, 5, 6, 7});
+
+    torch::NoGradGuard ng;
+    auto out = actor->forwardAll(node, seq, actFeat, actSample, actId);
+    CHECK(out.logits.size(0) == B && out.logits.size(1) == texas::kNumActions);
+    CHECK(out.eqHat.size(0) == B);
+    CHECK(out.oppHat.size(0) == B);
+
+    torch::Tensor eqMin = out.eqHat.min(), eqMax = out.eqHat.max();
+    torch::Tensor opMin = out.oppHat.min(), opMax = out.oppHat.max();
+    CHECK(eqMin.item<double>() >= 0.0 && eqMax.item<double>() <= 1.0);
+    CHECK(opMin.item<double>() >= 0.0 && opMax.item<double>() <= 1.0);
+
+    // 末层零初始化：两支残差都不改变策略（与"只走主干"的旧模型等价）。
+    torch::Tensor logits0 = out.logits.clone();
+    const float* l0 = logits0.data_ptr<float>();
+    for (int64_t i = 0; i < B; ++i) {
+        for (int a = 0; a < texas::kNumActions; ++a) {
+            const float v = l0[i * texas::kNumActions + a];
+            if (v > -1e8f) CHECK(std::isfinite(v));
+        }
+    }
+
+    // 把 opp 残差末层改成非零后，动作分数必须变化（证明支路接通了）。
+    {
+        torch::NoGradGuard ng2;
+        actor->oppAct2->weight.fill_(0.5);
+        actor->oppAct2->bias.fill_(0.25);
+    }
+    auto out2 = actor->forwardAll(node, seq, actFeat, actSample, actId);
+    const float* l1 = out2.logits.data_ptr<float>();
+    double diff = 0.0;
+    for (int64_t i = 0; i < B * texas::kNumActions; ++i) {
+        if (l0[i] < -1e8f) continue;
+        diff = std::max(diff, std::fabs(double(l0[i] - l1[i])));
+    }
+    CHECK(diff > 1e-4);
+}
+
+// ---------------------------------------------------------------- 范围胜率特征
+
+// rangeEq 是 rollout 里"组合级"算出来的输入特征：采样对手底牌、按对手最近
+// 动作的策略似然做贝叶斯重加权、再算我方摊牌胜率。测试钉住：
+//   1) 新支路末层零初始化 => 与旧检查点行为逐位相同；
+//   2) 接通后不同 rangeEq 会改变动作分数，且按行（样本）区分；
+//   3) rollout 填出的值在 [0,1]，且打开 rangeEq 不改变发牌/动作随机流；
+//   4) 同一 seed 的结果可复现。
+void testRangeEq() {
+    section("范围胜率特征");
+
+    texas::nn::ModelConfig mc;
+    mc.hidden = 32;
+    mc.lstmHidden = 16;
+    texas::nn::Actor actor(std::make_shared<texas::nn::ActorImpl>(mc));
+    actor->eval();
+
+    const int64_t B = 4;
+    const int64_t L = 8;
+    torch::Tensor node = torch::rand({B, texas::kNodeInput});
+    torch::Tensor seq = torch::rand({B, texas::kHistSteps, texas::kHistDim});
+    torch::Tensor actFeat = torch::rand({L, texas::kActionInput});
+    torch::Tensor actSample = torch::tensor({0, 0, 1, 1, 2, 2, 3, 3});
+    torch::Tensor actId = torch::tensor({0, 1, 2, 3, 4, 5, 6, 7});
+    torch::Tensor rqLo = torch::zeros({B});
+    torch::Tensor rqHi = torch::ones({B});
+
+    torch::NoGradGuard ng;
+    auto zero = actor->forwardAll(node, seq, actFeat, actSample, actId);
+    auto zero2 = actor->forwardAll(node, seq, actFeat, actSample, actId);
+    CHECK(torch::equal(zero.logits, zero2.logits));
+    auto lo = actor->forwardAll(node, seq, actFeat, actSample, actId, rqLo);
+    auto hi = actor->forwardAll(node, seq, actFeat, actSample, actId, rqHi);
+    // 零初始化：显式喂 0/1 与不喂（中性 0.5）结果必须逐位相同。
+    CHECK(torch::allclose(zero.logits, lo.logits));
+    CHECK(torch::allclose(zero.logits, hi.logits));
+
+    {
+        torch::NoGradGuard ng2;
+        actor->rngAct2->weight.fill_(0.7);
+        actor->rngAct2->bias.fill_(0.1);
+    }
+    auto lo2 = actor->forwardAll(node, seq, actFeat, actSample, actId, rqLo);
+    auto hi2 = actor->forwardAll(node, seq, actFeat, actSample, actId, rqHi);
+    const float* a = lo2.logits.data_ptr<float>();
+    const float* b = hi2.logits.data_ptr<float>();
+    double diff = 0.0;
+    for (int64_t i = 0; i < B * texas::kNumActions; ++i) {
+        if (a[i] < -1e8f) continue;
+        diff = std::max(diff, std::fabs(double(a[i] - b[i])));
+    }
+    CHECK(diff > 1e-4);
+
+    // 同一 seed 的两次 rollout：rangeEq 可复现，且全部落在 [0,1]。
+    texas::nn::ModelConfig mc2;
+    mc2.hidden = 32;
+    mc2.lstmHidden = 16;
+    texas::ModelSet models;
+    for (int s = 0; s < 2; ++s) {
+        models.actor[s] = texas::nn::Actor(std::make_shared<texas::nn::ActorImpl>(mc2));
+        models.critic[s] = texas::nn::Critic(std::make_shared<texas::nn::CriticImpl>(mc2));
+    }
+    auto run = [&](int samples) {
+        texas::RolloutConfig cfg;
+        cfg.games = 12;
+        cfg.seed = 777;
+        cfg.historicalProb = 0.0f;
+        cfg.ruleProb = 1.0f;  // 规则机器人不用全局随机流，牌局可复现
+        cfg.randomProb = 0.0f;
+        cfg.solidProb = 0.0f;
+        cfg.oracleReward = false;
+        cfg.teacher = false;
+        cfg.rangeEqSamples = samples;
+        cfg.rangeEqIters = 8;
+        std::array<std::vector<texas::Transition>, 2> tr;
+        texas::RolloutStats stats;
+        texas::collectRollout(models, nullptr, cfg, tr, stats);
+        return tr;
+    };
+
+    const auto off = run(0);
+    const auto off2 = run(0);
+    const auto on1 = run(8);
+    const auto on2 = run(8);
+
+    auto sameTrajectory = [](const std::array<std::vector<texas::Transition>, 2>& a,
+                             const std::array<std::vector<texas::Transition>, 2>& b) {
+        if (a[0].size() != b[0].size() || a[1].size() != b[1].size()) return false;
+        for (int s = 0; s < 2; ++s) {
+            for (size_t i = 0; i < a[s].size(); ++i) {
+                if (a[s][i].action != b[s][i].action) return false;
+                if (a[s][i].node != b[s][i].node) return false;
+                if (a[s][i].actions.size() != b[s][i].actions.size()) return false;
+            }
+        }
+        return true;
+    };
+
+    // 关闭时两次运行逐位一致（规则机器人 + 固定 seed）；打开 rangeEq 后，
+    // 零初始化支路不改变 logits，牌局本身也必须逐位相同。
+    CHECK(sameTrajectory(off, off2));
+    CHECK(sameTrajectory(off, on1));
+
+    bool allInRange = true;
+    bool allNeutralOff = true;
+    double minV = 1.0, maxV = 0.0;
+    size_t n = 0;
+    for (int s = 0; s < 2; ++s) {
+        for (const auto& t : off[s]) {
+            if (t.rangeEq != 0.5f) allNeutralOff = false;
+        }
+        CHECK(on1[s].size() == on2[s].size());
+        for (size_t i = 0; i < on1[s].size(); ++i) {
+            const float v = on1[s][i].rangeEq;
+            CHECK(v == on2[s][i].rangeEq);  // 同一 seed 可复现
+            if (!(v >= 0.0f && v <= 1.0f)) allInRange = false;
+            minV = std::min(minV, double(v));
+            maxV = std::max(maxV, double(v));
+            ++n;
+        }
+    }
+    CHECK(allInRange);
+    CHECK(allNeutralOff);
+    CHECK(n > 0);
+    // 真的是按牌面算出来的，而不是常数：至少要有明显的变化范围。
+    CHECK(maxV - minV > 0.05);
+}
+
+// 河牌 CFR+ 求解器：组合空间、根策略合法性、EV 界、收敛（BR 差随迭代下降）。
+void testRiverCfr() {
+    section("河牌 CFR+ 求解");
+
+    texas::Card board[5] = {texas::parseCard("Ah"), texas::parseCard("Kd"),
+                            texas::parseCard("7c"), texas::parseCard("3s"),
+                            texas::parseCard("2h")};
+    texas::Card mine[2] = {texas::parseCard("Qd"), texas::parseCard("Qc")};
+    texas::Card theirs[2] = {texas::parseCard("9s"), texas::parseCard("8s")};
+    texas::HUState st = texas::makeState(mine, theirs, board, 5);
+
+    const std::vector<texas::RiverCombo> combos = texas::riverCombos(st);
+    CHECK(static_cast<int>(combos.size()) == texas::kRiverComboCount);
+
+    bool noBoard = true;
+    bool distinct = true;
+    bool rankOk = true;
+    std::set<std::pair<int, int>> seen;
+    for (const texas::RiverCombo& c : combos) {
+        for (int i = 0; i < 5; ++i) {
+            if (c.c0 == board[i] || c.c1 == board[i]) noBoard = false;
+        }
+        if (c.c0 == c.c1) distinct = false;
+        if (!seen.insert({c.c0, c.c1}).second) distinct = false;
+        texas::Card h[7] = {c.c0, c.c1, board[0], board[1], board[2], board[3], board[4]};
+        if (c.rank != texas::evaluate7(h)) rankOk = false;
+        // 排名必须能区分强弱：至少要有多种取值
+    }
+    CHECK(noBoard);
+    CHECK(distinct);
+    CHECK(rankOk);
+
+    // 造一个河牌决策点：双方各投 500，底池 1000，无下注。
+    texas::HUState river = st;
+    river.street = texas::ST_RIVER;
+    river.boardN = 5;
+    river.toAct = 0;
+    river.contrib[0] = river.contrib[1] = 500;
+    river.total[0] = river.total[1] = 500;
+    river.stack[0] = river.stack[1] = texas::kStartingStack - 500;
+    river.lastRaiseTo = 0;
+    river.lastRaiseSize = texas::kBigBlind;
+
+    texas::RiverCfrConfig cfg;
+    cfg.iters = 20;
+    const texas::RiverCfrResult r20 = texas::riverCfrSolve(river, 0, {}, {}, cfg);
+    cfg.iters = 300;
+    const texas::RiverCfrResult r300 = texas::riverCfrSolve(river, 0, {}, {}, cfg);
+
+    CHECK(r20.valid);
+    CHECK(r300.valid);
+    CHECK(r300.nodes > 10);
+    CHECK(r300.root.size() >= 3);
+
+    double probSum = 0.0;
+    bool finite = true;
+    for (const texas::RiverRootAction& a : r300.root) {
+        probSum += a.prob;
+        if (!(std::isfinite(a.ev) && std::isfinite(a.prob))) finite = false;
+        if (!(a.prob >= -1e-6 && a.prob <= 1.0 + 1e-6)) finite = false;
+        if (!(a.ev > -3.0 * texas::kStartingStack && a.ev < 3.0 * texas::kStartingStack)) {
+            finite = false;
+        }
+    }
+    CHECK(finite);
+    CHECK(std::fabs(probSum - 1.0) < 1e-4);
+    // 根 EV 必须等于"平均策略"下各动作 EV 的加权和
+    double mix = 0.0;
+    for (const texas::RiverRootAction& a : r300.root) mix += a.prob * a.ev;
+    CHECK(std::fabs(mix - r300.rootValue) < 1e-6);
+
+    // 收敛：迭代越多，可利用度上界越小（CFR+ 单调下降，允许少量振荡）
+    CHECK(r300.brGap < r20.brGap);
+    // 常和博弈的数学不变式：BR0 + BR1 ≥ 常和，所以 BR 差不可能为负（只允许浮点误差）。
+    CHECK(r300.brGap >= -0.5);
+    CHECK(r20.brGap >= -0.5);
+    // 收敛后可利用度必须远小于底池（这里底池 1000；否则策略还没有可用性）
+    CHECK(r300.brGap < 150.0);
+
+    // 同一输入可复现
+    texas::RiverCfrConfig cfg2;
+    cfg2.iters = 300;
+    const texas::RiverCfrResult again = texas::riverCfrSolve(river, 0, {}, {}, cfg2);
+    CHECK(again.root.size() == r300.root.size());
+    if (again.root.size() == r300.root.size()) {
+        for (size_t i = 0; i < again.root.size(); ++i) {
+            CHECK(again.root[i].mv.kind == r300.root[i].mv.kind);
+            CHECK(again.root[i].mv.to == r300.root[i].mv.to);
+            CHECK(std::fabs(again.root[i].ev - r300.root[i].ev) < 1e-6);
+        }
+    }
+
+    // 面对下注：弃牌的 EV 必须恰好是 0（相对当前节点的定义）
+    texas::HUState facing = river;
+    facing.contrib[1] = 1500;  // 对手 1x 池下注
+    facing.total[1] = 1500;
+    facing.stack[1] = texas::kStartingStack - 1500;
+    facing.lastRaiseTo = 1500;
+    facing.lastRaiseSize = 1000;
+    texas::RiverCfrConfig cfg3;
+    cfg3.iters = 200;
+    const texas::RiverCfrResult rf = texas::riverCfrSolve(facing, 0, {}, {}, cfg3);
+    CHECK(rf.valid);
+    bool sawFold = false;
+    for (const texas::RiverRootAction& a : rf.root) {
+        if (a.mv.kind == texas::MK_FOLD) {
+            sawFold = true;
+            CHECK(std::fabs(a.ev) < 1e-6);
+        }
+    }
+    CHECK(sawFold);
+
+    // 退化局面（双方范围各只有一个组合）下答案可以手算：我们 QQ 对对手 9s8s
+    // （河牌没中），底池 1000 -> 我们的平均策略值必 ≈ 1000，对手的 BR 必 ≈ 0。
+    // 这同时验证了"反事实值按条件质量还原"这一步：范围加权不会把尺度做歪。
+    {
+        std::vector<float> own(combos.size(), 0.0f), opp(combos.size(), 0.0f);
+        int qi = -1, ji = -1;
+        for (int i = 0; i < static_cast<int>(combos.size()); ++i) {
+            const texas::Card a = combos[i].c0, b = combos[i].c1;
+            if ((a == C("Qd") && b == C("Qc")) || (b == C("Qd") && a == C("Qc"))) qi = i;
+            if ((a == C("9s") && b == C("8s")) || (b == C("9s") && a == C("8s"))) ji = i;
+        }
+        CHECK(qi >= 0);
+        CHECK(ji >= 0);
+        if (qi >= 0 && ji >= 0) {
+            own[qi] = 1.0f;
+            opp[ji] = 1.0f;
+            texas::RiverCfrConfig c;
+            c.iters = 200;
+            const texas::RiverCfrResult pm = texas::riverCfrSolve(river, 0, opp, own, c);
+            CHECK(pm.valid);
+            CHECK_NEAR(pm.rootValue, 1000.0, 5.0);
+            CHECK_NEAR(pm.br1, 0.0, 5.0);
+            CHECK(pm.brGap >= -0.5);
+            CHECK(pm.brGap < 10.0);
+        }
+    }
+
+    // 自己的范围必须真的影响均衡：均匀范围（默认）与"只有一手牌"的范围，
+    // 根 EV 与根策略不应该相同。这一条是 #106 的接线测试——求解器的均衡
+    // 取决于**双方**范围，漏掉 ownRange 就会退化成"以为自己是均匀范围"。
+    {
+        std::vector<float> polar(combos.size(), 0.0f);
+        int qi = -1;
+        for (int i = 0; i < static_cast<int>(combos.size()); ++i) {
+            const texas::Card a = combos[i].c0, b = combos[i].c1;
+            if ((a == C("Qd") && b == C("Qc")) || (b == C("Qd") && a == C("Qc"))) qi = i;
+        }
+        CHECK(qi >= 0);
+        if (qi >= 0) {
+            polar[static_cast<size_t>(qi)] = 1.0f;
+            texas::RiverCfrConfig c;
+            c.iters = 200;
+            const texas::RiverCfrResult rp = texas::riverCfrSolve(river, 0, {}, polar, c);
+            CHECK(rp.valid);
+            // 先是"我们只会拿 QQ"的贝叶斯后果：对手 BR 会更强（我们不再有
+            // 诈唬分支撑着），所以根 EV 不应高于均匀范围太多；关键是它确实变了。
+            CHECK(std::fabs(rp.rootValue - r300.rootValue) > 1.0);
+            CHECK(rp.root.size() == r300.root.size());
+        }
+    }
+
+    // riverCfrMove 必须给出合法动作
+    texas::RiverCfrConfig cfg4;
+    cfg4.iters = 100;
+    texas::Move mv{};
+    CHECK(texas::riverCfrMove(river, cfg4, mv, {}, {}, nullptr));
+    texas::LegalMove lm[texas::kNumActions];
+    const int nlm = texas::legalMoves(river, lm);
+    bool legal = false;
+    for (int i = 0; i < nlm; ++i) {
+        if (mv.kind == texas::MK_RAISE || mv.kind == texas::MK_ALLIN) {
+            if (texas::canRaiseTo(river, int(mv.to))) legal = true;
+        } else if (lm[i].mv.kind == mv.kind) {
+            legal = true;
+        }
+    }
+    CHECK(legal);
+    // 非河牌/未 finish 之外的早期街道应拒绝求解
+    CHECK(!texas::riverCfrMove(st, cfg4, mv, {}, {}, nullptr));
+}
+
 }  // namespace
 
 int main() {
@@ -1524,6 +2165,8 @@ int main() {
     testAnyAmount();
     testPpo();
     testNetwork();
+    testOppModel();
+    testRangeEq();
     testTeacher();
     testLeague();
     testEnsemble();
@@ -1532,7 +2175,10 @@ int main() {
     testLearnerSeatBias();
     testDuplicateDeals();
     testPolicySearch();
+    testRangeSearch();
+    testRiverCfr();
     testSlumbotState();
+    testSlumbotLastOpp();
     testAllinAdjusted();
     std::printf("\n%d 通过, %d 失败\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

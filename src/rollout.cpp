@@ -7,6 +7,7 @@
 #include <map>
 
 #include "texas/ppo.hpp"
+#include "texas/rivercfr.hpp"
 #include "texas/strength.hpp"
 
 namespace texas {
@@ -27,6 +28,9 @@ enum RoleType : uint8_t {
     // 训练行为策略仍是采样（T=1），但对手是部署时的尖版本，逼策略学会
     // 防住"不留送分动作"的精确打法。
     ROLE_LATEST_SHARP = 7,
+    // 范围搜索剥削者：座位动作由 policySearchMove 给出（河牌按对手最近动作
+    // 的似然做后验加权），其余街仍用最新策略采样。
+    ROLE_SEARCH_OPP = 14,
     // 紧全下机器人：只用顶范围推/接全下，教策略"全下=紧范围"。
     ROLE_TIGHT = 10,
     // 陷阱机器人：强牌只跟注/过牌，河牌才发力。
@@ -35,6 +39,19 @@ enum RoleType : uint8_t {
     ROLE_SPAMMER = 12,
     // 价值型强对手：翻前紧凶、翻后只用两对+ 建池，惩罚"中等牌建大池"。
     ROLE_SHARK = 13,
+    // 过度下注机器人：翻后 1.5~3 倍池超大尺寸开火（含诈唬）、面对下注也
+    // 大加注、合理价格宽跟。惩罚"把大加注当坚果"与"超池诈唬打宽跟对手"。
+    ROLE_MANIAC = 15,
+    // 读范围机器人：跟注/弃牌按"对手范围 = 当前牌面最强 keep% 组件"的条件胜率，
+    // 下注用强牌 + 固定频率诈唬。README #107(d)：其余脚本全是范围盲的
+    // equityVsRandom，策略因此学成"原始胜率 > 赔率就跟"，在 Slumbot 的价值
+    // 范围上变成 22% 高牌摊牌。这个对手提供缺失的"范围压力"。
+    ROLE_RANGER = 16,
+    // 河牌 CFR 对手：其它街按当前策略采样，河牌用 riverCfrMove 解出的均衡回应
+    // （双方范围都从各自的动作似然估计）。README #109(d)：手写范围脚本
+    // （ranger 各档 air）当教师都失败，因为它们假设"我们的价值范围 = 顶 K%"，
+    // 比真实对手紧；均衡回应不靠阈值，按决策树的 regret matching 定价。
+    ROLE_CFR = 17,
 };
 
 struct GameCtx {
@@ -48,6 +65,9 @@ struct GameCtx {
     float phi[2] = {0.0f, 0.0f};  // 上次开天眼势能
     uint8_t eqStamp = 255;        // 胜率缓存对应的公共牌张数
     float eq0 = 0.5f;
+    // 某个座位最近一次决策的"动作前状态 + 实际动作槽"。rangeEq 特征与
+    // 范围条件化搜索都要用它重建对手视角的观测（换入采样底牌），算策略似然。
+    RangeObs lastAct[2];
     bool active = true;
 };
 
@@ -226,7 +246,7 @@ float continuationPayoff(const HUState& s, int seat, const Move& first, int styl
 
 void writeTensors(const std::vector<Transition>& tmp, torch::Tensor& nodeT, torch::Tensor& seqT,
                   torch::Tensor& extraT, torch::Tensor& actFeatT, torch::Tensor& actSampleT,
-                  torch::Tensor& actIdT, bool withExtra) {
+                  torch::Tensor& actIdT, torch::Tensor& rangeEqT, bool withExtra) {
     const int64_t B = static_cast<int64_t>(tmp.size());
     const size_t L = totalOptions(tmp);
     nodeT = torch::empty({B, kNodeInput}, torch::kFloat32);
@@ -235,6 +255,7 @@ void writeTensors(const std::vector<Transition>& tmp, torch::Tensor& nodeT, torc
     actFeatT = torch::empty({static_cast<int64_t>(L), kActionInput}, torch::kFloat32);
     actSampleT = torch::empty({static_cast<int64_t>(L)}, torch::kLong);
     actIdT = torch::empty({static_cast<int64_t>(L)}, torch::kLong);
+    rangeEqT = torch::empty({B}, torch::kFloat32);
 
     float* pNode = nodeT.data_ptr<float>();
     float* pSeq = seqT.data_ptr<float>();
@@ -242,6 +263,7 @@ void writeTensors(const std::vector<Transition>& tmp, torch::Tensor& nodeT, torc
     float* pFeat = actFeatT.data_ptr<float>();
     int64_t* pSample = actSampleT.data_ptr<int64_t>();
     int64_t* pId = actIdT.data_ptr<int64_t>();
+    float* pRng = rangeEqT.data_ptr<float>();
 
     int64_t off = 0;
     for (int64_t i = 0; i < B; ++i) {
@@ -251,6 +273,7 @@ void writeTensors(const std::vector<Transition>& tmp, torch::Tensor& nodeT, torc
         if (withExtra) {
             std::copy(t.extra.begin(), t.extra.end(), pExtra + i * kExtraInput);
         }
+        pRng[i] = t.rangeEq;
         for (const ActionOption& a : t.actions) {
             std::copy(a.feat.begin(), a.feat.end(), pFeat + off * kActionInput);
             pSample[off] = i;
@@ -335,7 +358,207 @@ std::pair<int, float> argmaxAction(const float* probs, const std::vector<ActionO
     return {best, std::log(std::max(bp, 1e-12f))};
 }
 
+// 我方在当前公共牌 vs 一个确定对手底牌的摊牌胜率（平局算半胜）。
+// 转牌/河牌精确枚举剩余公共牌，翻牌/翻前用蒙特卡洛（iters 次同花顺抽样）。
+double showdownEquityVsHole(const HUState& s, int heroSeat, Card o0, Card o1, Rng& rng,
+                            int iters) {
+    bool used[kNumCards] = {};
+    Card hero[2] = {static_cast<Card>(s.hole[heroSeat][0]),
+                    static_cast<Card>(s.hole[heroSeat][1])};
+    used[hero[0]] = used[hero[1]] = true;
+    used[o0] = used[o1] = true;
+    Card board[5] = {0, 0, 0, 0, 0};
+    for (int i = 0; i < s.boardN && i < 5; ++i) {
+        board[i] = static_cast<Card>(s.board[i]);
+        used[board[i]] = true;
+    }
+    const int boardN = s.boardN;
+    if (boardN >= 5) {
+        Card h[7] = {hero[0], hero[1], board[0], board[1], board[2], board[3], board[4]};
+        Card o[7] = {o0, o1, board[0], board[1], board[2], board[3], board[4]};
+        const int hs = evaluate7(h);
+        const int os = evaluate7(o);
+        return (hs > os) ? 1.0 : (hs < os ? 0.0 : 0.5);
+    }
+
+    Card rest[kNumCards];
+    int nr = 0;
+    for (int c = 0; c < kNumCards; ++c) {
+        if (!used[static_cast<Card>(c)]) rest[nr++] = static_cast<Card>(c);
+    }
+    const int need = 5 - boardN;
+    if (need < 1 || nr < need) return 0.5;
+
+    if (need == 1) {
+        double acc = 0.0;
+        for (int i = 0; i < nr; ++i) {
+            Card h[7] = {hero[0], hero[1], board[0], board[1], board[2], board[3], rest[i]};
+            Card o[7] = {o0, o1, board[0], board[1], board[2], board[3], rest[i]};
+            const int hs = evaluate7(h);
+            const int os = evaluate7(o);
+            acc += (hs > os) ? 1.0 : (hs < os ? 0.0 : 0.5);
+        }
+        return acc / double(nr);
+    }
+
+    // MC：每次从剩余牌里抽 need 张不重复的做公共牌。
+    std::uniform_int_distribution<int> pick(0, nr - 1);
+    const int its = std::max(iters, 1);
+    double acc = 0.0;
+    Card pool[kNumCards];
+    for (int it = 0; it < its; ++it) {
+        for (int i = 0; i < nr; ++i) pool[i] = rest[i];
+        for (int k = 0; k < need; ++k) {
+            const int j = k + pick(rng) % (nr - k);
+            std::swap(pool[k], pool[j]);
+            board[boardN + k] = pool[k];
+        }
+        Card h[7] = {hero[0], hero[1], board[0], board[1], board[2], board[3], board[4]};
+        Card o[7] = {o0, o1, board[0], board[1], board[2], board[3], board[4]};
+        const int hs = evaluate7(h);
+        const int os = evaluate7(o);
+        acc += (hs > os) ? 1.0 : (hs < os ? 0.0 : 0.5);
+    }
+    return acc / double(its);
+}
+
+// 计算 rangeEq：从对手视角重建"它最近一次决策"的观测（换入采样底牌），
+// 用当前策略在该动作上的概率作为似然，对采样组合做贝叶斯重加权，再按后验
+// 权重算我方 vs 对手范围的摊牌胜率。似然前向固定喂中性 rangeEq=0.5，
+// 避免"rangeEq 依赖自身"的递归（定义清楚、部署也能复现）。
+float rangeEquityFor(const HUState& now, int heroSeat, const RangeObs& last,
+                     const nn::Actor* oppActor, int samples, int iters, Rng& rng) {
+    const int oppSeat = 1 - heroSeat;
+    if (!last.valid || last.slot < 0 || !oppActor) return 0.5f;
+    if (last.pre.toAct != oppSeat || last.pre.finished) return 0.5f;
+
+    LegalMove lm[kNumActions];
+    const int n = legalMoves(last.pre, lm);
+    if (n <= 0) return 0.5f;
+    bool legalSlot = false;
+    for (int i = 0; i < n; ++i) {
+        if (lm[i].slot == last.slot) legalSlot = true;
+    }
+    if (!legalSlot) return 0.5f;
+
+    // 采样池：当前公共牌 + 我方底牌都不能出现在对手手里。
+    bool used[kNumCards] = {};
+    used[static_cast<Card>(now.hole[heroSeat][0])] = true;
+    used[static_cast<Card>(now.hole[heroSeat][1])] = true;
+    for (int i = 0; i < now.boardN && i < 5; ++i) used[static_cast<Card>(now.board[i])] = true;
+    Card rest[kNumCards];
+    int nr = 0;
+    for (int c = 0; c < kNumCards; ++c) {
+        if (!used[static_cast<Card>(c)]) rest[nr++] = static_cast<Card>(c);
+    }
+    const int M = std::min(std::max(samples, 1), nr / 2);
+    if (M < 1) return 0.5f;
+
+    // 对手在动作前状态下的合法动作（对所有采样组合相同，只编码一次）。
+    std::vector<ActionOption> opts(static_cast<size_t>(n));
+    for (int k = 0; k < n; ++k) {
+        opts[static_cast<size_t>(k)].slot = lm[k].slot;
+        opts[static_cast<size_t>(k)].mv = lm[k].mv;
+        opts[static_cast<size_t>(k)].hi = lm[k].toHi;
+        encodeActionFeature(last.pre, lm[k], opts[static_cast<size_t>(k)].feat);
+    }
+
+    // 无放回洗牌，按相邻两张配成对手底牌。
+    std::uniform_int_distribution<int> pick(0, nr - 1);
+    for (int i = 0; i < 2 * M; ++i) {
+        const int j = i + pick(rng) % (nr - i);
+        std::swap(rest[i], rest[j]);
+    }
+
+    std::vector<Transition> tmp(static_cast<size_t>(M));
+    std::vector<Card> h0(static_cast<size_t>(M)), h1(static_cast<size_t>(M));
+    for (int m = 0; m < M; ++m) {
+        h0[static_cast<size_t>(m)] = rest[2 * m];
+        h1[static_cast<size_t>(m)] = rest[2 * m + 1];
+        HUState st = last.pre;
+        st.hole[oppSeat][0] = h0[static_cast<size_t>(m)];
+        st.hole[oppSeat][1] = h1[static_cast<size_t>(m)];
+        Obs obs;
+        encodeObservation(st, obs, 0.5f);
+        Transition& t = tmp[static_cast<size_t>(m)];
+        t.node = obs.node;
+        t.seq = obs.seq;
+        t.actions = opts;
+        t.rangeEq = 0.5f;
+    }
+
+    torch::NoGradGuard ng;
+    torch::Tensor nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT;
+    writeTensors(tmp, nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT, false);
+    torch::Tensor logits = (*oppActor)->forward(nodeT, seqT, actFeatT, actSampleT, actIdT,
+                                                rangeEqT);
+    const float* lp = logits.data_ptr<float>();
+    std::vector<double> w(static_cast<size_t>(M), 0.0);
+    double wsum = 0.0;
+    for (int m = 0; m < M; ++m) {
+        float probs[kNumActions];
+        ppo::maskedSoftmax(lp + size_t(m) * kNumActions, kNumActions, probs);
+        const double p = probs[last.slot];
+        w[static_cast<size_t>(m)] = p;
+        wsum += p;
+    }
+
+    double acc = 0.0;
+    if (wsum > 1e-12) {
+        for (int m = 0; m < M; ++m) {
+            acc += w[static_cast<size_t>(m)] *
+                   showdownEquityVsHole(now, heroSeat, h0[static_cast<size_t>(m)],
+                                        h1[static_cast<size_t>(m)], rng, iters);
+        }
+        acc /= wsum;
+    } else {
+        for (int m = 0; m < M; ++m) {
+            acc += showdownEquityVsHole(now, heroSeat, h0[static_cast<size_t>(m)],
+                                        h1[static_cast<size_t>(m)], rng, iters);
+        }
+        acc /= double(M);
+    }
+    return float(std::min(1.0, std::max(0.0, acc)));
+}
+
 }  // namespace
+
+// 把实际打出的 Move 映射回抽象动作槽（rangeEq 需要知道对手动作在策略里
+// 对应哪个槽才能算似然）。尺寸带内按区间包含匹配，再退到最近端点。
+int slotOfMove(const HUState& s, const Move& mv) {
+    LegalMove lm[kNumActions];
+    const int n = legalMoves(s, lm);
+    if (n <= 0) return -1;
+    if (mv.kind == MK_FOLD) {
+        for (int i = 0; i < n; ++i) {
+            if (lm[i].slot == kSlotFold) return lm[i].slot;
+        }
+        return -1;
+    }
+    if (mv.kind == MK_CHECK || mv.kind == MK_CALL) {
+        for (int i = 0; i < n; ++i) {
+            if (lm[i].slot == kSlotCheckCall) return lm[i].slot;
+        }
+        return -1;
+    }
+    int best = -1;
+    int bestDist = 1 << 30;
+    for (int i = 0; i < n; ++i) {
+        if (lm[i].slot < kSlotSize0) continue;
+        if (int(mv.to) >= int(lm[i].mv.to) && int(mv.to) <= lm[i].toHi) return lm[i].slot;
+        const int d = std::abs(int(mv.to) - int(lm[i].mv.to));
+        if (d < bestDist) {
+            bestDist = d;
+            best = lm[i].slot;
+        }
+    }
+    return best;
+}
+
+float rangeEquityAt(const HUState& now, int heroSeat, const RangeObs& last,
+                    const nn::Actor* oppActor, int samples, int iters, Rng& rng) {
+    return rangeEquityFor(now, heroSeat, last, oppActor, samples, iters, rng);
+}
 
 std::pair<int, float> sampleAction(const float* logits, const std::vector<ActionOption>& acts,
                                    Rng& rng) {
@@ -345,7 +568,7 @@ std::pair<int, float> sampleAction(const float* logits, const std::vector<Action
 }
 
 Move policyMove(const nn::Actor* sb, const nn::Actor* bb, const HUState& s, Rng& rng,
-                float temp) {
+                float temp, float rangeEq) {
     LegalMove lm[kNumActions];
     const int n = legalMoves(s, lm);
     if (n <= 0) return Move{};
@@ -362,6 +585,7 @@ Move policyMove(const nn::Actor* sb, const nn::Actor* bb, const HUState& s, Rng&
     t.node = obs.node;
     t.seq = obs.seq;
     t.extra = obs.extra;
+    t.rangeEq = rangeEq;
     t.actions.resize(static_cast<size_t>(n));
     for (int k = 0; k < n; ++k) {
         ActionOption& a = t.actions[static_cast<size_t>(k)];
@@ -371,9 +595,10 @@ Move policyMove(const nn::Actor* sb, const nn::Actor* bb, const HUState& s, Rng&
         encodeActionFeature(s, lm[k], a.feat);
     }
 
-    torch::Tensor nodeT, seqT, extraT, actFeatT, actSampleT, actIdT;
-    writeTensors(tmp, nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, false);
-    torch::Tensor logits = (*actors[seat])->forward(nodeT, seqT, actFeatT, actSampleT, actIdT);
+    torch::Tensor nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT;
+    writeTensors(tmp, nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT, false);
+    torch::Tensor logits = (*actors[seat])->forward(nodeT, seqT, actFeatT, actSampleT, actIdT,
+                                                    rangeEqT);
     float probs[kNumActions];
     maskedSoftmaxTemp(logits.data_ptr<float>(), kNumActions, temp, probs);
     auto [slot, logp] = sampleFromProbs(probs, t.actions, rng);
@@ -389,6 +614,69 @@ Move policyMove(const nn::Actor* sb, const nn::Actor* bb, const HUState& s, Rng&
         played.to = static_cast<int16_t>(amountInBand(int(played.to), opt->hi, u01(rng)));
     }
     return played;
+}
+
+// 河牌范围：枚举公共牌之外的 1081 个组合，用**该座位**在自己最近一次决策处
+// 的策略似然当权重。和 rangeEquity / 范围搜索是同一口径（似然前向固定喂
+// rangeEq=0.5），区别只是把"抽几个样本"换成"全枚举"——CFR 求解需要整条
+// 范围，16 个样本会让范围退化成 16 个点。
+//
+// targetSeat 是要估范围的座位；last 必须是它在最近一次决策时的快照（快照的
+// 公共牌可以少于 5 张：那时它还没看到河牌，似然正是在它当时的观测上算的）。
+// 返回向量与 riverCombos(now) 一一对应；未归一化（求解器自己归一）。
+std::vector<float> riverRangeFor(const HUState& now, int targetSeat, const RangeObs& last,
+                                 const nn::Actor* actor) {
+    const std::vector<RiverCombo> combos = riverCombos(now);
+    std::vector<float> w(combos.size(), 1.0f);
+    if (actor == nullptr || now.boardN < 5) return w;
+    if (!last.valid || last.slot < 0 || last.pre.finished || last.pre.toAct != targetSeat) return w;
+
+    LegalMove olm[kNumActions];
+    const int on = legalMoves(last.pre, olm);
+    if (on <= 0) return w;
+    int observed = -1;
+    for (int k = 0; k < on; ++k) {
+        if (olm[k].slot == last.slot) observed = k;
+    }
+    if (observed < 0) return w;
+
+    std::vector<ActionOption> opts(static_cast<size_t>(on));
+    for (int k = 0; k < on; ++k) {
+        opts[static_cast<size_t>(k)].slot = olm[k].slot;
+        opts[static_cast<size_t>(k)].mv = olm[k].mv;
+        opts[static_cast<size_t>(k)].hi = olm[k].toHi;
+        encodeActionFeature(last.pre, olm[k], opts[static_cast<size_t>(k)].feat);
+    }
+
+    const int M = static_cast<int>(combos.size());
+    std::vector<Transition> tmp(static_cast<size_t>(M));
+    for (int m = 0; m < M; ++m) {
+        HUState st = last.pre;
+        st.hole[targetSeat][0] = combos[static_cast<size_t>(m)].c0;
+        st.hole[targetSeat][1] = combos[static_cast<size_t>(m)].c1;
+        Obs obs;
+        encodeObservation(st, obs, 0.5f);
+        Transition& t = tmp[static_cast<size_t>(m)];
+        t.node = obs.node;
+        t.seq = obs.seq;
+        t.actions = opts;
+        t.rangeEq = 0.5f;
+    }
+
+    torch::NoGradGuard ng;
+    torch::Tensor nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT;
+    writeTensors(tmp, nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT, false);
+    torch::Tensor logits = (*actor)->forward(nodeT, seqT, actFeatT, actSampleT, actIdT,
+                                             rangeEqT);
+    const float* lp = logits.data_ptr<float>();
+    for (int m = 0; m < M; ++m) {
+        float probs[kNumActions];
+        ppo::maskedSoftmax(lp + static_cast<size_t>(m) * kNumActions, kNumActions, probs);
+        // 下限：否则模型认为"绝不可能"的组合会被彻底抹掉，范围变成几个点后
+        // 求解器的 BR 会把"对手只拿这几手牌"当真，反而放大可利用度。
+        w[static_cast<size_t>(m)] = std::max(probs[observed], 1e-4f);
+    }
+    return w;
 }
 
 Move ruleAgentMove(const HUState& s, Rng& rng) {
@@ -511,10 +799,13 @@ namespace {
 struct Leaf {
     HUState st;
     int branch = 0;
+    // 样本的后验权重（范围条件化搜索）。均匀搜索恒为 1，行为与原来一致。
+    double w = 1.0;
 };
 
 void advanceLeaves(std::vector<Leaf>& live, const nn::Actor* const* actors, int equityIters,
-                   Rng& rng, std::vector<double>& q, int seat, std::vector<Leaf>& next) {
+                   Rng& rng, std::vector<double>& q, int seat, std::vector<Leaf>& next,
+                   int oppSeat, Move (*oppScript)(const HUState&, Rng&)) {
     std::uniform_real_distribution<double> u01(0.0, 1.0);
     for (int act = 0; act < 2; ++act) {
         std::vector<size_t> idx;
@@ -522,6 +813,23 @@ void advanceLeaves(std::vector<Leaf>& live, const nn::Actor* const* actors, int 
             if (live[i].st.toAct == act) idx.push_back(i);
         }
         if (idx.empty()) continue;
+
+        // 鲁棒搜索的脚本对手：直接按脚本策略出招，不消耗一次前向。脚本的
+        // 动作是确定的（不含隐藏牌信息），所以这些叶子对"对手模型"的假设
+        // 是"它只会这么打"，和 actor 模型的混合形成最坏情况比较。
+        if (act == oppSeat && oppScript != nullptr) {
+            for (size_t j = 0; j < idx.size(); ++j) {
+                Leaf& L = live[idx[j]];
+                const Move mv = oppScript(L.st, rng);
+                applyMove(L.st, mv, rng);
+                if (L.st.finished) {
+                    q[static_cast<size_t>(L.branch)] += L.w * double(payoff(L.st, seat));
+                } else {
+                    next.push_back(std::move(L));
+                }
+            }
+            continue;
+        }
 
         std::vector<Transition> tmp(idx.size());
         for (size_t j = 0; j < idx.size(); ++j) {
@@ -546,9 +854,10 @@ void advanceLeaves(std::vector<Leaf>& live, const nn::Actor* const* actors, int 
             t.gameId = static_cast<int>(j);
         }
 
-        torch::Tensor nodeT, seqT, extraT, actFeatT, actSampleT, actIdT;
-        writeTensors(tmp, nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, false);
-        torch::Tensor logits = (*actors[act])->forward(nodeT, seqT, actFeatT, actSampleT, actIdT);
+        torch::Tensor nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT;
+        writeTensors(tmp, nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT, false);
+        torch::Tensor logits = (*actors[act])->forward(nodeT, seqT, actFeatT, actSampleT, actIdT,
+                                                       rangeEqT);
         const float* pLogits = logits.data_ptr<float>();
 
         for (size_t j = 0; j < idx.size(); ++j) {
@@ -566,7 +875,7 @@ void advanceLeaves(std::vector<Leaf>& live, const nn::Actor* const* actors, int 
             }
             applyMove(L.st, played, rng);
             if (L.st.finished) {
-                q[static_cast<size_t>(L.branch)] += double(payoff(L.st, seat));
+                q[static_cast<size_t>(L.branch)] += L.w * double(payoff(L.st, seat));
             } else {
                 next.push_back(L);
             }
@@ -577,10 +886,15 @@ void advanceLeaves(std::vector<Leaf>& live, const nn::Actor* const* actors, int 
 }  // namespace
 
 Move policySearchMove(const nn::Actor* sb, const nn::Actor* bb, const HUState& s, int seat,
-                      int samples, Rng& rng, int equityIters) {
+                      int samples, Rng& rng, int equityIters, const RangeObs* oppLast,
+                      const nn::Actor* oppActor, std::array<float, kNumActions>* qOut,
+                      const std::vector<HUState>* givenHidden,
+                      const std::vector<double>* givenW,
+                      Move (*oppScript)(const HUState&, Rng&)) {
     const nn::Actor* actors[2] = {sb, bb};
     LegalMove lm[kNumActions];
     const int n = legalMoves(s, lm);
+    if (qOut != nullptr) qOut->fill(0.0f);
     if (n <= 0) return Move{};
     if (n == 1 || samples <= 0) {
         Move mv = lm[0].mv;
@@ -601,22 +915,95 @@ Move policySearchMove(const nn::Actor* sb, const nn::Actor* bb, const HUState& s
         }
     }
 
+    // 隐藏牌样本：河牌上没有未发公共牌，唯一未知量是**对手底牌**，所以范围
+    // 条件化只是给对手底牌加权；翻前到转牌还要一起重抽未发公共牌，按对手
+    // 底牌似然加权会引入发牌偏差，因此只在河牌启用（调用方也只在这条街调）。
+    const int M = samples;
+    const int oppSeat = 1 - seat;
+    std::vector<HUState> hidden;
+    if (givenHidden != nullptr && static_cast<int>(givenHidden->size()) >= M) {
+        hidden.assign(givenHidden->begin(), givenHidden->begin() + M);
+    } else {
+        hidden.resize(static_cast<size_t>(M));
+        for (int k = 0; k < M; ++k) sampleHiddenCards(s, seat, rng, hidden[static_cast<size_t>(k)]);
+    }
+
+    // 后验权重 = 对手在它最近决策处打出实际动作的策略似然。似然前向固定喂
+    // 中性 rangeEq=0.5（避免"权重依赖自身"的递归），与 rangeEq 特征同口径。
+    std::vector<double> w(static_cast<size_t>(M), 1.0);
+    bool useRange = oppLast != nullptr && oppActor != nullptr && s.boardN >= 5 &&
+                    oppLast->valid && oppLast->slot >= 0 &&
+                    oppLast->pre.toAct == oppSeat && !oppLast->pre.finished;
+    if (givenW != nullptr && static_cast<int>(givenW->size()) >= M) {
+        // 调用方预先算好的权重（鲁棒搜索里的脚本模型用均匀权重）。
+        useRange = false;
+        w.assign(givenW->begin(), givenW->begin() + M);
+    } else if (useRange) {
+        LegalMove olm[kNumActions];
+        const int on = legalMoves(oppLast->pre, olm);
+        bool slotLegal = false;
+        for (int k = 0; k < on; ++k) {
+            if (olm[k].slot == oppLast->slot) slotLegal = true;
+        }
+        if (on > 0 && slotLegal) {
+            std::vector<ActionOption> opts(static_cast<size_t>(on));
+            for (int k = 0; k < on; ++k) {
+                ActionOption& a = opts[static_cast<size_t>(k)];
+                a.slot = olm[k].slot;
+                a.mv = olm[k].mv;
+                a.hi = olm[k].toHi;
+                encodeActionFeature(oppLast->pre, olm[k], a.feat);
+            }
+            std::vector<Transition> tmp(static_cast<size_t>(M));
+            for (int k = 0; k < M; ++k) {
+                HUState st = oppLast->pre;
+                st.hole[oppSeat][0] = hidden[static_cast<size_t>(k)].hole[oppSeat][0];
+                st.hole[oppSeat][1] = hidden[static_cast<size_t>(k)].hole[oppSeat][1];
+                Obs obs;
+                encodeObservation(st, obs, 0.5f);
+                Transition& t = tmp[static_cast<size_t>(k)];
+                t.node = obs.node;
+                t.seq = obs.seq;
+                t.actions = opts;
+                t.rangeEq = 0.5f;
+            }
+            torch::Tensor nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT;
+            writeTensors(tmp, nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT, false);
+            torch::Tensor logits =
+                (*oppActor)->forward(nodeT, seqT, actFeatT, actSampleT, actIdT, rangeEqT);
+            const float* lp = logits.data_ptr<float>();
+            double wsum = 0.0;
+            for (int k = 0; k < M; ++k) {
+                float probs[kNumActions];
+                ppo::maskedSoftmax(lp + size_t(k) * kNumActions, kNumActions, probs);
+                w[static_cast<size_t>(k)] = double(probs[oppLast->slot]);
+                wsum += w[static_cast<size_t>(k)];
+            }
+            if (wsum > 1e-9) {
+                for (double& x : w) x /= wsum;
+            } else {
+                useRange = false;  // 似然全零（数值退化）=> 退回均匀搜索
+            }
+        } else {
+            useRange = false;
+        }
+    }
+
     std::vector<double> q(static_cast<size_t>(n), 0.0);
     std::vector<Leaf> live;
-    live.reserve(static_cast<size_t>(samples * n * 3));
+    live.reserve(static_cast<size_t>(M) * static_cast<size_t>(n) * 3);
 
     // 每个隐藏牌样本对**所有**根动作各续演一次：分支之间共享发牌，动作间的
-    // 差没有发牌方差，这一点和教师的分支续演一样。
-    for (int k = 0; k < samples; ++k) {
-        HUState hidden;
-        sampleHiddenCards(s, seat, rng, hidden);
+    // 差没有发牌方差，这一点和教师的分支续演一样。样本回报按后验权重累加。
+    for (int k = 0; k < M; ++k) {
         for (int i = 0; i < n; ++i) {
             Leaf L;
-            L.st = hidden;
+            L.st = hidden[static_cast<size_t>(k)];
             L.branch = i;
+            L.w = w[static_cast<size_t>(k)];
             applyMove(L.st, branch[static_cast<size_t>(i)], rng);
             if (L.st.finished) {
-                q[static_cast<size_t>(i)] += double(payoff(L.st, seat));
+                q[static_cast<size_t>(i)] += L.w * double(payoff(L.st, seat));
             } else {
                 live.push_back(std::move(L));
             }
@@ -627,19 +1014,87 @@ Move policySearchMove(const nn::Actor* sb, const nn::Actor* bb, const HUState& s
     while (!live.empty() && guard++ < 64) {
         std::vector<Leaf> next;
         next.reserve(live.size());
-        advanceLeaves(live, actors, equityIters, rng, q, seat, next);
+        advanceLeaves(live, actors, equityIters, rng, q, seat, next, oppSeat, oppScript);
         live.swap(next);
     }
     // 理论上一手牌一定会终局；万一 guard 用尽，把未完成的局按当前净投入计。
     for (const Leaf& L : live) {
-        q[static_cast<size_t>(L.branch)] += double(payoff(L.st, seat));
+        q[static_cast<size_t>(L.branch)] += L.w * double(payoff(L.st, seat));
     }
 
     int best = 0;
+    double wsum = 0.0;
+    for (double x : w) wsum += x;
+    if (qOut != nullptr) {
+        // 权重和：均匀搜索是 M，后验加权是 1。除以它把 q 变成期望回报，
+        // 再按起始筹码归一（与脚本教师 teacherQ 的单位一致）。
+        const double denom = (wsum > 1e-9 ? wsum : 1.0) * double(kStartingStack);
+        for (int i = 0; i < n; ++i) {
+            (*qOut)[lm[i].slot] = static_cast<float>(q[static_cast<size_t>(i)] / denom);
+        }
+    }
     for (int i = 1; i < n; ++i) {
         if (q[static_cast<size_t>(i)] > q[static_cast<size_t>(best)]) best = i;
     }
     return branch[static_cast<size_t>(best)];
+}
+
+Move policySearchRobustMove(const nn::Actor* sb, const nn::Actor* bb, const HUState& s, int seat,
+                            int samples, Rng& rng, int equityIters, const RangeObs* oppLast,
+                            const nn::Actor* oppActor, bool useMean) {
+    LegalMove lm[kNumActions];
+    const int n = legalMoves(s, lm);
+    if (n <= 0) return Move{};
+    if (n == 1 || samples <= 0) {
+        Move mv = lm[0].mv;
+        if (mv.kind == MK_RAISE && lm[0].toHi > int(mv.to)) {
+            mv.to = static_cast<int16_t>(amountInBand(int(mv.to), lm[0].toHi, 0.5));
+        }
+        return mv;
+    }
+    // 所有模型共享同一批隐藏牌：否则"最小 EV"里混进了发牌方差，
+    // 最坏情况会退化成噪声。
+    std::vector<HUState> hidden(static_cast<size_t>(samples));
+    for (int k = 0; k < samples; ++k) sampleHiddenCards(s, seat, rng, hidden[static_cast<size_t>(k)]);
+    const std::vector<double> uniform(static_cast<size_t>(samples), 1.0);
+    const Rng saved = rng;
+
+    // 对手模型：0 = 自身 actor（带后验范围），1 = 跟注型 solid，2 = 价值型 shark。
+    // 脚本模型的动作似然与底牌无关，所以后验权重退化为均匀。
+    struct Model {
+        Move (*script)(const HUState&, Rng&);
+        bool ownRange;
+    };
+    const Model models[3] = {{nullptr, true}, {&solidAgentMove, false}, {&sharkAgentMove, false}};
+    std::array<float, kNumActions> q[3];
+    for (int m = 0; m < 3; ++m) {
+        rng = saved;
+        policySearchMove(sb, bb, s, seat, samples, rng, equityIters,
+                         models[m].ownRange ? oppLast : nullptr,
+                         models[m].ownRange ? oppActor : nullptr, &q[m], &hidden,
+                         models[m].ownRange ? nullptr : &uniform, models[m].script);
+    }
+
+    // 最坏情况（默认）或等权平均：可选项只在聚合口径上不同，三份 q 的样本相同。
+    int best = 0;
+    float bestScore = -1e30f;
+    for (int i = 0; i < n; ++i) {
+        const int slot = lm[i].slot;
+        float score = useMean ? 0.0f : q[0][static_cast<size_t>(slot)];
+        for (int m = 0; m < 3; ++m) {
+            if (useMean) score += q[m][static_cast<size_t>(slot)] / 3.0f;
+            else if (m > 0) score = std::min(score, q[m][static_cast<size_t>(slot)]);
+        }
+        if (score > bestScore) {
+            bestScore = score;
+            best = i;
+        }
+    }
+    Move mv = lm[best].mv;
+    if (mv.kind == MK_RAISE && lm[best].toHi > int(mv.to)) {
+        mv.to = static_cast<int16_t>(amountInBand(int(mv.to), lm[best].toHi, 0.5));
+    }
+    return mv;
 }
 
 namespace {
@@ -672,6 +1127,73 @@ float equityVsRandom(const HUState& s, int seat, int iters) {
         acc += (s0 > s1) ? 1.0 : ((s0 < s1) ? 0.0 : 0.5);
     }
     return float(acc / double(iters));
+}
+
+// 极化范围的条件胜率：假设对手范围 = "最强 keep 比例的组件"（价值）+ 占比
+// airShare 的**空气**（诈唬）。这是对"只取顶 K%"版本的修正：
+// 只取顶 K% 等于假设我们从不诈唬，对手因此过度弃牌，训练出来的策略会学到
+// "多诈唬"（README #108 的 rg1 就是这样退化的）。加入空气份后，对手的跟注
+// 频率由赔率决定，诈唬不再自动赚钱——这才是均衡附近的压力。
+//
+// airShare 是**假设范围里空气占的比例**。均匀采样下空气的自然占比是
+// 1-keep，所以每个空气组件的权重取 wAir = airShare*keep / ((1-airShare)*(1-keep))。
+float equityVsPolarizedRange(const HUState& s, int seat, int iters, float keep,
+                             float airShare) {
+    if (s.boardN <= 0) return equityVsRandom(s, seat, iters);
+    static thread_local Rng rng(0x51f3a2b7ULL);
+    keep = std::min(std::max(keep, 0.02f), 0.98f);
+    airShare = std::min(std::max(airShare, 0.0f), 0.9f);
+    HUState hidden;
+
+    const int probe = 96;
+    int scores[probe];
+    for (int it = 0; it < probe; ++it) {
+        sampleHiddenCards(s, seat, rng, hidden);
+        int c[7];
+        int n = 0;
+        c[n++] = int(hidden.hole[1 - seat][0]);
+        c[n++] = int(hidden.hole[1 - seat][1]);
+        for (int i = 0; i < s.boardN; ++i) c[n++] = int(s.board[i]);
+        scores[it] = evaluateBest(c, n);
+    }
+    std::sort(scores, scores + probe);
+    const int cut = std::min(probe - 1, std::max(0, int(double(probe) * (1.0 - double(keep)))));
+    const int thr = scores[cut];
+
+    const double pAir = 1.0 - double(keep);
+    const double wAir = (pAir > 1e-6)
+                            ? double(airShare) * double(keep) /
+                                  ((1.0 - double(airShare)) * pAir)
+                            : 0.0;
+    double acc = 0.0;
+    double wSum = 0.0;
+    for (int it = 0; it < iters; ++it) {
+        sampleHiddenCards(s, seat, rng, hidden);
+        int c[7];
+        int n = 0;
+        c[n++] = int(hidden.hole[1 - seat][0]);
+        c[n++] = int(hidden.hole[1 - seat][1]);
+        for (int i = 0; i < s.boardN; ++i) c[n++] = int(s.board[i]);
+        const bool value = evaluateBest(c, n) >= thr;
+        if (!value && wAir <= 0.0) continue;
+        const double w = value ? 1.0 : wAir;
+        Card a[7] = {static_cast<Card>(s.hole[seat][0]), static_cast<Card>(s.hole[seat][1]),
+                     static_cast<Card>(hidden.board[0]), static_cast<Card>(hidden.board[1]),
+                     static_cast<Card>(hidden.board[2]), static_cast<Card>(hidden.board[3]),
+                     static_cast<Card>(hidden.board[4])};
+        Card b[7] = {static_cast<Card>(hidden.hole[1 - seat][0]),
+                     static_cast<Card>(hidden.hole[1 - seat][1]),
+                     static_cast<Card>(hidden.board[0]), static_cast<Card>(hidden.board[1]),
+                     static_cast<Card>(hidden.board[2]), static_cast<Card>(hidden.board[3]),
+                     static_cast<Card>(hidden.board[4])};
+        const int s0 = evaluate7(a);
+        const int s1 = evaluate7(b);
+        const double win = (s0 > s1) ? 1.0 : ((s0 < s1) ? 0.0 : 0.5);
+        acc += w * win;
+        wSum += w;
+    }
+    if (wSum <= 0.0) return 0.0f;
+    return float(acc / wSum);
 }
 
 }  // namespace
@@ -860,6 +1382,115 @@ Move solidAgentMove(const HUState& s, Rng& rng) {
         if (out.kind == MK_RAISE || out.kind == MK_ALLIN) return out;
     }
     if (eq > odds * 1.02f) {
+        checkCall(out);
+        return out;
+    }
+    if (fold(out)) return out;
+    checkCall(out);
+    return out;
+}
+
+// 「读范围」机器人。和 solid 的唯一结构性区别：面对下注时用条件胜率
+// `equityVsPolarizedRange`（假设我们的范围 = 当前牌面最强的 keep%，外加
+// airShare 份空气）而不是原始胜率；keep 随下注尺寸收紧。它的作用不是"更强"，
+// 而是提供 README #107(d) 缺的那层压力——我们的薄价值下注与宽跟注会被它按
+// 范围惩罚，而其余脚本（包括 solid 的宽跟、shark 的两对+建池）都只在某个
+// 方向施压。
+Move rangerAgentMove(const HUState& s, Rng& rng, float airShare) {
+    LegalMove mv[kNumActions];
+    const int n = legalMoves(s, mv);
+    if (n == 0) return Move{};
+
+    const int me = s.toAct;
+    const int need = toCall(s, me);
+    const int pot = s.pot();
+    const float eqRaw = equityVsRandom(s, me, 16);
+    std::uniform_real_distribution<float> u(0.0f, 1.0f);
+    const float j = (u(rng) - 0.5f) * 0.04f;  // ±2% 抖动，避免完全确定
+
+    auto checkCall = [&](Move& out) {
+        for (int i = 0; i < n; ++i) {
+            if (mv[i].slot == kSlotCheckCall) {
+                out = mv[i].mv;
+                return true;
+            }
+        }
+        return false;
+    };
+    auto fold = [&](Move& out) {
+        for (int i = 0; i < n; ++i) {
+            if (mv[i].slot == kSlotFold) {
+                out = mv[i].mv;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    Move out{};
+    if (s.street == ST_PREFLOP) {
+        if (need == 0) {
+            if (eqRaw > 0.80f + j && isRaisePossible(s)) {
+                out = makeRaise(s, 3 * kBigBlind);
+                if (out.kind == MK_RAISE || out.kind == MK_ALLIN) return out;
+            }
+            checkCall(out);
+            return out;
+        }
+        if (s.numRaises <= 1) {
+            if (eqRaw > 0.68f + j && isRaisePossible(s)) {
+                out = makeRaise(s, int(s.lastRaiseTo) * 3);
+                if (out.kind == MK_RAISE || out.kind == MK_ALLIN) return out;
+            }
+            if (eqRaw > 0.50f + j) {
+                checkCall(out);
+                return out;
+            }
+            if (fold(out)) return out;
+            checkCall(out);
+            return out;
+        }
+        if (eqRaw > 0.80f + j && isRaisePossible(s)) {
+            out = makeRaise(s, int(s.lastRaiseTo) * 2);
+            if (out.kind == MK_RAISE || out.kind == MK_ALLIN) return out;
+        }
+        if (eqRaw > 0.62f + j) {
+            checkCall(out);
+            return out;
+        }
+        if (fold(out)) return out;
+        checkCall(out);
+        return out;
+    }
+
+    if (need == 0) {
+        // 无人下注：对"跟注范围 = 最强 45% + 28% 空气"的条件胜率决定价值下注，
+        // 另加 28% 纯诈唬（原始胜率很低时才诈唬），尺寸 0.6 池。
+        // 诈唬份额必须与假设范围里的空气比例同量级：只拿强牌开火会让对手
+        // （学习座位）过度弃牌，学不到"防守要有抓诈唬"（README #108 的 rg1）。
+        const float eqValue = equityVsPolarizedRange(s, me, 24, 0.45f, airShare);
+        if (eqValue > 0.72f + j && isRaisePossible(s)) {
+            out = makeRaise(s, int(s.contrib[me]) + std::max<int>(kBigBlind, int(0.6 * pot)));
+            if (out.kind == MK_RAISE || out.kind == MK_ALLIN) return out;
+        }
+        if (eqRaw < 0.30f && u(rng) < 0.28f && isRaisePossible(s)) {
+            out = makeRaise(s, int(s.contrib[me]) + std::max<int>(kBigBlind, int(0.6 * pot)));
+            if (out.kind == MK_RAISE || out.kind == MK_ALLIN) return out;
+        }
+        checkCall(out);
+        return out;
+    }
+
+    // 面对下注：尺寸越大，假设我们的范围越强（keep 越小）；范围里始终留
+    // 28% 的空气，否则跟注频率会过低、诈唬自动赚钱。
+    const float odds = float(need) / float(pot + need);
+    const float keep = std::min(0.60f, std::max(0.10f, 0.72f - 1.4f * odds));
+    const float eq = equityVsPolarizedRange(s, me, 32, keep, airShare);
+    if (eq > 0.85f + j && isRaisePossible(s)) {
+        out = makeRaise(s, int(s.contrib[me]) + std::max<int>(kBigBlind, int(0.9 * pot)));
+        if (out.kind == MK_RAISE || out.kind == MK_ALLIN) return out;
+    }
+    if (eq > odds * 1.05f) {
         checkCall(out);
         return out;
     }
@@ -1368,6 +1999,103 @@ Move folderAgentMove(const HUState& s, Rng& rng) {
     return out;
 }
 
+// 「过度下注」机器人：翻后不看牌力、用 1.5~3 倍池的超大尺寸开火（含诈唬），
+// 面对下注也会用超大加注施压；合理价格下宽跟，不弃强牌。
+//
+// 加它的原因是外部逐决策复盘（rng1g 2153 手，`--dump-big calloff|fold`）暴露了
+// 两类灾难，方向正好相反：
+//   - 河牌把 333QQ（葫芦）弃给一次 4 倍加注：eq 0.977 vs 赔率 0.364；
+//   - 河牌用 4.5% 胜率的牌打 8.6 倍池超池诈唬，被跟注后打光。
+// 前者说明网络把"大加注"先验当成坚果（没见过大尺寸诈唬），后者说明它不
+// 相信对手会宽跟。现有脚本对手都不提供这两个信号：spammer 只打 1/3 池、
+// 被加注就弃；solid 宽跟但从不主动开火；folder 从不主动下注。
+Move maniacAgentMove(const HUState& s, Rng& rng) {
+    LegalMove mv[kNumActions];
+    const int n = legalMoves(s, mv);
+    if (n == 0) return Move{};
+
+    const int me = s.toAct;
+    const int need = toCall(s, me);
+    const int pot = s.pot();
+    const float eq = equityVsRandom(s, me, 24);
+    std::uniform_real_distribution<float> u(0.0f, 1.0f);
+
+    auto checkCall = [&](Move& out) {
+        for (int i = 0; i < n; ++i) {
+            if (mv[i].slot == kSlotCheckCall) {
+                out = mv[i].mv;
+                return true;
+            }
+        }
+        return false;
+    };
+    auto fold = [&](Move& out) {
+        for (int i = 0; i < n; ++i) {
+            if (mv[i].slot == kSlotFold) {
+                out = mv[i].mv;
+                return true;
+            }
+        }
+        return false;
+    };
+    auto raiseTo = [&](int to, Move& out) {
+        if (!isRaisePossible(s)) return false;
+        out = makeRaise(s, to);
+        return out.kind == MK_RAISE || out.kind == MK_ALLIN;
+    };
+    // 超过剩余筹码时 makeRaise 自动钳成全下。
+    const int myContrib = int(s.contrib[me]);
+
+    Move out{};
+    if (s.street == ST_PREFLOP) {
+        if (need == 0) {
+            if (u(rng) < 0.50f && raiseTo(4 * kBigBlind, out)) return out;
+            checkCall(out);
+            return out;
+        }
+        // 面对加注：45% 反加（3 倍上次加注），10% 直接全下，其余宽跟。
+        if (u(rng) < 0.45f && raiseTo(int(s.lastRaiseTo) * 3, out)) return out;
+        if (u(rng) < 0.10f && raiseTo(myContrib + s.stack[me], out)) return out;
+        const float odds = float(need) / float(pot + need);
+        if (eq > odds - 0.10f) {
+            checkCall(out);
+            return out;
+        }
+        if (fold(out)) return out;
+        checkCall(out);
+        return out;
+    }
+
+    if (need == 0) {
+        // 两极化：只用强牌（eq>0.62）或空气（eq<0.32）打 1.5~3 倍池，中等牌
+        // 过牌。刻意**不**让"大尺寸"单向地等于弱牌，否则策略会学成"见大注
+        // 就宽跟"，对 Slumbot 这种大注=价值的对手反而更糟。7% 直接全下。
+        const bool polar = (eq > 0.62f) || (eq < 0.32f);
+        if (polar && u(rng) < 0.07f && raiseTo(myContrib + s.stack[me], out)) return out;
+        if (polar && u(rng) < 0.66f) {
+            const float mult = 1.5f + 1.5f * u(rng);
+            const int to = myContrib + std::max<int>(kBigBlind, int(mult * pot));
+            if (raiseTo(to, out)) return out;
+        }
+        checkCall(out);
+        return out;
+    }
+
+    // 面对下注：40% 大加注（强牌价值 / 空气诈唬各半），其余按赔率宽跟。
+    if ((eq > 0.72f || eq < 0.25f) && u(rng) < 0.40f) {
+        const int to = myContrib + std::max<int>(kBigBlind, int(2.0f * pot));
+        if (raiseTo(to, out)) return out;
+    }
+    const float odds = float(need) / float(pot + need);
+    if (eq > odds - 0.06f) {
+        checkCall(out);
+        return out;
+    }
+    if (fold(out)) return out;
+    checkCall(out);
+    return out;
+}
+
 void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const RolloutConfig& cfg,
                     std::array<std::vector<Transition>, 2>& out, RolloutStats& stats) {
     torch::NoGradGuard noGrad;  // 采样只做前向，不需要建图
@@ -1376,6 +2104,26 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
     std::vector<GameCtx> gs(static_cast<size_t>(N));
     std::uniform_real_distribution<float> u(0.0f, 1.0f);
     std::uniform_real_distribution<double> uu(0.0, 1.0);
+    // rangeEq 的采样/枚举用独立随机流：打开 rangeEq 不能改变牌局发牌与动作
+    // 采样的随机流，否则和基线不可比。
+    Rng rangeRng(cfg.seed ^ 0x9E3779B97F4A7C15ULL);
+
+    // 记录"某座位最近一次决策"的动作前状态与动作槽。rangeEq 与范围条件化
+    // 搜索都要从对手视角重建观测（换入采样底牌），所以必须留下动作前状态。
+    auto recordAction = [&](GameCtx& g, int s, const Move& mv) {
+        if (cfg.rangeEqSamples <= 0 && cfg.rangeSearchSamples <= 0 &&
+            cfg.searchOppProb <= 0.0f && cfg.expertProb <= 0.0f && cfg.riverCfrIters <= 0) {
+            return;
+        }
+        RangeObs& la = g.lastAct[s];
+        la.pre = g.st;
+        la.slot = slotOfMove(g.st, mv);
+        la.valid = (la.slot >= 0);
+    };
+    auto play = [&](GameCtx& g, int s, const Move& mv) {
+        recordAction(g, s, mv);
+        applyMove(g.st, mv, rng);
+    };
 
     out[0].clear();
     out[1].clear();
@@ -1401,8 +2149,12 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
     const float wTrapper = std::max(0.0f, cfg.trapperProb);
     const float wShark = std::max(0.0f, cfg.sharkProb);
     const float wSpammer = std::max(0.0f, cfg.spammerProb);
+    const float wManiac = std::max(0.0f, cfg.maniacProb);
+    const float wRanger = std::max(0.0f, cfg.rangerProb);
+    const float wCfr = (cfg.oppCfrIters > 0) ? std::max(0.0f, cfg.oppCfrProb) : 0.0f;
     const float wFolder = std::max(0.0f, cfg.folderProb);
     const float wSharp = std::max(0.0f, cfg.selfSharpProb);
+    const float wSROpp = std::max(0.0f, cfg.searchOppProb);
     const bool hasExtra =
         cfg.mixedFrozen &&
         (cfg.extraOpponentCount > 0 || cfg.fixedOpponent[0] != nullptr ||
@@ -1410,9 +2162,11 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
     const float wExtra = hasExtra ? std::max(0.0f, cfg.extraOpponentProb) : 0.0f;
     const float wSelf = std::max(
         0.0f, 1.0f - (wHist + wRule + wRand + wPro + wSearch + wSolid + wTight + wTrapper +
-                      wShark + wSpammer + wFolder + wSharp + wExtra));
+                      wShark + wSpammer + wManiac + wRanger + wCfr + wFolder + wSharp + wSROpp +
+                      wExtra));
     const float wSum = wSelf + wHist + wRule + wRand + wPro + wSearch + wSolid + wTight +
-                       wTrapper + wShark + wSpammer + wFolder + wSharp + wExtra;
+                       wTrapper + wShark + wSpammer + wManiac + wRanger + wCfr + wFolder + wSharp +
+                       wSROpp + wExtra;
 
     // 评估路径：强制某个座位是固定对手，另一个座位就是被测策略。
     int forcedSeat = -1;
@@ -1435,6 +2189,12 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
     } else if (cfg.forceSolidSeat >= 0) {
         forcedSeat = cfg.forceSolidSeat;
         forcedRole = ROLE_SOLID;
+    } else if (cfg.forceRangerSeat >= 0) {
+        forcedSeat = cfg.forceRangerSeat;
+        forcedRole = ROLE_RANGER;
+    } else if (cfg.forceCfrSeat >= 0) {
+        forcedSeat = cfg.forceCfrSeat;
+        forcedRole = ROLE_CFR;
     }
 
     for (int i = 0; i < N; ++i) {
@@ -1503,14 +2263,28 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
             } else if (r < wHist + wRule + wRand + wPro + wSearch + wSolid + wTight + wTrapper +
                            wShark + wSpammer) {
                 oppRole = ROLE_SPAMMER;
+            } else if (r < wHist + wRule + wRand + wPro + wSearch + wSolid + wTight + wTrapper +
+                           wShark + wSpammer + wManiac) {
+                oppRole = ROLE_MANIAC;
             } else if (r < wHist + wRule + wRand + wPro + wSearch + wSolid + wTight +
-                           wTrapper + wShark + wSpammer + wFolder) {
+                           wTrapper + wShark + wSpammer + wManiac + wRanger) {
+                oppRole = ROLE_RANGER;
+            } else if (r < wHist + wRule + wRand + wPro + wSearch + wSolid + wTight +
+                           wTrapper + wShark + wSpammer + wManiac + wRanger + wCfr) {
+                oppRole = ROLE_CFR;
+            } else if (r < wHist + wRule + wRand + wPro + wSearch + wSolid + wTight +
+                           wTrapper + wShark + wSpammer + wManiac + wRanger + wCfr + wFolder) {
                 oppRole = ROLE_FOLDER;
             } else if (r < wHist + wRule + wRand + wPro + wSearch + wSolid + wTight +
-                           wTrapper + wShark + wSpammer + wFolder + wSharp) {
+                           wTrapper + wShark + wSpammer + wManiac + wRanger + wCfr + wFolder + wSharp) {
                 oppRole = ROLE_LATEST_SHARP;
             } else if (r < wHist + wRule + wRand + wPro + wSearch + wSolid + wTight +
-                           wTrapper + wShark + wSpammer + wFolder + wSharp + wExtra) {
+                           wTrapper + wShark + wSpammer + wManiac + wRanger + wCfr + wFolder + wSharp +
+                           wSROpp) {
+                oppRole = ROLE_SEARCH_OPP;
+            } else if (r < wHist + wRule + wRand + wPro + wSearch + wSolid + wTight +
+                           wTrapper + wShark + wSpammer + wManiac + wRanger + wCfr + wFolder + wSharp +
+                           wSROpp + wExtra) {
                 oppRole = ROLE_FIXED;
                 if (cfg.extraOpponentCount > 1) {
                     g.extraIdx = static_cast<uint8_t>(rng() % cfg.extraOpponentCount);
@@ -1565,6 +2339,12 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
             ++stats.vsShark;
         } else if (oppRole == ROLE_SPAMMER) {
             ++stats.vsSpammer;
+        } else if (oppRole == ROLE_MANIAC) {
+            ++stats.vsManiac;
+        } else if (oppRole == ROLE_RANGER) {
+            ++stats.vsRanger;
+        } else if (oppRole == ROLE_CFR) {
+            ++stats.vsCfr;
         } else if (oppRole == ROLE_FOLDER) {
             ++stats.vsFolder;
         } else if (oppRole == ROLE_LATEST_SHARP) {
@@ -1600,7 +2380,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         stats.sbScore += payoff(g.st, 0);
         stats.bbScore += payoff(g.st, 1);
         if (cfg.handScores || cfg.handScoresByGame || cfg.handPotsByGame ||
-            cfg.handSeatsByGame) {
+            cfg.handSeatsByGame || cfg.handShowdownByGame) {
             int watched;
             if (cfg.watchedSeat >= 0) {
                 watched = cfg.watchedSeat;
@@ -1609,7 +2389,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
             } else {
                 watched = (cfg.forceRuleSeat == 0 || cfg.forceRandomSeat == 0 ||
                            cfg.forceProSeat == 0 || cfg.forceSearchSeat == 0 ||
-                           cfg.forceSolidSeat == 0)
+                           cfg.forceSolidSeat == 0 || cfg.forceRangerSeat == 0)
                               ? 1
                               : 0;
             }
@@ -1618,6 +2398,25 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
             if (cfg.handScoresByGame) (*cfg.handScoresByGame)[g.index] = net;
             if (cfg.handPotsByGame) (*cfg.handPotsByGame)[g.index] = g.st.pot();
             if (cfg.handSeatsByGame) (*cfg.handSeatsByGame)[g.index] = watched;
+            if (cfg.handShowdownByGame) {
+                const bool sd = g.st.folded == 255 && g.st.boardN == 5;
+                (*cfg.handShowdownByGame)[g.index] = sd ? 1 : 0;
+                int myScore = -1, oppScore = -1;
+                if (sd) {
+                    int c[7];
+                    for (int p = 0; p < 2; ++p) {
+                        int n = 0;
+                        c[n++] = int(g.st.hole[p][0]);
+                        c[n++] = int(g.st.hole[p][1]);
+                        for (int i = 0; i < 5; ++i) c[n++] = int(g.st.board[i]);
+                        const int sc = evaluateBest(c, n);
+                        if (p == watched) myScore = sc;
+                        else oppScore = sc;
+                    }
+                }
+                if (cfg.handScoreByGame) (*cfg.handScoreByGame)[g.index] = myScore;
+                if (cfg.handOppScoreByGame) (*cfg.handOppScoreByGame)[g.index] = oppScore;
+            }
         }
         stats.games += 1;
         g.active = false;
@@ -1645,6 +2444,28 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
             // 用 actor 也看得到的节点特征（信息集上的 V）。
             if (cfg.criticOracleExtra) t.extra = obs.extra;
 
+            // 对手建模头标签：对手当前牌力百分位（与节点特征里的我方 handStrength
+            // 同一口径，含听牌折算）。这里只做标注，不改变任何行为。
+            {
+                const int oppSeat = 1 - seat;
+                Card oh[2] = {static_cast<Card>(g.st.hole[oppSeat][0]),
+                              static_cast<Card>(g.st.hole[oppSeat][1])};
+                Card bd[5] = {0, 0, 0, 0, 0};
+                for (int i = 0; i < g.st.boardN && i < 5; ++i) {
+                    bd[i] = static_cast<Card>(g.st.board[i]);
+                }
+                t.oppPct = handStrength(oh, bd, int(g.st.boardN));
+            }
+
+            // 范围胜率特征：组合级计算（采样对手底牌 + 对手动作似然重加权
+            // + 我方摊牌胜率），网络从标量特征学不出来。似然前向喂中性 0.5。
+            if (cfg.rangeEqSamples > 0) {
+                const int oppSeat = 1 - seat;
+                t.rangeEq = rangeEquityFor(g.st, seat, g.lastAct[oppSeat],
+                                           &latest.actor[oppSeat], cfg.rangeEqSamples,
+                                           cfg.rangeEqIters, rangeRng);
+            }
+
             LegalMove lm[kNumActions];
             const int n = legalMoves(g.st, lm);
             t.actions.resize(static_cast<size_t>(n));
@@ -1671,12 +2492,27 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
                 teacherActionValues(g.st, seat, t.teacherQ, cfg.teacherSamples, cfg.teacherStyles);
                 t.hasTeacher = true;
             }
+
+            // 专家迭代：河牌用范围条件化搜索的 Q 当教师标签。搜索把当前策略
+            // 当对手模型，所以只在对座位上**确实是当前策略**（自对局）时标注；
+            // 对手是脚本/快照时模型错配，标签会把我们带向针对错误对手的打法。
+            // 标签走同一条 softmax(Q/T) 蒸馏损失，只是来源不同。
+            if (cfg.expertProb > 0.0f && critic != nullptr && g.st.boardN >= 5 &&
+                g.role[1 - seat] == ROLE_LATEST &&
+                (cfg.expertProb >= 1.0f || u(rng) < cfg.expertProb)) {
+                policySearchMove(&latest.actor[0], &latest.actor[1], g.st, seat,
+                                 cfg.expertSamples > 0 ? cfg.expertSamples : 8, rng,
+                                 cfg.policySearchEquityIters, &g.lastAct[1 - seat],
+                                 &latest.actor[1 - seat], &t.teacherQ);
+                t.hasTeacher = true;
+            }
         }
 
-        torch::Tensor nodeT, seqT, extraT, actFeatT, actSampleT, actIdT;
-        writeTensors(tmp, nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, critic != nullptr);
+        torch::Tensor nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT;
+        writeTensors(tmp, nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT,
+                     critic != nullptr);
 
-        torch::Tensor logits = actor->forward(nodeT, seqT, actFeatT, actSampleT, actIdT);
+        torch::Tensor logits = actor->forward(nodeT, seqT, actFeatT, actSampleT, actIdT, rangeEqT);
         const float* pLogits = logits.data_ptr<float>();
         // 动作级集成：额外成员各跑一遍前向。它们看到的是同一个节点、同一批
         // 合法动作，所以概率可以在槽位上直接平均。
@@ -1686,7 +2522,8 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
             for (int e = 0; e < m; ++e) {
                 const nn::Actor* extra = cfg.ensembleExtra[seat][e];
                 if (extra == nullptr) continue;
-                ensLogits.push_back((*extra)->forward(nodeT, seqT, actFeatT, actSampleT, actIdT));
+                ensLogits.push_back(
+                    (*extra)->forward(nodeT, seqT, actFeatT, actSampleT, actIdT, rangeEqT));
             }
         }
         torch::Tensor values;
@@ -1778,7 +2615,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
                 if (to > cap) to = cap;
                 if (to > int(played.to)) played.to = static_cast<int16_t>(to);
             }
-            applyMove(g.st, played, rng);
+            play(g, seat, played);
             ++stats.decisions;
             if (played.kind == MK_ALLIN) ++stats.allinDecisions;
             if (played.kind == MK_FOLD) ++stats.folds;
@@ -1814,7 +2651,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
                 played.to = static_cast<int16_t>(
                     amountInBand(int(played.to), lm[pick].toHi, uu(rng)));
             }
-            applyMove(g.st, played, rng);
+            play(g, seat, played);
             if (lm[pick].mv.kind == MK_FOLD) ++stats.folds;
             if (g.st.terminal()) finishGame(g);
         }
@@ -1825,7 +2662,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         for (int gi : idx) {
             GameCtx& g = gs[static_cast<size_t>(gi)];
             const Move mv = ruleAgentMove(g.st, rng);
-            applyMove(g.st, mv, rng);
+            play(g, seat, mv);
             if (mv.kind == MK_FOLD) ++stats.folds;
             if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
             if (g.st.terminal()) finishGame(g);
@@ -1837,7 +2674,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         for (int gi : idx) {
             GameCtx& g = gs[static_cast<size_t>(gi)];
             const Move mv = proAgentMove(g.st, rng);
-            applyMove(g.st, mv, rng);
+            play(g, seat, mv);
             if (mv.kind == MK_FOLD) ++stats.folds;
             if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
             if (g.st.terminal()) finishGame(g);
@@ -1849,7 +2686,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         for (int gi : idx) {
             GameCtx& g = gs[static_cast<size_t>(gi)];
             const Move mv = folderAgentMove(g.st, rng);
-            applyMove(g.st, mv, rng);
+            play(g, seat, mv);
             if (mv.kind == MK_FOLD) ++stats.folds;
             if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
             if (g.st.terminal()) finishGame(g);
@@ -1861,7 +2698,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         for (int gi : idx) {
             GameCtx& g = gs[static_cast<size_t>(gi)];
             const Move mv = solidAgentMove(g.st, rng);
-            applyMove(g.st, mv, rng);
+            play(g, seat, mv);
             if (mv.kind == MK_FOLD) ++stats.folds;
             if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
             if (g.st.terminal()) finishGame(g);
@@ -1873,7 +2710,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         for (int gi : idx) {
             GameCtx& g = gs[static_cast<size_t>(gi)];
             const Move mv = tightAgentMove(g.st, rng);
-            applyMove(g.st, mv, rng);
+            play(g, seat, mv);
             if (mv.kind == MK_FOLD) ++stats.folds;
             if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
             if (g.st.terminal()) finishGame(g);
@@ -1885,7 +2722,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         for (int gi : idx) {
             GameCtx& g = gs[static_cast<size_t>(gi)];
             const Move mv = trapperAgentMove(g.st, rng);
-            applyMove(g.st, mv, rng);
+            play(g, seat, mv);
             if (mv.kind == MK_FOLD) ++stats.folds;
             if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
             if (g.st.terminal()) finishGame(g);
@@ -1897,7 +2734,19 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         for (int gi : idx) {
             GameCtx& g = gs[static_cast<size_t>(gi)];
             const Move mv = spammerAgentMove(g.st, rng);
-            applyMove(g.st, mv, rng);
+            play(g, seat, mv);
+            if (mv.kind == MK_FOLD) ++stats.folds;
+            if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
+            if (g.st.terminal()) finishGame(g);
+        }
+    };
+
+    auto runManiac = [&](int seat, const std::vector<int>& idx) {
+        (void)seat;
+        for (int gi : idx) {
+            GameCtx& g = gs[static_cast<size_t>(gi)];
+            const Move mv = maniacAgentMove(g.st, rng);
+            play(g, seat, mv);
             if (mv.kind == MK_FOLD) ++stats.folds;
             if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
             if (g.st.terminal()) finishGame(g);
@@ -1909,7 +2758,19 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         for (int gi : idx) {
             GameCtx& g = gs[static_cast<size_t>(gi)];
             const Move mv = sharkAgentMove(g.st, rng);
-            applyMove(g.st, mv, rng);
+            play(g, seat, mv);
+            if (mv.kind == MK_FOLD) ++stats.folds;
+            if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
+            if (g.st.terminal()) finishGame(g);
+        }
+    };
+
+    auto runRanger = [&](int seat, const std::vector<int>& idx) {
+        (void)seat;
+        for (int gi : idx) {
+            GameCtx& g = gs[static_cast<size_t>(gi)];
+            const Move mv = rangerAgentMove(g.st, rng, cfg.rangerAir);
+            play(g, seat, mv);
             if (mv.kind == MK_FOLD) ++stats.folds;
             if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
             if (g.st.terminal()) finishGame(g);
@@ -1921,7 +2782,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         for (int gi : idx) {
             GameCtx& g = gs[static_cast<size_t>(gi)];
             const Move mv = searchAgentMove(g.st, rng, cfg.searchSamples, cfg.searchStyles);
-            applyMove(g.st, mv, rng);
+            play(g, seat, mv);
             if (mv.kind == MK_FOLD) ++stats.folds;
             if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
             if (g.st.terminal()) finishGame(g);
@@ -1937,11 +2798,139 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
             const Move mv = policySearchMove(psActors[0], psActors[1], g.st, seat,
                                              cfg.policySearchSamples, rng,
                                              cfg.policySearchEquityIters);
-            applyMove(g.st, mv, rng);
+            play(g, seat, mv);
             ++stats.decisions;
             if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
             if (mv.kind == MK_FOLD) ++stats.folds;
             if (g.st.terminal()) finishGame(g);
+        }
+    };
+
+    // 河牌范围条件化搜索：只在河牌决策上做"按对手最近动作的似然加权"的
+    // 一步前瞻（其余街走 runBatch 的原策略）。对手模型优先用真实对手
+    // （对打时的 forceActor），否则用同一条支路里的另一座位网络。
+    auto runRangeSearchActs = [&](const nn::Actor* a0, const nn::Actor* a1, int seat,
+                                  const std::vector<int>& idx) {
+        const nn::Actor* acts[2] = {a0, a1};
+        // 评估路径用 rangeSearchSamples；训练对手用 searchOppSamples（更便宜）。
+        const int samples = cfg.rangeSearchSamples > 0 ? cfg.rangeSearchSamples
+                                                       : cfg.searchOppSamples;
+        if (samples <= 0 || acts[0] == nullptr || acts[1] == nullptr) return;
+        for (int gi : idx) {
+            GameCtx& g = gs[static_cast<size_t>(gi)];
+            const nn::Actor* oppActor =
+                (cfg.forceActor != nullptr && cfg.forceActorSeat == 1 - seat)
+                    ? cfg.forceActor
+                    : acts[1 - seat];
+            const Move mv =
+                cfg.robustSearch
+                    ? policySearchRobustMove(acts[0], acts[1], g.st, seat, samples, rng,
+                                             cfg.policySearchEquityIters,
+                                             cfg.rangeSearchUniform ? nullptr : &g.lastAct[1 - seat],
+                                             oppActor, cfg.robustMean)
+                    : policySearchMove(acts[0], acts[1], g.st, seat, samples, rng,
+                                       cfg.policySearchEquityIters,
+                                       cfg.rangeSearchUniform ? nullptr : &g.lastAct[1 - seat],
+                                       oppActor);
+            play(g, seat, mv);
+            ++stats.decisions;
+            if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
+            if (mv.kind == MK_FOLD) ++stats.folds;
+            if (g.st.terminal()) finishGame(g);
+        }
+    };
+    auto runRangeSearch = [&](int seat, const std::vector<int>& idx) {
+        runRangeSearchActs(psActors[0], psActors[1], seat, idx);
+    };
+
+    // 河牌 CFR+ 子博弈：固定公共牌，把对手范围全枚举成 1081 个组合（权重 =
+    // 它最近一次动作的策略似然），解一棵抽象下注树上的均衡，取自己这张牌的
+    // 均衡动作。和一步前瞻搜索的区别：这里的对手按均衡回应，而不是按我们的
+    // 网络续演，所以输出的是"不被针对"的打法（minimax），两者互补。
+    auto runRiverCfr = [&](int seat, const std::vector<int>& idx) {
+        if (idx.empty()) return;
+        const nn::Actor* acts[2] = {psActors[0] != nullptr ? psActors[0] : &latest.actor[0],
+                                    psActors[1] != nullptr ? psActors[1] : &latest.actor[1]};
+        RiverCfrConfig rc;
+        rc.iters = cfg.riverCfrIters;
+        rc.maxRaises = cfg.riverCfrMaxRaises;
+        rc.allin = cfg.riverCfrAllin;
+        std::vector<int> fallback;
+        for (int gi : idx) {
+            GameCtx& g = gs[static_cast<size_t>(gi)];
+            const nn::Actor* oppActor =
+                (cfg.forceActor != nullptr && cfg.forceActorSeat == 1 - seat)
+                    ? cfg.forceActor
+                    : acts[1 - seat];
+            const std::vector<float> oppRange =
+                riverRangeFor(g.st, 1 - seat, g.lastAct[1 - seat], oppActor);
+            // 自己的范围同样要估：均衡策略取决于双方范围。用均匀范围会让求解器
+            // 以为我们手里全是中等牌，从而系统性偏向小注/过牌（这正是"对脚本
+            // 对手丢失剥削力"的来源之一）。
+            const std::vector<float> ownRange =
+                riverRangeFor(g.st, seat, g.lastAct[seat], acts[seat]);
+            Move mv{};
+            if (!riverCfrMove(g.st, rc, mv, oppRange, ownRange)) {
+                fallback.push_back(gi);  // 求解失败不丢样本，退回网络策略
+                continue;
+            }
+            play(g, seat, mv);
+            ++stats.decisions;
+            if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
+            if (mv.kind == MK_FOLD) ++stats.folds;
+            if (g.st.terminal()) finishGame(g);
+        }
+        if (!fallback.empty()) {
+            runBatch(latest.actor[seat], &latest.critic[seat], seat, fallback,
+                     /*withEnsemble=*/true, cfg.policyTemp, cfg.policyGreedy, cfg.amountMid,
+                     cfg.preflopRaiseMult, cfg.postflopBetMult);
+        }
+    };
+
+    // 河牌 CFR 当**对手**（README #109(d)）。和学习座位上的求解器用的是同一套
+    // riverCfrMove，只是座位对调：
+    //   - 我们的范围：latest.actor[1-seat] 在它最近一次动作上的似然（这是求解器
+    //     惩罚薄价值/宽跟注的依据）；
+    //   - 它自己的范围：latest.actor[seat] 在同一口径上的似然。
+    // 两条街的**打法**必须和范围估计自洽：其它街用当前策略采样（下面的 runBatch），
+    // 河牌才用均衡回应。第一版让其它街走 solid，范围模型与实际打出来的牌错位，
+    // 实测只比 solid 强 0.14BB/手；自洽版强 2.6BB/手（README #109(d)）。
+    // 小池 / 求解失败仍退回当前策略（不是 solid），否则范围又错位。
+    auto runOppCfr = [&](int seat, const std::vector<int>& idx) {
+        if (idx.empty()) return;
+        RiverCfrConfig rc;
+        rc.iters = cfg.oppCfrIters;
+        rc.maxRaises = cfg.riverCfrMaxRaises;
+        rc.allin = cfg.riverCfrAllin;
+        std::vector<int> rest;
+        for (int gi : idx) {
+            GameCtx& g = gs[static_cast<size_t>(gi)];
+            const bool bigEnough =
+                cfg.oppCfrMinPot <= 0 || g.st.pot() >= cfg.oppCfrMinPot;
+            if (g.st.street != ST_RIVER || g.st.boardN < 5 || !bigEnough) {
+                rest.push_back(gi);
+                continue;
+            }
+            const std::vector<float> oppRange =
+                riverRangeFor(g.st, 1 - seat, g.lastAct[1 - seat], &latest.actor[1 - seat]);
+            const std::vector<float> ownRange =
+                riverRangeFor(g.st, seat, g.lastAct[seat], &latest.actor[seat]);
+            Move mv{};
+            if (!riverCfrMove(g.st, rc, mv, oppRange, ownRange)) {
+                rest.push_back(gi);
+                continue;
+            }
+            play(g, seat, mv);
+            ++stats.decisions;
+            if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
+            if (mv.kind == MK_FOLD) ++stats.folds;
+            if (g.st.terminal()) finishGame(g);
+        }
+        // 非河牌：用当前策略采样（不是 solid），保证 `ownRange` 的似然代理自洽
+        // ——它翻前/翻牌的范围就是它自己的策略打出来的。
+        if (!rest.empty()) {
+            runBatch(latest.actor[seat], nullptr, seat, rest, /*withEnsemble=*/false,
+                     cfg.policyTemp, cfg.policyGreedy);
         }
     };
 
@@ -1960,8 +2949,12 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
             std::vector<int> trapperIdx;
             std::vector<int> sharkIdx;
             std::vector<int> spammerIdx;
+            std::vector<int> maniacIdx;
+            std::vector<int> rangerIdx;
+            std::vector<int> cfrIdx;
             std::vector<int> folderIdx;
             std::vector<int> bigIdx;
+            std::vector<int> sOppIdx;
             const bool useBig =
                 cfg.bigPotOpponent[seat] != nullptr && cfg.bigPotThreshold > 0.0f;
 
@@ -1981,6 +2974,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
                         break;
                     case ROLE_RANDOM: randomIdx.push_back(i); break;
                     case ROLE_LATEST_SHARP: sharpIdx.push_back(i); break;
+                    case ROLE_SEARCH_OPP: sOppIdx.push_back(i); break;
                     case ROLE_FIXED: fixedIdx.push_back(i); break;
                     case ROLE_PRO: proIdx.push_back(i); break;
                     case ROLE_SEARCH: searchIdx.push_back(i); break;
@@ -1989,18 +2983,85 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
                     case ROLE_TRAPPER: trapperIdx.push_back(i); break;
                     case ROLE_SHARK: sharkIdx.push_back(i); break;
                     case ROLE_SPAMMER: spammerIdx.push_back(i); break;
+                    case ROLE_MANIAC: maniacIdx.push_back(i); break;
+                    case ROLE_RANGER: rangerIdx.push_back(i); break;
+                    case ROLE_CFR: cfrIdx.push_back(i); break;
                     case ROLE_FOLDER: folderIdx.push_back(i); break;
                     default: ruleIdx.push_back(i); break;
                 }
             }
 
-            if (cfg.policySearchSamples > 0 && cfg.policySearchActors[0] != nullptr &&
-                cfg.policySearchActors[1] != nullptr) {
+            if (cfg.riverCfrIters > 0) {
+                // 河牌：CFR+ 子博弈；其它街：原策略。
+                std::vector<int> solvedIdx;
+                std::vector<int> otherIdx;
+                for (int gi : latestIdx) {
+                    const GameCtx& g = gs[static_cast<size_t>(gi)];
+                    const bool bigEnough =
+                        cfg.riverCfrMinPot <= 0 || g.st.pot() >= cfg.riverCfrMinPot;
+                    if (g.st.street == ST_RIVER && g.st.boardN >= 5 && bigEnough) {
+                        solvedIdx.push_back(gi);
+                    } else {
+                        otherIdx.push_back(gi);
+                    }
+                }
+                runRiverCfr(seat, solvedIdx);
+                if (!otherIdx.empty()) {
+                    runBatch(latest.actor[seat], &latest.critic[seat], seat, otherIdx,
+                             /*withEnsemble=*/true, cfg.policyTemp, cfg.policyGreedy,
+                             cfg.amountMid, cfg.preflopRaiseMult, cfg.postflopBetMult);
+                }
+            } else if (cfg.rangeSearchSamples > 0 && cfg.policySearchActors[0] != nullptr &&
+                       cfg.policySearchActors[1] != nullptr) {
+                // 河牌：范围条件化搜索；其它街：原策略（runBatch）。
+                // 底池 < rangeSearchMinPot 的河牌决策也走原策略：搜索的模型
+                // 错配成本在小池最不划算（外部赤字集中在大池摊牌）。
+                std::vector<int> riverIdx;
+                std::vector<int> otherIdx;
+                for (int gi : latestIdx) {
+                    const GameCtx& g = gs[static_cast<size_t>(gi)];
+                    const bool bigEnough = cfg.rangeSearchMinPot <= 0 ||
+                                           g.st.pot() >= cfg.rangeSearchMinPot;
+                    const bool facingBet = !cfg.rangeSearchDefenseOnly ||
+                                           toCall(g.st, seat) > 0;
+                    if (g.st.boardN >= 5 && bigEnough && facingBet) {
+                        riverIdx.push_back(gi);
+                    } else {
+                        otherIdx.push_back(gi);
+                    }
+                }
+                runRangeSearch(seat, riverIdx);
+                if (!otherIdx.empty()) {
+                    runBatch(latest.actor[seat], &latest.critic[seat], seat, otherIdx,
+                             /*withEnsemble=*/true, cfg.policyTemp, cfg.policyGreedy,
+                             cfg.amountMid, cfg.preflopRaiseMult, cfg.postflopBetMult);
+                }
+            } else if (cfg.policySearchSamples > 0 && cfg.policySearchActors[0] != nullptr &&
+                       cfg.policySearchActors[1] != nullptr) {
                 runPolicySearch(seat, latestIdx);
             } else {
                 runBatch(latest.actor[seat], &latest.critic[seat], seat, latestIdx,
                          /*withEnsemble=*/true, cfg.policyTemp, cfg.policyGreedy, cfg.amountMid,
                          cfg.preflopRaiseMult, cfg.postflopBetMult);
+            }
+            if (!sOppIdx.empty()) {
+                // 范围搜索剥削者：河牌用最新策略做后验加权前瞻，其它街按
+                // 最新策略采样。它和"尖自对局"一样，只在对手座位出现。
+                std::vector<int> riverIdx;
+                std::vector<int> otherIdx;
+                for (int gi : sOppIdx) {
+                    if (gs[static_cast<size_t>(gi)].st.boardN >= 5) {
+                        riverIdx.push_back(gi);
+                    } else {
+                        otherIdx.push_back(gi);
+                    }
+                }
+                runRangeSearchActs(&latest.actor[0], &latest.actor[1], seat, riverIdx);
+                if (!otherIdx.empty()) {
+                    runBatch(latest.actor[seat], nullptr, seat, otherIdx,
+                             /*withEnsemble=*/false, cfg.policyTemp, cfg.policyGreedy,
+                             cfg.amountMid, cfg.preflopRaiseMult, cfg.postflopBetMult);
+                }
             }
             // 尖自对局：同一套权重、按部署温度提取动作；这些转移和快照对手
             // 一样只作为"对手视角"的样本来用。
@@ -2066,6 +3127,9 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
             runTrapper(seat, trapperIdx);
             runShark(seat, sharkIdx);
             runSpammer(seat, spammerIdx);
+            runManiac(seat, maniacIdx);
+            runRanger(seat, rangerIdx);
+            runOppCfr(seat, cfrIdx);
             runFolder(seat, folderIdx);
         }
     }
