@@ -57,6 +57,11 @@ struct SlumbotConfig {
     // 建到 200BB 再被顶范围接住；这条规则直接掐掉"用中等牌建大池"。
     float preflopAggroPct = 0.0f;   // 0 = 关闭
     int preflopAggroMaxRaises = 2;  // 允许到 3-bet（numRaises < 2 时不受限）
+    // BB 面对开牌（numRaises==1）的 3-bet 门槛：翻前手牌百分位低于它时不 3-bet，
+    // 改成跟注。注意：早期 200~400 手分桶曾显示 0.45~0.60 档 3-bet 亏 2~4.5 BB/手，
+    // 12k 手重算后只有 −0.9~−1.1，与跟注 EV（−0.86~−1.42）几乎相同 ⇒ 增量≈0。
+    // 保留开关作对照，默认关闭（README #113(d)）。0 = 关闭。
+    float bb3betMinPct = 0.0f;
     // 翻牌进攻上限：牌力百分位 < flopAggroPct 时不加注（改成跟注/过牌）。
     // 路径分析：翻牌用 pct 0.40~0.60 的成牌/听牌加注，是把底池建到 200BB
     // 的第二大来源。
@@ -68,6 +73,9 @@ struct SlumbotConfig {
     // 对手模型用我们自己（训练里也是"对手=当前策略"）。
     int rangeEqSamples = 0;  // 0 = 关闭（喂中性 0.5）
     int rangeEqIters = 48;
+    // rangeEq 的对手似然来源：0 = 我们的策略（训练同口径）；1 = 经验模型
+    // （Slumbot 日志拟合的"动作类型 × 手牌百分位"密度，仅部署有意义）。
+    int rangeModel = 0;
 };
 
 struct SlumbotResult {
@@ -76,6 +84,7 @@ struct SlumbotResult {
     int riverOverbets = 0;  // 河牌大注 override 触发次数（诊断用）
     int allinGuardFolds = 0;  // 全下纪律 guard 强制弃牌次数（诊断用）
     int preflopAggroCapped = 0;  // 翻前进攻上限触发次数（诊断用）
+    int bb3betCapped = 0;        // BB 中等牌 3-bet 改成跟注的次数（诊断用）
     int flopAggroCapped = 0;     // 翻牌进攻上限触发次数（诊断用）
     int rangeEqDecisions = 0;    // 真实算过 rangeEq 的决策数（诊断用）
     long long winnings = 0;  // 净筹码（正 = 我们赢）

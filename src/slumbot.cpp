@@ -409,6 +409,7 @@ bool slumbotLastOppDecision(const std::string& action, const std::string& hole0,
 
 SlumbotResult playSlumbot(const nn::Actor actors[2], const SlumbotConfig& cfg) {
     SlumbotResult res;
+    setEmpiricalRangeModel(cfg.rangeModel == 1);
     Rng rng(cfg.seed);
     std::string token;
     int consecutiveErrors = 0;
@@ -623,6 +624,19 @@ SlumbotResult playSlumbot(const nn::Actor actors[2], const SlumbotConfig& cfg) {
                     int to = int(std::lround(double(mv.to) * double(cfg.postflopBetMult)));
                     if (to > cap) to = cap;
                     if (to > int(mv.to)) mv.to = static_cast<int16_t>(to);
+                }
+            }
+            // BB 3-bet 门槛：中等牌的 3-bet 在外面实测亏 2~4.5BB/手，改成跟注。
+            if (cfg.bb3betMinPct > 0.0f && st.street == ST_PREFLOP &&
+                st.toAct == 1 && st.numRaises == 1 &&
+                (mv.kind == MK_RAISE || mv.kind == MK_ALLIN)) {
+                int hole2[2] = {int(st.hole[st.toAct][0]), int(st.hole[st.toAct][1])};
+                int bd0[5] = {0, 0, 0, 0, 0};
+                if (handStrength(hole2, bd0, 0) < cfg.bb3betMinPct) {
+                    mv = Move{};
+                    mv.kind = MK_CALL;
+                    mv.to = st.contrib[1 - st.toAct];
+                    ++res.bb3betCapped;
                 }
             }
             // 翻前进攻上限：弱牌不在大池里继续加注（4-bet/5-bet 改成跟注）。

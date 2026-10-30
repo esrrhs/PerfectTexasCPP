@@ -441,6 +441,9 @@ int slotOfMove(const HUState& s, const Move& mv);
 
 // 与训练 rollout 完全相同口径的 rangeEq：给定我方当前状态、对手最近一次决策
 // （动作前状态 + 槽位）与对手模型，返回按动作似然重加权后的摊牌胜率。
+// 部署期：把 rangeEq 的对手似然换成"Slumbot 经验范围模型"（见 rollout.cpp）。
+void setEmpiricalRangeModel(bool on);
+
 float rangeEquityAt(const HUState& now, int heroSeat, const RangeObs& last,
                     const nn::Actor* oppActor, int samples, int iters, Rng& rng);
 

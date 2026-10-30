@@ -124,6 +124,8 @@ void usage() {
         "                       [--range-eq N] [--range-eq-iters N]\n"
         "  perfecttexas slumbot-analyze --csv FILE.csv  逐决策算事后胜率，定位漏点\n"
         "  perfecttexas allin-audit --csv FILE.csv...  全下决策审计（按座位/街/推接）\n"
+        "  perfecttexas commit-audit --csv FILE.csv... 弃牌前投入审计（按投入深度/弃牌街）\n"
+        "  perfecttexas slumbot-decisions --csv FILE.csv... 导出 Slumbot 逐决策样本（含手牌百分位）\n"
         "  perfecttexas showdown --resume DIR --vs solid|rule|pro|search|random|ranger|cfr\n"
         "                     [--hands N] [--seed N] [--temp F] [--range-eq N]\n"
         "                     [--ranger-air F] [--opp-cfr-iters N] [--opp-cfr-min-pot N]\n"
@@ -186,6 +188,7 @@ void usage() {
         "  --range-eq N    范围胜率特征：每个决策采样 N 个对手组合，按对手最近动作\n"
         "                  的策略似然重加权后算 vs-range 摊牌胜率（默认 0 = 关闭）\n"
         "  --range-eq-iters N rangeEq 摊牌胜率的蒙特卡洛次数（默认 48；转/河精确）\n"
+        "  --range-model M  rangeEq 的对手似然：policy（默认）| empirical（Slumbot 经验表）\n"
         "  --teacher-min-pot F 只对底池 >= F 的决策做教师标注（默认 0 = 全部）\n"
         "  --anchor-model DIR --anchor-coef F 非大池状态对冻结基座加 KL 信任域\n"
         "  --river-rule-coef F --river-rule-min-pot N 河牌大池 -> 1.5x 下注的规则蒸馏\n"
@@ -239,6 +242,7 @@ void usage() {
         "  --allin-guard-post-cat N 翻后跟全下要求的最低牌力（0高牌..3三条；-1=关，建议 3）\n"
         "  --allin-guard-min-risk F 跟注额 >= 剩余筹码×F 才触发（默认 0.5）\n"
         "  --preflop-aggro-pct F 手牌胜率低于 F 时，面对 >=N 次加注不再加注（0=关）\n"
+        "  --bb-3bet-min-pct F  BB 面对开牌时，手牌百分位低于 F 不 3-bet（改成跟注，0=关）\n"
         "  --preflop-aggro-max-raises N 允许的加注次数上限（默认 2，即允许 3-bet）\n"
         "  --flop-aggro-pct F 翻牌牌力百分位低于 F 时不加注（0=关，建议 0.65）\n"
         "  --policy fold|random  slumbot 的诊断策略（fold 的期望是 -75 筹码/手）\n");
@@ -2468,6 +2472,464 @@ int cmdAllinAudit(int argc, char** argv) {
     return 0;
 }
 
+// 承诺审计：外部日志里"我们投了一大笔之后弃牌"的手，按投入深度和弃牌街分组。
+// #111(c) 显示 rng1 的赤字 62% 来自这类手（投 76BB 再弃），但当时是一次性脚本；
+// 这个子命令把同一测量变成可复现指标，训练/部署改动前后可直接对比。
+int cmdCommitAudit(int argc, char** argv) {
+    const std::vector<std::string> csvs = argValues(argc, argv, "--csv");
+    if (csvs.empty()) {
+        std::printf("commit-audit 需要 --csv FILE（可重复）\n");
+        return 1;
+    }
+    const int kNumBuckets = 5;
+    const int bucketLoBB[kNumBuckets] = {0, 10, 30, 60, 100};
+    const char* bucketNames[kNumBuckets] = {"<10BB", "10-30BB", "30-60BB", "60-100BB", ">=100BB"};
+    struct Agg {
+        int n = 0;
+        double sumAdj = 0.0;
+        double sumSq = 0.0;
+        double sumInvested = 0.0;
+    };
+    Agg bucket[kNumBuckets];
+    Agg foldStreet[4];
+    Agg deepByStreet[4];  // 投入 >=30BB 且在该街弃牌
+    Agg totalSeat[2];     // 全部手（不只弃牌）按座位，用于算调整后 EV ± SE
+    Agg preRaise[4];      // 我方翻前最高加注层级：0 无 / 1 open / 2 3-bet / 3 4-bet / 4 5-bet+
+    const char* preRaiseNames[5] = {"无加注", "open", "3-bet", "4-bet", "5-bet+"};
+    // 翻前首轮响应：SB 开牌（弃/limp/加注）与 BB 面对开牌（弃/跟/3-bet）。
+    Agg sbOpen[3];
+    Agg bbVsOpen[3];
+    const char* sbOpenNames[3] = {"弃牌", "limp", "加注"};
+    const char* bbRespNames[3] = {"弃牌", "跟注", "3-bet"};
+    Agg bb3betPct[4];  // BB 3-bet 按翻前手牌百分位分桶
+    const char* bb3betPctNames[4] = {"<0.45", "0.45-0.60", "0.60-0.75", ">=0.75"};
+    Agg sbOpenPct[4];  // SB 开牌加注按翻前手牌百分位分桶
+    const char* sbOpenPctNames[4] = {"<0.30", "0.30-0.50", "0.50-0.70", ">=0.70"};
+    Agg bbFoldPct[4];  // BB 面对开牌弃牌的手牌百分位分布（判断是否过度弃牌）
+    const char* bbFoldPctNames[4] = {"<0.40", "0.40-0.55", "0.55-0.70", ">=0.70"};
+    // 终局底池 × 摊牌/非摊牌（与 README #111(d) 同口径，底池单位筹码）
+    Agg termSd[3], termNoSd[3];
+    const char* potBucketNames[3] = {"<1500", "1500-4000", ">=4000"};
+    int handsSeen = 0, foldedHands = 0, badReplay = 0;
+    double totalAdj = 0.0, totalSq = 0.0;
+    for (const std::string& path : csvs) {
+        std::ifstream in(path);
+        if (!in) {
+            std::printf("打不开 %s\n", path.c_str());
+            continue;
+        }
+        std::string line;
+        std::getline(in, line);  // header
+        texas::Rng rng(11);
+        while (std::getline(in, line)) {
+            const auto f = splitCsvLine(line);
+            if (f.size() < 10 || f[6].empty()) continue;
+            const int clientPos = std::atoi(f[1].c_str());
+            const int mySeat = (clientPos == 0) ? 1 : 0;
+            const auto hole = splitWs(f[7]);
+            const auto bot = splitWs(f[8]);
+            const auto boardS = splitWs(f[9]);
+            if (hole.size() < 2 || bot.size() < 2) continue;
+            texas::Card mine[2] = {texas::parseCard(hole[0].c_str()),
+                                   texas::parseCard(hole[1].c_str())};
+            texas::Card theirs[2] = {texas::parseCard(bot[0].c_str()),
+                                     texas::parseCard(bot[1].c_str())};
+            texas::Card bd[5] = {0, 0, 0, 0, 0};
+            bool ok = mine[0] >= 0 && mine[1] >= 0 && theirs[0] >= 0 && theirs[1] >= 0;
+            for (size_t k = 0; ok && k < boardS.size() && k < 5; ++k) {
+                bd[k] = texas::parseCard(boardS[k].c_str());
+                ok = bd[k] >= 0;
+            }
+            if (!ok) continue;
+            ++handsSeen;
+            const double adj = std::atof(f[3].c_str());
+            totalAdj += adj;
+            totalSq += adj * adj;
+            {
+                Agg& ts = totalSeat[mySeat];
+                ++ts.n;
+                ts.sumAdj += adj;
+                ts.sumSq += adj * adj;
+            }
+
+            texas::HUState st = (clientPos == 0) ? texas::makeState(theirs, mine, bd, 0)
+                                                 : texas::makeState(mine, theirs, bd, 0);
+            const std::string& action = f[6];
+            size_t i = 0;
+            int foldedStreet = -1;
+            int preLevel = 0;  // 0 = 没加注；1..4 = open / 3-bet / 4-bet / 5-bet+
+            int sbOpenAct = -1, bbRespAct = -1;
+            while (i < action.size() && !st.finished) {
+                const char c = action[i++];
+                texas::Move m{};
+                if (c == '/') continue;
+                if (c == 'k') {
+                    m.kind = texas::MK_CHECK;
+                    m.to = st.contrib[st.toAct];
+                } else if (c == 'c') {
+                    m.kind = texas::MK_CALL;
+                    m.to = st.contrib[1 - st.toAct];
+                } else if (c == 'f') {
+                    m.kind = texas::MK_FOLD;
+                    m.to = st.contrib[st.toAct];
+                } else if (c == 'b') {
+                    int v = 0;
+                    const size_t start = i;
+                    while (i < action.size() && action[i] >= '0' && action[i] <= '9') {
+                        v = v * 10 + (action[i] - '0');
+                        ++i;
+                    }
+                    if (i == start) break;
+                    m.kind = texas::MK_RAISE;
+                    m.to = static_cast<int16_t>(v);
+                } else {
+                    break;
+                }
+                if (st.toAct == mySeat) {
+                    if (m.kind == texas::MK_FOLD) foldedStreet = int(st.street);
+                    if (st.street == texas::ST_PREFLOP) {
+                        if (mySeat == 0 && sbOpenAct < 0 && st.numRaises == 0 &&
+                            texas::toCall(st, mySeat) > 0) {
+                            sbOpenAct = (m.kind == texas::MK_FOLD)
+                                            ? 0
+                                            : (m.kind == texas::MK_CALL ? 1 : 2);
+                        }
+                        if (mySeat == 1 && bbRespAct < 0 && st.numRaises >= 1 &&
+                            texas::toCall(st, mySeat) > 0) {
+                            bbRespAct = (m.kind == texas::MK_FOLD)
+                                            ? 0
+                                            : (m.kind == texas::MK_CALL ? 1 : 2);
+                        }
+                        if ((m.kind == texas::MK_RAISE || m.kind == texas::MK_ALLIN)) {
+                            const int lv = std::min(4, int(st.numRaises) + 1);
+                            if (lv > preLevel) preLevel = lv;
+                        }
+                    }
+                }
+                texas::applyMove(st, m, rng);
+            }
+            {
+                Agg& pr = preRaise[preLevel];
+                ++pr.n;
+                pr.sumAdj += adj;
+                pr.sumSq += adj * adj;
+            }
+            if (sbOpenAct >= 0) {
+                Agg& so = sbOpen[sbOpenAct];
+                ++so.n;
+                so.sumAdj += adj;
+                so.sumSq += adj * adj;
+                if (sbOpenAct == 2) {
+                    const float pp = texas::handStrength(mine, bd, 0);
+                    const int pb = pp < 0.30f ? 0 : (pp < 0.50f ? 1 : (pp < 0.70f ? 2 : 3));
+                    Agg& so2 = sbOpenPct[pb];
+                    ++so2.n;
+                    so2.sumAdj += adj;
+                    so2.sumSq += adj * adj;
+                }
+            }
+            if (st.finished) {
+                const int finalPot = st.pot();
+                const int pbi = finalPot < 1500 ? 0 : (finalPot < 4000 ? 1 : 2);
+                Agg& ta = (st.folded == 255) ? termSd[pbi] : termNoSd[pbi];
+                ++ta.n;
+                ta.sumAdj += adj;
+                ta.sumSq += adj * adj;
+            }
+            if (bbRespAct >= 0) {
+                Agg& br = bbVsOpen[bbRespAct];
+                ++br.n;
+                br.sumAdj += adj;
+                br.sumSq += adj * adj;
+                if (bbRespAct == 2) {
+                    const float pp = texas::handStrength(mine, bd, 0);
+                    const int pb = pp < 0.45f ? 0 : (pp < 0.60f ? 1 : (pp < 0.75f ? 2 : 3));
+                    Agg& b3 = bb3betPct[pb];
+                    ++b3.n;
+                    b3.sumAdj += adj;
+                    b3.sumSq += adj * adj;
+                } else if (bbRespAct == 0) {
+                    const float pp = texas::handStrength(mine, bd, 0);
+                    const int pb = pp < 0.40f ? 0 : (pp < 0.55f ? 1 : (pp < 0.70f ? 2 : 3));
+                    Agg& bf = bbFoldPct[pb];
+                    ++bf.n;
+                    bf.sumAdj += adj;
+                    bf.sumSq += adj * adj;
+                }
+            }
+            if (st.folded != mySeat) continue;
+            if (foldedStreet < 0) {
+                ++badReplay;
+                continue;
+            }
+            ++foldedHands;
+            const int invested = int(st.total[mySeat]);
+            const double investedBB = double(invested) / 100.0;
+            int bi = 0;
+            for (int b = kNumBuckets - 1; b >= 0; --b) {
+                if (investedBB >= bucketLoBB[b]) {
+                    bi = b;
+                    break;
+                }
+            }
+            Agg& a = bucket[bi];
+            ++a.n;
+            a.sumAdj += adj;
+            a.sumSq += adj * adj;
+            a.sumInvested += invested;
+            Agg& fs = foldStreet[foldedStreet];
+            ++fs.n;
+            fs.sumAdj += adj;
+            fs.sumSq += adj * adj;
+            fs.sumInvested += invested;
+            if (investedBB >= 30.0) {
+                Agg& ds = deepByStreet[foldedStreet];
+                ++ds.n;
+                ds.sumAdj += adj;
+                ds.sumSq += adj * adj;
+                ds.sumInvested += invested;
+            }
+        }
+    }
+    const char* streetNames[4] = {"preflop", "flop", "turn", "river"};
+    std::printf("commit-audit: %d 个文件, 重放 %d 手（重放失败 %d）, 我们弃牌 %d 手\n",
+                int(csvs.size()), handsSeen, badReplay, foldedHands);
+    std::printf("  %-10s %5s %7s %10s %10s %10s\n", "投入桶", "n", "占比", "投入/手",
+                "调整EV/手", "贡献BB/手");
+    for (int b = 0; b < kNumBuckets; ++b) {
+        const Agg& a = bucket[b];
+        if (a.n == 0) continue;
+        std::printf("  %-10s %5d %6.2f%% %10.1f %+10.1f %+10.2f\n", bucketNames[b], a.n,
+                    handsSeen ? 100.0 * a.n / handsSeen : 0.0, a.sumInvested / a.n,
+                    a.sumAdj / a.n, handsSeen ? a.sumAdj / handsSeen / 100.0 : 0.0);
+    }
+    std::printf("  %-10s %5s %7s %10s %10s %10s\n", "弃牌街", "n", "占比", "投入/手",
+                "调整EV/手", "贡献BB/手");
+    for (int s = 0; s < 4; ++s) {
+        const Agg& a = foldStreet[s];
+        if (a.n == 0) continue;
+        std::printf("  %-10s %5d %6.2f%% %10.1f %+10.1f %+10.2f\n", streetNames[s], a.n,
+                    handsSeen ? 100.0 * a.n / handsSeen : 0.0, a.sumInvested / a.n,
+                    a.sumAdj / a.n, handsSeen ? a.sumAdj / handsSeen / 100.0 : 0.0);
+    }
+    Agg deep;
+    for (int s = 0; s < 4; ++s) {
+        deep.n += deepByStreet[s].n;
+        deep.sumAdj += deepByStreet[s].sumAdj;
+        deep.sumInvested += deepByStreet[s].sumInvested;
+    }
+    if (handsSeen > 0) {
+        std::printf("  投入>=30BB 后弃牌: %d 手（%.2f%%）, 投入/手 %.1f, 调整EV/手 %+.1f, "
+                    "贡献 %+.2f BB/手\n",
+                    deep.n, 100.0 * deep.n / handsSeen,
+                    deep.n ? deep.sumInvested / deep.n : 0.0,
+                    deep.n ? deep.sumAdj / deep.n : 0.0, deep.sumAdj / handsSeen / 100.0);
+        const double mean = totalAdj / handsSeen;
+        double se = 0.0;
+        if (handsSeen > 1) {
+            const double var = (totalSq - handsSeen * mean * mean) / (handsSeen - 1);
+            se = var > 0.0 ? std::sqrt(var / handsSeen) : 0.0;
+        }
+        std::printf("  合计 %+.2f ± %.2f BB/手（%d 手）| %+.1f ± %.1f 筹码/手\n",
+                    mean / 100.0, se / 100.0, handsSeen, mean, se);
+        std::printf("  %-3s %6s %11s %13s\n", "座位", "手数", "筹码/手", "BB/手");
+        for (int s = 0; s < 2; ++s) {
+            const Agg& ts = totalSeat[s];
+            if (ts.n == 0) continue;
+            const double m = ts.sumAdj / ts.n;
+            double e = 0.0;
+            if (ts.n > 1) {
+                const double v = (ts.sumSq - ts.n * m * m) / (ts.n - 1);
+                e = v > 0.0 ? std::sqrt(v / ts.n) : 0.0;
+            }
+            std::printf("  %-3s %6d %+11.1f %+7.2f ± %.2f\n", s == 0 ? "SB" : "BB", ts.n, m,
+                        m / 100.0, e / 100.0);
+        }
+        std::printf("  %-7s %6s %7s %11s %13s\n", "翻前最高", "手数", "占比", "筹码/手", "BB/手");
+        for (int lv = 0; lv <= 4; ++lv) {
+            const Agg& pr = preRaise[lv];
+            if (pr.n == 0) continue;
+            const double m = pr.sumAdj / pr.n;
+            double e = 0.0;
+            if (pr.n > 1) {
+                const double v = (pr.sumSq - pr.n * m * m) / (pr.n - 1);
+                e = v > 0.0 ? std::sqrt(v / pr.n) : 0.0;
+            }
+            std::printf("  %-7s %6d %6.2f%% %+11.1f %+7.2f ± %.2f\n", preRaiseNames[lv], pr.n,
+                        100.0 * pr.n / handsSeen, m, m / 100.0, e / 100.0);
+        }
+        auto printRow = [&](const char* label, const Agg& a) {
+            if (a.n == 0) return;
+            const double m = a.sumAdj / a.n;
+            double e = 0.0;
+            if (a.n > 1) {
+                const double v = (a.sumSq - a.n * m * m) / (a.n - 1);
+                e = v > 0.0 ? std::sqrt(v / a.n) : 0.0;
+            }
+            std::printf("  %-9s %6d %6.2f%% %+11.1f %+7.2f ± %.2f\n", label, a.n,
+                        100.0 * a.n / handsSeen, m, m / 100.0, e / 100.0);
+        };
+        std::printf("  %-9s %6s %7s %11s %13s\n", "SB 首轮", "手数", "占比", "筹码/手",
+                    "BB/手");
+        for (int k = 0; k < 3; ++k) printRow(sbOpenNames[k], sbOpen[k]);
+        if (sbOpen[2].n > 0) {
+            std::printf("  %-9s %6s %7s %11s %13s\n", "SB 开牌", "手数", "占开牌",
+                        "筹码/手", "BB/手");
+            for (int k = 0; k < 4; ++k) {
+                const Agg& a = sbOpenPct[k];
+                if (a.n == 0) continue;
+                const double m = a.sumAdj / a.n;
+                double e = 0.0;
+                if (a.n > 1) {
+                    const double v = (a.sumSq - a.n * m * m) / (a.n - 1);
+                    e = v > 0.0 ? std::sqrt(v / a.n) : 0.0;
+                }
+                std::printf("  %-9s %6d %6.2f%% %+11.1f %+7.2f ± %.2f\n", sbOpenPctNames[k],
+                            a.n, 100.0 * a.n / sbOpen[2].n, m, m / 100.0, e / 100.0);
+            }
+        }
+        std::printf("  %-9s %6s %7s %11s %13s\n", "BB 对开牌", "手数", "占比", "筹码/手",
+                    "BB/手");
+        for (int k = 0; k < 3; ++k) printRow(bbRespNames[k], bbVsOpen[k]);
+        if (bbVsOpen[0].n > 0) {
+            std::printf("  %-9s %6s %7s %11s %13s\n", "BB 弃牌", "手数", "占弃牌",
+                        "筹码/手", "BB/手");
+            for (int k = 0; k < 4; ++k) {
+                const Agg& a = bbFoldPct[k];
+                if (a.n == 0) continue;
+                std::printf("  %-9s %6d %6.2f%% %+11.1f %+7.2f\n", bbFoldPctNames[k], a.n,
+                            100.0 * a.n / bbVsOpen[0].n, a.sumAdj / a.n, -1.0);
+            }
+        }
+        std::printf("  %-10s %6s %12s %6s %12s\n", "终局底池", "摊牌n", "摊牌筹码/手",
+                    "非摊牌n", "非摊牌筹码/手");
+        for (int b = 0; b < 3; ++b) {
+            const Agg& sdA = termSd[b];
+            const Agg& nsA = termNoSd[b];
+            std::printf("  %-10s %6d %+12.1f %6d %+12.1f\n", potBucketNames[b], sdA.n,
+                        sdA.n ? sdA.sumAdj / sdA.n : 0.0, nsA.n,
+                        nsA.n ? nsA.sumAdj / nsA.n : 0.0);
+        }
+        if (bbVsOpen[2].n > 0) {
+            std::printf("  %-9s %6s %7s %11s %13s\n", "BB 3-bet", "手数", "占3bet",
+                        "筹码/手", "BB/手");
+            for (int k = 0; k < 4; ++k) {
+                const Agg& a = bb3betPct[k];
+                if (a.n == 0) continue;
+                const double m = a.sumAdj / a.n;
+                double e = 0.0;
+                if (a.n > 1) {
+                    const double v = (a.sumSq - a.n * m * m) / (a.n - 1);
+                    e = v > 0.0 ? std::sqrt(v / a.n) : 0.0;
+                }
+                std::printf("  %-9s %6d %6.2f%% %+11.1f %+7.2f ± %.2f\n", bb3betPctNames[k],
+                            a.n, 100.0 * a.n / bbVsOpen[2].n, m, m / 100.0, e / 100.0);
+            }
+        }
+    }
+    return 0;
+}
+
+// 导出 Slumbot 的逐决策样本：每个"对手决策点"一行，带它当时的真实手牌百分位。
+// 用途：拟合"动作 → 手牌强度分布"的经验范围模型（rangeEq 现在用我们自己的
+// 策略当对手模型，这是它对外失真的根源之一）。输出 CSV 到 stdout。
+int cmdSlumbotDecisions(int argc, char** argv) {
+    const std::vector<std::string> csvs = argValues(argc, argv, "--csv");
+    if (csvs.empty()) {
+        std::printf("slumbot-decisions 需要 --csv FILE（可重复）\n");
+        return 1;
+    }
+    std::printf("hand,seat,street,pot,to_call,num_raises,act,to,pct,board_n\n");
+    int rows = 0, hands = 0, badReplay = 0;
+    for (const std::string& path : csvs) {
+        std::ifstream in(path);
+        if (!in) {
+            std::printf("打不开 %s\n", path.c_str());
+            continue;
+        }
+        std::string line;
+        std::getline(in, line);
+        texas::Rng rng(11);
+        while (std::getline(in, line)) {
+            const auto f = splitCsvLine(line);
+            if (f.size() < 10 || f[6].empty()) continue;
+            const int clientPos = std::atoi(f[1].c_str());
+            const int mySeat = (clientPos == 0) ? 1 : 0;
+            const int oppSeat = 1 - mySeat;
+            const auto hole = splitWs(f[7]);
+            const auto bot = splitWs(f[8]);
+            const auto boardS = splitWs(f[9]);
+            if (hole.size() < 2 || bot.size() < 2) continue;
+            texas::Card mine[2] = {texas::parseCard(hole[0].c_str()),
+                                   texas::parseCard(hole[1].c_str())};
+            texas::Card theirs[2] = {texas::parseCard(bot[0].c_str()),
+                                     texas::parseCard(bot[1].c_str())};
+            texas::Card bd[5] = {0, 0, 0, 0, 0};
+            bool ok = mine[0] >= 0 && mine[1] >= 0 && theirs[0] >= 0 && theirs[1] >= 0;
+            for (size_t k = 0; ok && k < boardS.size() && k < 5; ++k) {
+                bd[k] = texas::parseCard(boardS[k].c_str());
+                ok = bd[k] >= 0;
+            }
+            if (!ok) continue;
+            ++hands;
+            texas::HUState st = (clientPos == 0) ? texas::makeState(theirs, mine, bd, 0)
+                                                 : texas::makeState(mine, theirs, bd, 0);
+            const std::string& action = f[6];
+            size_t i = 0;
+            bool broke = false;
+            while (i < action.size() && !st.finished) {
+                const char c = action[i++];
+                texas::Move m{};
+                if (c == '/') continue;
+                if (c == 'k') {
+                    m.kind = texas::MK_CHECK;
+                    m.to = st.contrib[st.toAct];
+                } else if (c == 'c') {
+                    m.kind = texas::MK_CALL;
+                    m.to = st.contrib[1 - st.toAct];
+                } else if (c == 'f') {
+                    m.kind = texas::MK_FOLD;
+                    m.to = st.contrib[st.toAct];
+                } else if (c == 'b') {
+                    int v = 0;
+                    const size_t start = i;
+                    while (i < action.size() && action[i] >= '0' && action[i] <= '9') {
+                        v = v * 10 + (action[i] - '0');
+                        ++i;
+                    }
+                    if (i == start) {
+                        broke = true;
+                        break;
+                    }
+                    m.kind = texas::MK_RAISE;
+                    m.to = static_cast<int16_t>(v);
+                } else {
+                    broke = true;
+                    break;
+                }
+                if (st.toAct == oppSeat) {
+                    const int boardN = (st.street == texas::ST_PREFLOP) ? 0 : int(st.street) + 2;
+                    const float pct = texas::handStrength(theirs, bd, boardN);
+                    const int need = texas::toCall(st, oppSeat);
+                    const char kind = m.kind == texas::MK_FOLD   ? 'f'
+                                      : m.kind == texas::MK_CALL ? 'c'
+                                      : m.kind == texas::MK_CHECK ? 'k'
+                                                                  : 'b';
+                    std::printf("%s,%d,%d,%d,%d,%d,%c,%d,%.4f,%d\n", f[0].c_str(), oppSeat,
+                                int(st.street), st.pot(), need, int(st.numRaises), kind,
+                                int(m.to), pct, boardN);
+                    ++rows;
+                }
+                texas::applyMove(st, m, rng);
+            }
+            if (broke) ++badReplay;
+        }
+    }
+    std::fprintf(stderr, "slumbot-decisions: %d 手，%d 行，重放失败 %d\n", hands, rows,
+                 badReplay);
+    return 0;
+}
+
 // 把 Slumbot 的逐手日志变成行为克隆数据集，并从现有检查点微调出"对手模型"。
 // 动机：内部基准和外部强度的相关性很弱，唯一已知的成熟 AI 是 Slumbot。
 // 想赢它，先得有一份它的策略（哪怕是近似），之后才能做 BR / 放进联赛。
@@ -3231,9 +3693,12 @@ int cmdSlumbot(int argc, char** argv) {
     cfg.preflopAggroPct =
         static_cast<float>(argDouble(argc, argv, "--preflop-aggro-pct", 0.0));
     cfg.preflopAggroMaxRaises = argInt(argc, argv, "--preflop-aggro-max-raises", 2);
+    cfg.bb3betMinPct = static_cast<float>(argDouble(argc, argv, "--bb-3bet-min-pct", 0.0));
     cfg.flopAggroPct = static_cast<float>(argDouble(argc, argv, "--flop-aggro-pct", 0.0));
     cfg.rangeEqSamples = argInt(argc, argv, "--range-eq", 0);
     cfg.rangeEqIters = argInt(argc, argv, "--range-eq-iters", 48);
+    cfg.rangeModel =
+        argStr(argc, argv, "--range-model", "policy") == "empirical" ? 1 : 0;
 
     texas::nn::ModelConfig mc;
     mc.hidden = argInt(argc, argv, "--hidden", 256);
@@ -3267,11 +3732,11 @@ int cmdSlumbot(int argc, char** argv) {
     const double adjSeBb100 = r.adjustedStderr / double(texas::kBigBlind) * 100.0;
     std::printf(
         "\nslumbot 结果: %d/%d 手完成（中止 %d，错误 %d，河牌大注 %d，全下 guard %d，"
-        "翻前限攻 %d，翻牌限攻 %d，rangeEq 决策 %d）\n"
+        "翻前限攻 %d，翻牌限攻 %d，BB 3-bet 限攻 %d，rangeEq 决策 %d）\n"
                 "  净收益 %+lld 筹码 | %+0.1f ± %.1f 筹码/手 | %+0.1f ± %.1f bb/100 | "
                 "胜 %d 负 %d 平 %d | %.1f 手/s\n",
                 r.hands, r.attempted, r.attempted - r.hands, r.errors, r.riverOverbets,
-                r.allinGuardFolds, r.preflopAggroCapped, r.flopAggroCapped,
+                r.allinGuardFolds, r.preflopAggroCapped, r.flopAggroCapped, r.bb3betCapped,
                 r.rangeEqDecisions, r.winnings, per,
                 r.chipsStderr, per / double(texas::kBigBlind) * 100.0, seBb100, r.wins, r.losses,
                 r.pushes, double(r.hands) / std::max(secs, 1e-6));
@@ -3300,6 +3765,8 @@ int main(int argc, char** argv) {
     if (cmd == "slumbot") return cmdSlumbot(argc, argv);
     if (cmd == "slumbot-analyze") return cmdSlumbotAnalyze(argc, argv);
     if (cmd == "allin-audit") return cmdAllinAudit(argc, argv);
+    if (cmd == "commit-audit") return cmdCommitAudit(argc, argv);
+    if (cmd == "slumbot-decisions") return cmdSlumbotDecisions(argc, argv);
     if (cmd == "river-ranges") return cmdRiverRanges(argc, argv);
     if (cmd == "showdown") return cmdShowdown(argc, argv);
     if (cmd == "slumbot-fit") return cmdSlumbotFit(argc, argv);

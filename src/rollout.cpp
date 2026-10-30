@@ -8,9 +8,17 @@
 
 #include "texas/ppo.hpp"
 #include "texas/rivercfr.hpp"
+#include "texas/slumbot_range_table.hpp"
 #include "texas/strength.hpp"
 
 namespace texas {
+
+// 部署期可选的"经验对手模型"：rangeEq 的似然改用 Slumbot 日志拟合的
+// （街 × 动作类型 × 手牌百分位）密度表，而不是我们自己的策略。训练路径
+// 默认关闭（训练里对手是自身策略，经验模型只对 Slumbot 有意义）。
+static bool gEmpiricalRange = false;
+
+void setEmpiricalRangeModel(bool on) { gEmpiricalRange = on; }
 
 namespace {
 
@@ -490,17 +498,36 @@ float rangeEquityFor(const HUState& now, int heroSeat, const RangeObs& last,
     torch::NoGradGuard ng;
     torch::Tensor nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT;
     writeTensors(tmp, nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT, false);
-    torch::Tensor logits = (*oppActor)->forward(nodeT, seqT, actFeatT, actSampleT, actIdT,
-                                                rangeEqT);
-    const float* lp = logits.data_ptr<float>();
     std::vector<double> w(static_cast<size_t>(M), 0.0);
     double wsum = 0.0;
-    for (int m = 0; m < M; ++m) {
-        float probs[kNumActions];
-        ppo::maskedSoftmax(lp + size_t(m) * kNumActions, kNumActions, probs);
-        const double p = probs[last.slot];
-        w[static_cast<size_t>(m)] = p;
-        wsum += p;
+    if (gEmpiricalRange) {
+        // 经验对手模型（部署用）：用 Slumbot 日志拟合的"动作类型 → 手牌百分位"
+        // 密度当似然。抽样组合均匀，prior 近似均匀，所以密度本身即可当权重。
+        const int st = int(last.pre.street);
+        const int bN = (st == ST_PREFLOP) ? 0 : st + 2;
+        const int kind = last.slot == kSlotFold ? 0 : (last.slot == kSlotCheckCall ? 1 : 2);
+        for (int m = 0; m < M; ++m) {
+            Card hh[2] = {h0[static_cast<size_t>(m)], h1[static_cast<size_t>(m)]};
+            int hhI[2] = {int(hh[0]), int(hh[1])};
+            int bdI[5] = {0, 0, 0, 0, 0};
+            for (int b = 0; b < bN && b < 5; ++b) bdI[b] = int(last.pre.board[b]);
+            const float pct = handStrength(hhI, bdI, bN);
+            const int bin = std::min(9, std::max(0, int(pct * 10.0f)));
+            const double p = kOppDensity[st][kind][bin];
+            w[static_cast<size_t>(m)] = p;
+            wsum += p;
+        }
+    } else {
+        torch::Tensor logits = (*oppActor)->forward(nodeT, seqT, actFeatT, actSampleT, actIdT,
+                                                    rangeEqT);
+        const float* lp = logits.data_ptr<float>();
+        for (int m = 0; m < M; ++m) {
+            float probs[kNumActions];
+            ppo::maskedSoftmax(lp + size_t(m) * kNumActions, kNumActions, probs);
+            const double p = probs[last.slot];
+            w[static_cast<size_t>(m)] = p;
+            wsum += p;
+        }
     }
 
     double acc = 0.0;
