@@ -11,7 +11,9 @@
 #include <thread>
 
 #include "texas/features.hpp"
+#include "texas/rivercfr.hpp"
 #include "texas/rollout.hpp"
+#include "texas/turncfr.hpp"
 
 namespace texas {
 
@@ -311,9 +313,12 @@ namespace {
 
 // 重放动作串。lastOpp 非空时，把"对手（clientPos 座位）最近一次决策"的
 // 动作前状态与实际动作槽记下来 —— rangeEq 的似然要在这个状态上算。
+// lastSelf 非空时，把"我们自己（1-clientPos 座位）最近一次决策"也记下来
+// —— 转牌子博弈求解器需要双方范围。
 bool buildStateImpl(const std::string& action, const std::string& hole0,
                     const std::string& hole1, const std::vector<std::string>& board,
-                    int clientPos, Rng& rng, HUState& out, RangeObs* lastOpp) {
+                    int clientPos, Rng& rng, HUState& out, RangeObs* lastOpp,
+                    RangeObs* lastSelf) {
     if (hole0.empty() || hole1.empty()) return false;
     const Card mine[2] = {parseCard(hole0.c_str()), parseCard(hole1.c_str())};
     if (mine[0] < 0 || mine[1] < 0 || mine[0] == mine[1]) return false;
@@ -349,6 +354,7 @@ bool buildStateImpl(const std::string& action, const std::string& hole0,
     HUState st = (clientPos == 0) ? makeState(opp, mine, boardCards, boardN)
                                   : makeState(mine, opp, boardCards, boardN);
     if (lastOpp != nullptr) *lastOpp = RangeObs{};
+    if (lastSelf != nullptr) *lastSelf = RangeObs{};
     size_t i = 0;
     while (i < action.size()) {
         const char c = action[i++];
@@ -382,6 +388,11 @@ bool buildStateImpl(const std::string& action, const std::string& hole0,
             lastOpp->slot = slotOfMove(st, m);
             lastOpp->valid = lastOpp->slot >= 0;
         }
+        if (lastSelf != nullptr && st.toAct == 1 - clientPos) {
+            lastSelf->pre = st;
+            lastSelf->slot = slotOfMove(st, m);
+            lastSelf->valid = lastSelf->slot >= 0;
+        }
         applyMove(st, m, rng);
         if (st.finished) break;
     }
@@ -394,7 +405,7 @@ bool buildStateImpl(const std::string& action, const std::string& hole0,
 bool buildSlumbotState(const std::string& action, const std::string& hole0,
                        const std::string& hole1, const std::vector<std::string>& board,
                        int clientPos, Rng& rng, HUState& out) {
-    return buildStateImpl(action, hole0, hole1, board, clientPos, rng, out, nullptr);
+    return buildStateImpl(action, hole0, hole1, board, clientPos, rng, out, nullptr, nullptr);
 }
 
 bool slumbotLastOppDecision(const std::string& action, const std::string& hole0,
@@ -402,9 +413,21 @@ bool slumbotLastOppDecision(const std::string& action, const std::string& hole0,
                             int clientPos, Rng& rng, RangeObs& out) {
     HUState st;
     RangeObs last;
-    if (!buildStateImpl(action, hole0, hole1, board, clientPos, rng, st, &last)) return false;
+    if (!buildStateImpl(action, hole0, hole1, board, clientPos, rng, st, &last, nullptr)) {
+        return false;
+    }
     out = last;
     return last.valid;
+}
+
+bool slumbotLastDecisions(const std::string& action, const std::string& hole0,
+                          const std::string& hole1, const std::vector<std::string>& board,
+                          int clientPos, Rng& rng, RangeObs& lastOpp, RangeObs& lastSelf) {
+    HUState st;
+    if (!buildStateImpl(action, hole0, hole1, board, clientPos, rng, st, &lastOpp, &lastSelf)) {
+        return false;
+    }
+    return lastOpp.valid || lastSelf.valid;
 }
 
 SlumbotResult playSlumbot(const nn::Actor actors[2], const SlumbotConfig& cfg) {
@@ -586,6 +609,28 @@ SlumbotResult playSlumbot(const nn::Actor actors[2], const SlumbotConfig& cfg) {
                     mv.to = static_cast<int16_t>(amountInBand(int(mv.to), lm[pick].toHi, u01(rng)));
                 }
             } else {
+                // 转牌 CFR+ 子博弈：转牌决策改用范围均衡动作（与 eval 的
+                // --turn-cfr 同一实现；求解失败静默回退网络策略）。
+                bool solved = false;
+                if (cfg.turnCfrIters > 0 && st.street == ST_TURN && st.boardN == 4 &&
+                    st.stack[st.toAct] > 0 &&
+                    (cfg.turnCfrMinPot <= 0 || st.pot() >= cfg.turnCfrMinPot)) {
+                    RangeObs lastOpp, lastSelf;
+                    if (slumbotLastDecisions(action, hole[0], hole[1], board, int(clientPos),
+                                             rng, lastOpp, lastSelf)) {
+                        const std::vector<float> oppRange = turnRangeFor(
+                            st, int(clientPos), lastOpp, &actors[int(clientPos)]);
+                        const std::vector<float> ownRange = turnRangeFor(
+                            st, 1 - int(clientPos), lastSelf, &actors[1 - int(clientPos)]);
+                        texas::TurnCfrConfig tc;
+                        tc.iters = cfg.turnCfrIters;
+                        if (texas::turnCfrMove(st, tc, mv, oppRange, ownRange)) {
+                            solved = true;
+                            ++res.turnCfrDecisions;
+                        }
+                    }
+                }
+                if (!solved) {
                 // rangeEq：与训练同一口径。训练时每个决策都真算并喂给范围残差
                 // 支路，部署若固定喂 0.5，同一份权重看到的输入就和训练不同。
                 float rq = 0.5f;
@@ -599,7 +644,33 @@ SlumbotResult playSlumbot(const nn::Actor actors[2], const SlumbotConfig& cfg) {
                         ++res.rangeEqDecisions;
                     }
                 }
-                mv = policyMove(&actors[0], &actors[1], st, rng, cfg.temp, rq);
+                // 河牌 CFR 子博弈：底池够大时用范围均衡动作替换网络动作。
+                // 只换河牌（求解便宜），其它街仍走网络。
+                bool solvedRiver = false;
+                if (cfg.riverCfrIters > 0 && st.street == ST_RIVER && st.boardN == 5 &&
+                    (cfg.riverCfrMinPot <= 0 || st.pot() >= cfg.riverCfrMinPot)) {
+                    RangeObs lastOpp;
+                    RangeObs lastSelf;
+                    const int heroSeat = 1 - int(clientPos);
+                    if (slumbotLastDecisions(action, hole[0], hole[1], board, int(clientPos),
+                                             rng, lastOpp, lastSelf)) {
+                        const std::vector<float> oppRange =
+                            riverRangeAt(st, 1 - heroSeat, lastOpp, &actors[1 - heroSeat]);
+                        const std::vector<float> ownRange =
+                            riverRangeAt(st, heroSeat, lastSelf, &actors[heroSeat]);
+                        RiverCfrConfig rc;
+                        rc.iters = cfg.riverCfrIters;
+                        rc.maxRaises = cfg.riverCfrMaxRaises;
+                        rc.allin = cfg.riverCfrAllin;
+                        Move rmv{};
+                        if (riverCfrMove(st, rc, rmv, oppRange, ownRange)) {
+                            mv = rmv;
+                            solvedRiver = true;
+                            ++res.riverCfrDecisions;
+                        }
+                    }
+                }
+                if (!solvedRiver) mv = policyMove(&actors[0], &actors[1], st, rng, cfg.temp, rq);
                 // 河牌大注剥削：无人下注且底池够大时，直接按 1.5x 池下注。
                 // 这是外部范围诊断给出的最高 EV 动作（第 87 条）。
                 if (cfg.riverOverbetPot > 0.0f && st.street == ST_RIVER &&
@@ -624,6 +695,7 @@ SlumbotResult playSlumbot(const nn::Actor actors[2], const SlumbotConfig& cfg) {
                     int to = int(std::lround(double(mv.to) * double(cfg.postflopBetMult)));
                     if (to > cap) to = cap;
                     if (to > int(mv.to)) mv.to = static_cast<int16_t>(to);
+                }
                 }
             }
             // BB 3-bet 门槛：中等牌的 3-bet 在外面实测亏 2~4.5BB/手，改成跟注。

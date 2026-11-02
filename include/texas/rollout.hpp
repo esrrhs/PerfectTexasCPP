@@ -253,6 +253,14 @@ struct RolloutConfig {
     // 抽象树形状：首次下注后允许的加注次数；是否保留全下。
     int riverCfrMaxRaises = 1;
     bool riverCfrAllin = true;
+    // 转牌 CFR+ 子博弈求解器：>0 = 在自己的转牌决策上用固定 4 张公共牌 +
+    // 对手范围（按对手最近动作似然全枚举 1128 个组合）解出的均衡策略替换
+    // 网络动作。叶子 = 发河牌后 check-down 摊牌（≥1 人全下时精确；双方都
+    // 有筹码时忽略河牌下注街，是已知近似）。0 = 关。
+    int turnCfrIters = 0;
+    int turnCfrMinPot = 0;
+    int turnCfrMaxRaises = 1;
+    bool turnCfrAllin = true;
     // 河牌 CFR 当**对手**（README #109(d)）：按此概率把对手座位换成"河牌按
     // 范围均衡回应、其它街按 solid 打"的智能体。它不用手写阈值，而是从我们的
     // 动作似然估我们的范围、在整棵下注树上 regret matching，所以薄价值下注和
@@ -446,6 +454,17 @@ void setEmpiricalRangeModel(bool on);
 
 float rangeEquityAt(const HUState& now, int heroSeat, const RangeObs& last,
                     const nn::Actor* oppActor, int samples, int iters, Rng& rng);
+
+// 转牌范围：与 riverRangeFor 同一口径（目标座位在它最近一次决策处的策略
+// 似然当权重），组合空间 = 当前 4 张公共牌之外的全部两两组合（1128 个）。
+// 返回向量与 turnCombos(now) 一一对应；未归一化（求解器自己归一）。
+std::vector<float> turnRangeFor(const HUState& now, int targetSeat, const RangeObs& last,
+                                const nn::Actor* actor);
+
+// 河牌范围的部署入口（riverRangeFor 的内部实现不发散到 header）：
+// 枚举公共牌之外的 1081 个组合，用该座位最近一次决策的策略似然当权重。
+std::vector<float> riverRangeAt(const HUState& now, int targetSeat, const RangeObs& last,
+                                const nn::Actor* actor);
 
 // 脚本教师：枚举 s 的每个合法动作，用同一副牌（同一对手底牌、同一公共牌）
 // 分支续演到终局，返回每个 slot 的动作价值（净筹码 / 起始筹码）。

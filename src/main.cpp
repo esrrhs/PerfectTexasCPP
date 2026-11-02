@@ -122,6 +122,7 @@ void usage() {
         "                       [--policy actor|fold|random] [--log FILE.csv]\n"
         "                       [--allin-guard-pre F] [--allin-guard-post F]\n"
         "                       [--range-eq N] [--range-eq-iters N]\n"
+        "                       [--river-cfr N] [--river-cfr-min-pot N] [--river-cfr-raises N]\n"
         "  perfecttexas slumbot-analyze --csv FILE.csv  逐决策算事后胜率，定位漏点\n"
         "  perfecttexas allin-audit --csv FILE.csv...  全下决策审计（按座位/街/推接）\n"
         "  perfecttexas commit-audit --csv FILE.csv... 弃牌前投入审计（按投入深度/弃牌街）\n"
@@ -189,6 +190,8 @@ void usage() {
         "                  的策略似然重加权后算 vs-range 摊牌胜率（默认 0 = 关闭）\n"
         "  --range-eq-iters N rangeEq 摊牌胜率的蒙特卡洛次数（默认 48；转/河精确）\n"
         "  --range-model M  rangeEq 的对手似然：policy（默认）| empirical（Slumbot 经验表）\n"
+        "  --turn-cfr N    转牌决策用 CFR+ 子博弈求解（叶子=发河牌后 check-down 摊牌；\n"
+        "                 0=关闭，默认走网络策略；--turn-cfr-min-pot N 只在底池>=N 时求解）\n"
         "  --teacher-min-pot F 只对底池 >= F 的决策做教师标注（默认 0 = 全部）\n"
         "  --anchor-model DIR --anchor-coef F 非大池状态对冻结基座加 KL 信任域\n"
         "  --river-rule-coef F --river-rule-min-pot N 河牌大池 -> 1.5x 下注的规则蒸馏\n"
@@ -231,6 +234,13 @@ void usage() {
         "  --river-cfr-min-pot N  只在底池 >= N 筹码的河牌决策上求解（0=全部）\n"
         "  --river-cfr-raises N   抽象树里首次下注后的加注次数（默认 1）\n"
         "  --river-cfr-no-allin   抽象树里去掉全下尺寸\n"
+        "  --turn-cfr N      转牌 CFR+ 子博弈：同 --river-cfr 口径（对手范围 = 1128\n"
+        "                  个组合），叶子 = 发河牌后 check-down 摊牌（河牌全枚举\n"
+        "                  精确；≥1 人全下时整个叶子精确，双方有筹码时忽略河牌\n"
+        "                  下注街，是已知近似）\n"
+        "  --turn-cfr-min-pot N  只在底池 >= N 筹码的转牌决策上求解（0=全部）\n"
+        "  --turn-cfr-raises N   抽象树里首次下注后的加注次数（默认 1）\n"
+        "  --turn-cfr-no-allin   抽象树里去掉全下尺寸\n"
         "  --expert-prob F / --expert-samples N  专家迭代：自对局的河牌决策按概率 F 用\n"
         "                  范围搜索的 Q 当教师标签，经 --teacher-coef 蒸馏回策略\n"
         "  --temp F / --a-temp F  评估时把动作 logits 除以 F（<1 更尖，默认 1）\n"
@@ -1054,6 +1064,10 @@ int cmdEval(int argc, char** argv) {
     team.riverCfrMinPot = argInt(argc, argv, "--river-cfr-min-pot", 0);
     team.riverCfrMaxRaises = argInt(argc, argv, "--river-cfr-raises", 1);
     if (hasFlag(argc, argv, "--river-cfr-no-allin")) team.riverCfrAllin = false;
+    team.turnCfrIters = argInt(argc, argv, "--turn-cfr", 0);
+    team.turnCfrMinPot = argInt(argc, argv, "--turn-cfr-min-pot", 0);
+    team.turnCfrMaxRaises = argInt(argc, argv, "--turn-cfr-raises", 1);
+    if (hasFlag(argc, argv, "--turn-cfr-no-allin")) team.turnCfrAllin = false;
 
     texas::EvalResult r;
     if (policySearch > 0) {
@@ -1096,6 +1110,8 @@ int cmdEval(int argc, char** argv) {
     if (team.rangeSearchDefenseOnly) label += "+defonly";
     if (team.riverCfrIters > 0) label += "+rcfr" + std::to_string(team.riverCfrIters);
     if (team.riverCfrMinPot > 0) label += "+rcfrmin" + std::to_string(team.riverCfrMinPot);
+    if (team.turnCfrIters > 0) label += "+tcfr" + std::to_string(team.turnCfrIters);
+    if (team.turnCfrMinPot > 0) label += "+tcfrmin" + std::to_string(team.turnCfrMinPot);
     if (team.policyGreedy) {
         label += "+greedy";
     } else if (team.policyTemp != 1.0f) {
@@ -1190,6 +1206,10 @@ int cmdMatch(int argc, char** argv) {
     team.riverCfrMinPot = argInt(argc, argv, "--river-cfr-min-pot", 0);
     team.riverCfrMaxRaises = argInt(argc, argv, "--river-cfr-raises", 1);
     if (hasFlag(argc, argv, "--river-cfr-no-allin")) team.riverCfrAllin = false;
+    team.turnCfrIters = argInt(argc, argv, "--turn-cfr", 0);
+    team.turnCfrMinPot = argInt(argc, argv, "--turn-cfr-min-pot", 0);
+    team.turnCfrMaxRaises = argInt(argc, argv, "--turn-cfr-raises", 1);
+    if (hasFlag(argc, argv, "--turn-cfr-no-allin")) team.turnCfrAllin = false;
 
     texas::MatchLog mlog;
     const texas::EvalResult r =
@@ -1231,6 +1251,7 @@ int cmdMatch(int argc, char** argv) {
     if (team.rangeSearchMinPot > 0) labelA += "+minpot" + std::to_string(team.rangeSearchMinPot);
     if (team.rangeSearchDefenseOnly) labelA += "+defonly";
     if (team.riverCfrIters > 0) labelA += "+rcfr" + std::to_string(team.riverCfrIters);
+    if (team.turnCfrIters > 0) labelA += "+tcfr" + std::to_string(team.turnCfrIters);
     if (team.policyGreedy) {
         labelA += "+greedy";
     } else if (team.policyTemp != 1.0f) {
@@ -3699,6 +3720,12 @@ int cmdSlumbot(int argc, char** argv) {
     cfg.rangeEqIters = argInt(argc, argv, "--range-eq-iters", 48);
     cfg.rangeModel =
         argStr(argc, argv, "--range-model", "policy") == "empirical" ? 1 : 0;
+    cfg.turnCfrIters = argInt(argc, argv, "--turn-cfr", 0);
+    cfg.turnCfrMinPot = argInt(argc, argv, "--turn-cfr-min-pot", 0);
+    cfg.riverCfrIters = argInt(argc, argv, "--river-cfr", 0);
+    cfg.riverCfrMinPot = argInt(argc, argv, "--river-cfr-min-pot", 0);
+    cfg.riverCfrMaxRaises = argInt(argc, argv, "--river-cfr-raises", 1);
+    if (hasFlag(argc, argv, "--river-cfr-no-allin")) cfg.riverCfrAllin = false;
 
     texas::nn::ModelConfig mc;
     mc.hidden = argInt(argc, argv, "--hidden", 256);
@@ -3732,12 +3759,13 @@ int cmdSlumbot(int argc, char** argv) {
     const double adjSeBb100 = r.adjustedStderr / double(texas::kBigBlind) * 100.0;
     std::printf(
         "\nslumbot 结果: %d/%d 手完成（中止 %d，错误 %d，河牌大注 %d，全下 guard %d，"
-        "翻前限攻 %d，翻牌限攻 %d，BB 3-bet 限攻 %d，rangeEq 决策 %d）\n"
+        "翻前限攻 %d，翻牌限攻 %d，BB 3-bet 限攻 %d，rangeEq 决策 %d，转牌求解 %d，"
+        "河牌求解 %d）\n"
                 "  净收益 %+lld 筹码 | %+0.1f ± %.1f 筹码/手 | %+0.1f ± %.1f bb/100 | "
                 "胜 %d 负 %d 平 %d | %.1f 手/s\n",
                 r.hands, r.attempted, r.attempted - r.hands, r.errors, r.riverOverbets,
                 r.allinGuardFolds, r.preflopAggroCapped, r.flopAggroCapped, r.bb3betCapped,
-                r.rangeEqDecisions, r.winnings, per,
+                r.rangeEqDecisions, r.turnCfrDecisions, r.riverCfrDecisions, r.winnings, per,
                 r.chipsStderr, per / double(texas::kBigBlind) * 100.0, seBb100, r.wins, r.losses,
                 r.pushes, double(r.hands) / std::max(secs, 1e-6));
     std::printf("  全下调整: %+0.1f ± %.1f 筹码/手 | %+0.1f ± %.1f bb/100 | 调整 %d 手（%.0f%%）\n",

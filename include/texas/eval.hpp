@@ -72,6 +72,12 @@ struct EvalTeam {
     int riverCfrMinPot = 0;
     int riverCfrMaxRaises = 1;
     bool riverCfrAllin = true;
+    // 转牌 CFR+ 子博弈求解器（README 第八节下一步 #1）：>0 = 转牌决策改用
+    // 范围均衡动作，叶子 = 发河牌后 check-down 摊牌（≥1 人全下时精确）。
+    int turnCfrIters = 0;
+    int turnCfrMinPot = 0;
+    int turnCfrMaxRaises = 1;
+    bool turnCfrAllin = true;
     // 「读范围机器人」的对手范围里空气（诈唬）占比，见 RolloutConfig::rangerAir。
     float rangerAir = 0.28f;
     // 对手座位用河牌 CFR 均衡回应（见 RolloutConfig::oppCfrProb）。0 = 关。

@@ -76,6 +76,17 @@ struct SlumbotConfig {
     // rangeEq 的对手似然来源：0 = 我们的策略（训练同口径）；1 = 经验模型
     // （Slumbot 日志拟合的"动作类型 × 手牌百分位"密度，仅部署有意义）。
     int rangeModel = 0;
+    // 转牌 CFR+ 子博弈求解器：>0 = 转牌决策改用范围均衡动作（叶子 = 发河牌
+    // 后 check-down 摊牌；对手范围 = 1128 个组合按对手最近动作的策略似然）。
+    // 与 eval 的 --turn-cfr 同一实现；0 = 关闭（默认，转牌走网络策略）。
+    int turnCfrIters = 0;
+    int turnCfrMinPot = 0;  // 只在底池 >= 该值（筹码）的转牌决策上求解（0=全部）
+    // 河牌 CFR+ 子博弈（与内部 eval 的 --river-cfr 同一实现）。河牌求解便宜
+    // （1081 组合、每手 ~20ms），可以在外部整段开。0 = 关闭。
+    int riverCfrIters = 0;
+    int riverCfrMinPot = 0;
+    int riverCfrMaxRaises = 1;
+    bool riverCfrAllin = true;
 };
 
 struct SlumbotResult {
@@ -87,6 +98,8 @@ struct SlumbotResult {
     int bb3betCapped = 0;        // BB 中等牌 3-bet 改成跟注的次数（诊断用）
     int flopAggroCapped = 0;     // 翻牌进攻上限触发次数（诊断用）
     int rangeEqDecisions = 0;    // 真实算过 rangeEq 的决策数（诊断用）
+    int turnCfrDecisions = 0;    // 转牌子博弈求解器接管的决策数（诊断用）
+    int riverCfrDecisions = 0;   // 河牌子博弈求解器接管的决策数（诊断用）
     long long winnings = 0;  // 净筹码（正 = 我们赢）
     double chipsStderr = 0.0;  // 每手净收益的标准误（按逐手结果算）
     // 河牌前全下的手用全下时胜率折算底池（"EV 调整"），剔掉发牌运气。
@@ -121,6 +134,12 @@ bool buildSlumbotState(const std::string& action, const std::string& hole0,
 bool slumbotLastOppDecision(const std::string& action, const std::string& hole0,
                             const std::string& hole1, const std::vector<std::string>& board,
                             int clientPos, Rng& rng, RangeObs& out);
+
+// 同时重建对手与我们自己（1-clientPos 座位）的最近一次决策。转牌子博弈
+// 求解器需要**双方**范围（均衡策略取决于双方范围，见 riverCfr 的 ownRange）。
+bool slumbotLastDecisions(const std::string& action, const std::string& hole0,
+                          const std::string& hole1, const std::vector<std::string>& board,
+                          int clientPos, Rng& rng, RangeObs& lastOpp, RangeObs& lastSelf);
 
 // 全下纪律：面对会打光筹码的全下，且跟注额 >= minRisk * 剩余筹码时，
 // 手牌百分位低于阈值就返回 true（应当弃牌）。翻前用 prePct（对随机胜率），

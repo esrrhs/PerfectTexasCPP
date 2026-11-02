@@ -3,13 +3,17 @@
 #include <torch/torch.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <map>
+#include <mutex>
+#include <thread>
 
 #include "texas/ppo.hpp"
 #include "texas/rivercfr.hpp"
 #include "texas/slumbot_range_table.hpp"
 #include "texas/strength.hpp"
+#include "texas/turncfr.hpp"
 
 namespace texas {
 
@@ -706,6 +710,62 @@ std::vector<float> riverRangeFor(const HUState& now, int targetSeat, const Range
     return w;
 }
 
+// 转牌范围：与 riverRangeFor 同一口径（目标座位在它最近一次决策处的策略
+// 似然当权重），区别是组合空间 = 4 张公共牌之外的全部两两组合（1128 个）。
+// 返回向量与 turnCombos(now) 一一对应；未归一化（求解器自己归一）。
+std::vector<float> turnRangeFor(const HUState& now, int targetSeat, const RangeObs& last,
+                                const nn::Actor* actor) {
+    const std::vector<TurnCombo> combos = turnCombos(now);
+    std::vector<float> w(combos.size(), 1.0f);
+    if (actor == nullptr || now.boardN < 4) return w;
+    if (!last.valid || last.slot < 0 || last.pre.finished || last.pre.toAct != targetSeat) return w;
+
+    LegalMove olm[kNumActions];
+    const int on = legalMoves(last.pre, olm);
+    if (on <= 0) return w;
+    int observed = -1;
+    for (int k = 0; k < on; ++k) {
+        if (olm[k].slot == last.slot) observed = k;
+    }
+    if (observed < 0) return w;
+
+    std::vector<ActionOption> opts(static_cast<size_t>(on));
+    for (int k = 0; k < on; ++k) {
+        opts[static_cast<size_t>(k)].slot = olm[k].slot;
+        opts[static_cast<size_t>(k)].mv = olm[k].mv;
+        opts[static_cast<size_t>(k)].hi = olm[k].toHi;
+        encodeActionFeature(last.pre, olm[k], opts[static_cast<size_t>(k)].feat);
+    }
+
+    const int M = static_cast<int>(combos.size());
+    std::vector<Transition> tmp(static_cast<size_t>(M));
+    for (int m = 0; m < M; ++m) {
+        HUState st = last.pre;
+        st.hole[targetSeat][0] = static_cast<uint8_t>(combos[static_cast<size_t>(m)].c0);
+        st.hole[targetSeat][1] = static_cast<uint8_t>(combos[static_cast<size_t>(m)].c1);
+        Obs obs;
+        encodeObservation(st, obs, 0.5f);
+        Transition& t = tmp[static_cast<size_t>(m)];
+        t.node = obs.node;
+        t.seq = obs.seq;
+        t.actions = opts;
+        t.rangeEq = 0.5f;
+    }
+
+    torch::NoGradGuard ng;
+    torch::Tensor nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT;
+    writeTensors(tmp, nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT, false);
+    torch::Tensor logits = (*actor)->forward(nodeT, seqT, actFeatT, actSampleT, actIdT,
+                                             rangeEqT);
+    const float* lp = logits.data_ptr<float>();
+    for (int m = 0; m < M; ++m) {
+        float probs[kNumActions];
+        ppo::maskedSoftmax(lp + static_cast<size_t>(m) * kNumActions, kNumActions, probs);
+        w[static_cast<size_t>(m)] = std::max(probs[observed], 1e-4f);
+    }
+    return w;
+}
+
 Move ruleAgentMove(const HUState& s, Rng& rng) {
     std::uniform_real_distribution<float> u(0.0f, 1.0f);
     return ruleAgentMoveWithJitter(s, u(rng));
@@ -772,6 +832,11 @@ void sampleHiddenCards(const HUState& s, int seat, Rng& rng, HUState& out) {
 }
 
 }  // namespace
+
+std::vector<float> riverRangeAt(const HUState& now, int targetSeat, const RangeObs& last,
+                                const nn::Actor* actor) {
+    return riverRangeFor(now, targetSeat, last, actor);
+}
 
 void teacherActionValues(const HUState& s, int seat, std::array<float, kNumActions>& q,
                          int samples, int styles) {
@@ -2870,6 +2935,200 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         runRangeSearchActs(psActors[0], psActors[1], seat, idx);
     };
 
+    // 转牌 CFR+ 子博弈：固定 4 张公共牌，把对手范围全枚举成 1128 个组合
+    // （权重 = 它最近一次动作的策略似然），解一棵抽象下注树上的均衡，取
+    // 自己这张牌的均衡动作。叶子 = 发河牌后 check-down 摊牌（对手范围 ×
+    // 河牌全枚举，精确摊牌矩阵）。与河牌 CFR 的同一套口径：minimax 回应。
+    //
+    // 性能：范围估计按"本块待解游戏 × 1128 组合"合成一次批量前向；求解本身
+    // 是纯 C++（无 torch），用线程池并行（每局一个 TurnSolver，互不共享）。
+    //
+    // **必须分块**：一次把整批游戏的 2×1128 组合都做成 Transition 会按
+    // 每手 ~3KB × 2×1128 × 批量线性涨（批量 500 手就是 ~3GB，直接 OOM）。
+    // 一块 8 手 ≈ 110MB，前向和线程并行都仍然摊得平。
+    auto runTurnCfrChunk = [&](int seat, const std::vector<int>& idx) {
+        if (idx.empty()) return;
+        const nn::Actor* acts[2] = {psActors[0] != nullptr ? psActors[0] : &latest.actor[0],
+                                    psActors[1] != nullptr ? psActors[1] : &latest.actor[1]};
+        TurnCfrConfig tc;
+        tc.iters = cfg.turnCfrIters;
+        tc.maxRaises = cfg.turnCfrMaxRaises;
+        tc.allin = cfg.turnCfrAllin;
+
+        // 范围批量估计：每个 (游戏, 座位) 查询 = 1128 个组合换底牌前向一次，
+        // 全部查询拼成一个大 batch（与 rangeEquityFor 的批量口径相同）。
+        struct Query {
+            int gi;
+            int targetSeat;
+            std::vector<TurnCombo> combos;
+            RangeObs last;
+            std::vector<float> w;
+        };
+        std::vector<Query> queries;
+        queries.reserve(idx.size() * 2);
+        for (int gi : idx) {
+            const GameCtx& g = gs[static_cast<size_t>(gi)];
+            for (int q = 0; q < 2; ++q) {
+                const int tgt = (q == 0) ? (1 - seat) : seat;
+                Query qu;
+                qu.gi = gi;
+                qu.targetSeat = tgt;
+                qu.combos = turnCombos(g.st);
+                qu.last = g.lastAct[tgt];
+                queries.push_back(std::move(qu));
+            }
+        }
+        std::vector<Transition> tmp;
+        std::vector<int> qOfSample;
+        std::vector<int> offOfSample;  // 样本在所属 query 内的组合偏移
+        tmp.reserve(queries.size() * 1128);
+        for (size_t qi = 0; qi < queries.size(); ++qi) {
+            Query& qu = queries[qi];
+            LegalMove olm[kNumActions];
+            const int on = legalMoves(qu.last.pre, olm);
+            bool okQuery = on > 0 && qu.last.valid && qu.last.slot >= 0 &&
+                           !qu.last.pre.finished && qu.last.pre.toAct == qu.targetSeat;
+            int observed = -1;
+            if (okQuery) {
+                for (int k = 0; k < on; ++k) {
+                    if (olm[k].slot == qu.last.slot) observed = k;
+                }
+                okQuery = observed >= 0;
+            }
+            if (!okQuery) {
+                qu.w.assign(qu.combos.size(), 1.0f);
+                continue;
+            }
+            // 先给默认权重：forwardGroup 只会覆盖"似然算出来的"那部分，
+            // 漏初始化的向量是空的（曾在这里空指针崩过一次）。
+            qu.w.assign(qu.combos.size(), 1.0f);
+            std::vector<ActionOption> opts(static_cast<size_t>(on));
+            for (int k = 0; k < on; ++k) {
+                opts[static_cast<size_t>(k)].slot = olm[k].slot;
+                opts[static_cast<size_t>(k)].mv = olm[k].mv;
+                opts[static_cast<size_t>(k)].hi = olm[k].toHi;
+                encodeActionFeature(qu.last.pre, olm[k], opts[static_cast<size_t>(k)].feat);
+            }
+            int off = 0;
+            for (const TurnCombo& c : qu.combos) {
+                HUState st = qu.last.pre;
+                st.hole[qu.targetSeat][0] = static_cast<uint8_t>(c.c0);
+                st.hole[qu.targetSeat][1] = static_cast<uint8_t>(c.c1);
+                Obs obs;
+                encodeObservation(st, obs, 0.5f);
+                Transition t;
+                t.node = obs.node;
+                t.seq = obs.seq;
+                t.actions = opts;
+                t.rangeEq = 0.5f;
+                tmp.push_back(std::move(t));
+                qOfSample.push_back(static_cast<int>(qi));
+                offOfSample.push_back(off);
+                ++off;
+            }
+        }
+        // 按座位网络分组前向（对手座位被 forceActor 替换时单独一组）。
+        auto forwardGroup = [&](const std::vector<int>& group, const nn::Actor* actor) {
+            if (group.empty() || actor == nullptr) return;
+            std::vector<Transition> gtmp;
+            gtmp.reserve(group.size());
+            for (int m : group) gtmp.push_back(tmp[static_cast<size_t>(m)]);
+            torch::NoGradGuard ng;
+            torch::Tensor nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT;
+            writeTensors(gtmp, nodeT, seqT, extraT, actFeatT, actSampleT, actIdT, rangeEqT,
+                         false);
+            torch::Tensor logits =
+                (*actor)->forward(nodeT, seqT, actFeatT, actSampleT, actIdT, rangeEqT);
+            const float* lp = logits.data_ptr<float>();
+            for (size_t k = 0; k < group.size(); ++k) {
+                const int m = group[k];
+                Query& qu = queries[static_cast<size_t>(qOfSample[static_cast<size_t>(m)])];
+                float probs[kNumActions];
+                ppo::maskedSoftmax(lp + static_cast<size_t>(k) * kNumActions, kNumActions,
+                                   probs);
+                int observed = -1;
+                const Transition& t = tmp[static_cast<size_t>(m)];
+                for (size_t a = 0; a < t.actions.size(); ++a) {
+                    if (t.actions[a].slot == qu.last.slot) observed = static_cast<int>(a);
+                }
+                if (observed < 0) continue;
+                const int off = offOfSample[static_cast<size_t>(m)];
+                qu.w[static_cast<size_t>(off)] = std::max(probs[observed], 1e-4f);
+            }
+        };
+        {
+            const nn::Actor* oppActor =
+                (cfg.forceActor != nullptr && cfg.forceActorSeat == 1 - seat) ? cfg.forceActor
+                                                                              : nullptr;
+            std::vector<int> g0, g1, gForce;
+            for (size_t m = 0; m < tmp.size(); ++m) {
+                const Query& qu = queries[static_cast<size_t>(qOfSample[m])];
+                if (qu.targetSeat == seat) {
+                    g0.push_back(static_cast<int>(m));
+                } else if (oppActor != nullptr) {
+                    gForce.push_back(static_cast<int>(m));
+                } else {
+                    g1.push_back(static_cast<int>(m));
+                }
+            }
+            forwardGroup(g0, acts[seat]);
+            forwardGroup(g1, acts[1 - seat]);
+            forwardGroup(gForce, oppActor);
+        }
+
+        // 并行求解（纯 C++，无共享状态）。解不出来回退网络策略。
+        const int nThreads = std::max(1, std::min(8, int(std::thread::hardware_concurrency())));
+        std::vector<int> fallback;
+        std::mutex fbMtx;
+        std::vector<std::pair<int, Move>> solved(queries.size() / 2);
+        std::vector<unsigned char> solvedOk(queries.size() / 2, 0);
+        const int nSolves = static_cast<int>(queries.size() / 2);
+        std::vector<std::thread> workers;
+        std::atomic<int> nextSolve{0};
+        for (int w = 0; w < nThreads; ++w) {
+            workers.emplace_back([&, w]() {
+                (void)w;
+                while (true) {
+                    const int q = nextSolve.fetch_add(1);
+                    if (q >= nSolves) break;
+                    const Query& oppQ = queries[static_cast<size_t>(2 * q)];
+                    const Query& ownQ = queries[static_cast<size_t>(2 * q + 1)];
+                    const GameCtx& g = gs[static_cast<size_t>(oppQ.gi)];
+                    Move mv{};
+                    if (turnCfrMove(g.st, tc, mv, oppQ.w, ownQ.w)) {
+                        solved[static_cast<size_t>(q)] = {oppQ.gi, mv};
+                        solvedOk[static_cast<size_t>(q)] = 1;
+                    } else {
+                        std::lock_guard<std::mutex> lk(fbMtx);
+                        fallback.push_back(oppQ.gi);
+                    }
+                }
+            });
+        }
+        for (std::thread& t : workers) t.join();
+        for (int q = 0; q < nSolves; ++q) {
+            if (!solvedOk[static_cast<size_t>(q)]) continue;
+            GameCtx& g = gs[static_cast<size_t>(solved[static_cast<size_t>(q)].first)];
+            play(g, seat, solved[static_cast<size_t>(q)].second);
+            ++stats.decisions;
+            if (solved[static_cast<size_t>(q)].second.kind == MK_ALLIN) ++stats.allinDecisions;
+            if (solved[static_cast<size_t>(q)].second.kind == MK_FOLD) ++stats.folds;
+            if (g.st.terminal()) finishGame(g);
+        }
+        if (!fallback.empty()) {
+            runBatch(latest.actor[seat], &latest.critic[seat], seat, fallback,
+                     /*withEnsemble=*/true, cfg.policyTemp, cfg.policyGreedy, cfg.amountMid,
+                     cfg.preflopRaiseMult, cfg.postflopBetMult);
+        }
+    };
+    auto runTurnCfr = [&](int seat, const std::vector<int>& idx) {
+        constexpr int kChunk = 8;
+        for (size_t b = 0; b < idx.size(); b += kChunk) {
+            const size_t e = std::min(idx.size(), b + kChunk);
+            runTurnCfrChunk(seat, std::vector<int>(idx.begin() + b, idx.begin() + e));
+        }
+    };
+
     // 河牌 CFR+ 子博弈：固定公共牌，把对手范围全枚举成 1081 个组合（权重 =
     // 它最近一次动作的策略似然），解一棵抽象下注树上的均衡，取自己这张牌的
     // 均衡动作。和一步前瞻搜索的区别：这里的对手按均衡回应，而不是按我们的
@@ -3018,7 +3277,27 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
                 }
             }
 
-            if (cfg.riverCfrIters > 0) {
+            if (cfg.turnCfrIters > 0) {
+                // 转牌：CFR+ 子博弈；其它街：原策略。
+                std::vector<int> solvedIdx;
+                std::vector<int> otherIdx;
+                for (int gi : latestIdx) {
+                    const GameCtx& g = gs[static_cast<size_t>(gi)];
+                    const bool bigEnough =
+                        cfg.turnCfrMinPot <= 0 || g.st.pot() >= cfg.turnCfrMinPot;
+                    if (g.st.street == ST_TURN && g.st.boardN >= 4 && bigEnough) {
+                        solvedIdx.push_back(gi);
+                    } else {
+                        otherIdx.push_back(gi);
+                    }
+                }
+                runTurnCfr(seat, solvedIdx);
+                if (!otherIdx.empty()) {
+                    runBatch(latest.actor[seat], &latest.critic[seat], seat, otherIdx,
+                             /*withEnsemble=*/true, cfg.policyTemp, cfg.policyGreedy,
+                             cfg.amountMid, cfg.preflopRaiseMult, cfg.postflopBetMult);
+                }
+            } else if (cfg.riverCfrIters > 0) {
                 // 河牌：CFR+ 子博弈；其它街：原策略。
                 std::vector<int> solvedIdx;
                 std::vector<int> otherIdx;

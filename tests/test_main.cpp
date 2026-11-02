@@ -26,6 +26,7 @@
 #include "texas/rivercfr.hpp"
 #include "texas/slumbot.hpp"
 #include "texas/strength.hpp"
+#include "texas/turncfr.hpp"
 
 namespace {
 
@@ -1065,6 +1066,23 @@ void testSlumbotLastOpp() {
     CHECK(texas::slumbotLastOppDecision("b20000c", "Qs", "8h", {}, /*clientPos=*/0, rng, last));
     CHECK(last.valid);
     CHECK(last.slot == texas::kSlotAllIn);
+
+    // 双方最近一次决策（转牌求解器要双方范围）。
+    texas::RangeObs lastOpp, lastSelf;
+    CHECK(texas::slumbotLastDecisions("b200c/kb400", "Qs", "8h", {"Kd", "7c", "2s"},
+                                      /*clientPos=*/0, rng, lastOpp, lastSelf));
+    CHECK(lastOpp.valid);
+    CHECK(lastSelf.valid);
+    CHECK(lastOpp.pre.street == texas::ST_FLOP);      // 对手最近决策 = 翻牌 b400
+    CHECK(int(lastOpp.pre.toAct) == 0);
+    CHECK(lastSelf.pre.street == texas::ST_FLOP);     // 我们最近决策 = 翻牌过牌
+    CHECK(int(lastSelf.pre.toAct) == 1);
+    CHECK(lastSelf.slot == texas::kSlotCheckCall);
+    // 我们还没行动过：只有对手决策。
+    CHECK(texas::slumbotLastDecisions("b200", "Qs", "8h", {}, /*clientPos=*/0, rng, lastOpp,
+                                      lastSelf));
+    CHECK(lastOpp.valid);
+    CHECK(!lastSelf.valid);
 }
 
 // ---------------------------------------------------------------- 全下 EV 调整
@@ -2156,6 +2174,226 @@ void testRiverCfr() {
     CHECK(!texas::riverCfrMove(st, cfg4, mv, {}, {}, nullptr));
 }
 
+// 转牌 CFR+ 求解器：组合空间、check-down 叶子 vs 暴力枚举、收敛、sanitiy、合法性。
+void testTurnCfr() {
+    section("转牌 CFR+ 求解");
+
+    texas::Card board[5] = {texas::parseCard("Ah"), texas::parseCard("Kd"),
+                            texas::parseCard("7c"), texas::parseCard("3s"), 0};
+    texas::Card mine[2] = {texas::parseCard("Qd"), texas::parseCard("Qc")};
+    texas::Card theirs[2] = {texas::parseCard("9s"), texas::parseCard("8s")};
+    texas::HUState st = texas::makeState(mine, theirs, board, 4);
+
+    const std::vector<texas::TurnCombo> combos = texas::turnCombos(st);
+    CHECK(static_cast<int>(combos.size()) == texas::kTurnComboCount);
+    bool noBoard = true;
+    bool distinct = true;
+    std::set<std::pair<int, int>> seen;
+    for (const texas::TurnCombo& c : combos) {
+        for (int i = 0; i < 4; ++i) {
+            if (c.c0 == board[i] || c.c1 == board[i]) noBoard = false;
+        }
+        if (c.c0 == c.c1) distinct = false;
+        if (!seen.insert({int(c.c0), int(c.c1)}).second) distinct = false;
+    }
+    CHECK(noBoard);
+    CHECK(distinct);
+
+    // 转牌决策点：双方各投 500，底池 1000，无下注。
+    texas::HUState turn = st;
+    turn.street = texas::ST_TURN;
+    turn.boardN = 4;
+    turn.toAct = 0;
+    turn.contrib[0] = turn.contrib[1] = 500;
+    turn.total[0] = turn.total[1] = 500;
+    turn.stack[0] = turn.stack[1] = texas::kStartingStack - 500;
+    turn.lastRaiseTo = 0;
+    turn.lastRaiseSize = texas::kBigBlind;
+
+    // 暴力参考：给定我方底牌、叶子底池与"我们相对根节点多投的额"，双方无
+    // 河牌下注直接摊牌时的平均收益 = mean_{对手组合 j, 河牌 r} u(i, j, r)。
+    auto bruteLeaf = [&](texas::Card h0, texas::Card h1, int potF, int eHero) {
+        bool used[texas::kNumCards] = {};
+        for (int i = 0; i < 4; ++i) used[static_cast<size_t>(board[i])] = true;
+        used[static_cast<size_t>(h0)] = true;
+        used[static_cast<size_t>(h1)] = true;
+        double sum = 0.0;
+        long cnt = 0;
+        for (int a = 0; a < texas::kNumCards; ++a) {
+            if (used[static_cast<size_t>(a)]) continue;
+            for (int b = a + 1; b < texas::kNumCards; ++b) {
+                if (used[static_cast<size_t>(b)]) continue;
+                for (int r = 0; r < texas::kNumCards; ++r) {
+                    if (r == a || r == b) continue;
+                    if (used[static_cast<size_t>(r)]) continue;
+                    texas::Card hh[7] = {h0, h1, board[0], board[1], board[2], board[3],
+                                         static_cast<texas::Card>(r)};
+                    texas::Card oh[7] = {static_cast<texas::Card>(a), static_cast<texas::Card>(b),
+                                         board[0], board[1], board[2], board[3],
+                                         static_cast<texas::Card>(r)};
+                    const int hs = texas::evaluate7(hh);
+                    const int os = texas::evaluate7(oh);
+                    double u;
+                    if (hs > os) u = double(potF - eHero);
+                    else if (hs < os) u = double(-eHero);
+                    else u = 0.5 * double(potF) - double(eHero);
+                    sum += u;
+                    ++cnt;
+                }
+            }
+        }
+        CHECK(cnt == 1035L * 44L);
+        return sum / double(cnt);
+    };
+
+    // 全下跟注：对手推 20000，我们跟注 = 全下 -> 跟注 EV 必须等于暴力摊牌均值。
+    {
+        texas::HUState fac = turn;
+        fac.contrib[1] = 20000;
+        fac.total[1] = 20000;
+        fac.stack[1] = 0;
+        fac.lastRaiseTo = 20000;
+        fac.lastRaiseSize = 19500;
+        texas::TurnCfrConfig c;
+        c.iters = 5;  // 树只有 fold/call：跟注 EV 与迭代无关，本来就精确
+        const texas::TurnCfrResult r = texas::turnCfrSolve(fac, 0, {}, {}, c);
+        CHECK(r.valid);
+        CHECK(r.root.size() == 2);
+        double callEv = 0.0;
+        bool sawFold = false;
+        for (const texas::TurnRootAction& a : r.root) {
+            if (a.mv.kind == texas::MK_FOLD) {
+                sawFold = true;
+                CHECK_NEAR(a.ev, 0.0, 1e-6);
+            } else {
+                callEv = a.ev;
+            }
+        }
+        CHECK(sawFold);
+        const double brute = bruteLeaf(mine[0], mine[1], 40000, 19500);
+        CHECK_NEAR(callEv, brute, 2.0);
+        // 空气牌面对全下必须弃牌、坚果必须跟
+        texas::Move mv{};
+        CHECK(texas::turnCfrMove(fac, c, mv, {}, {}, nullptr));
+        CHECK(mv.kind == texas::MK_CALL);  // QQ 对均匀范围是强牌
+        texas::HUState air = fac;
+        air.hole[0][0] = static_cast<uint8_t>(texas::parseCard("9h"));
+        air.hole[0][1] = static_cast<uint8_t>(texas::parseCard("2c"));
+        CHECK(texas::turnCfrMove(air, c, mv, {}, {}, nullptr));
+        CHECK(mv.kind == texas::MK_FOLD);
+    }
+
+    // 半池跟注（双方都还有筹码）：叶子是 check-down 近似，但数学必须与暴力
+    // 摊牌均值逐位一致。
+    {
+        texas::HUState fac = turn;
+        fac.contrib[1] = 1000;
+        fac.total[1] = 1000;
+        fac.stack[1] = texas::kStartingStack - 1000;
+        fac.lastRaiseTo = 1000;
+        fac.lastRaiseSize = 500;
+        texas::TurnCfrConfig c;
+        c.iters = 5;
+        const texas::TurnCfrResult r = texas::turnCfrSolve(fac, 0, {}, {}, c);
+        CHECK(r.valid);
+        CHECK(r.root.size() >= 4);  // fold / call / 0.5x / 1x / 2x / allin
+        double callEv = 0.0;
+        for (const texas::TurnRootAction& a : r.root) {
+            if (a.mv.kind == texas::MK_CALL) callEv = a.ev;
+        }
+        const double brute = bruteLeaf(mine[0], mine[1], 2000, 500);
+        CHECK_NEAR(callEv, brute, 2.0);
+    }
+
+    // 过牌-过牌叶子（对手全下、只能"过牌"）：同样精确。
+    {
+        texas::HUState ck = turn;
+        ck.stack[1] = 0;
+        ck.allin[1] = 1;
+        texas::TurnCfrConfig c;
+        c.iters = 5;
+        const texas::TurnCfrResult r = texas::turnCfrSolve(ck, 0, {}, {}, c);
+        CHECK(r.valid);
+        double checkEv = 0.0;
+        for (const texas::TurnRootAction& a : r.root) {
+            if (a.mv.kind == texas::MK_CHECK) checkEv = a.ev;
+        }
+        const double brute = bruteLeaf(mine[0], mine[1], 1000, 0);
+        CHECK_NEAR(checkEv, brute, 2.0);
+    }
+
+    // 收敛：迭代越多可利用度越小；常和不变式 brGap ≥ 0。
+    {
+        texas::TurnCfrConfig c20;
+        c20.iters = 20;
+        const texas::TurnCfrResult r20 = texas::turnCfrSolve(turn, 0, {}, {}, c20);
+        texas::TurnCfrConfig c80;
+        c80.iters = 80;
+        const texas::TurnCfrResult r80 = texas::turnCfrSolve(turn, 0, {}, {}, c80);
+        CHECK(r20.valid);
+        CHECK(r80.valid);
+        CHECK(r80.nodes > 5);
+        CHECK(r80.root.size() >= 3);
+        double probSum = 0.0;
+        bool finite = true;
+        for (const texas::TurnRootAction& a : r80.root) {
+            probSum += a.prob;
+            if (!(std::isfinite(a.ev) && std::isfinite(a.prob))) finite = false;
+            if (!(a.ev > -3.0 * texas::kStartingStack && a.ev < 3.0 * texas::kStartingStack)) {
+                finite = false;
+            }
+        }
+        CHECK(finite);
+        CHECK(std::fabs(probSum - 1.0) < 1e-4);
+        double mix = 0.0;
+        for (const texas::TurnRootAction& a : r80.root) mix += a.prob * a.ev;
+        CHECK(std::fabs(mix - r80.rootValue) < 1e-6);
+        CHECK(r80.brGap < r20.brGap);
+        CHECK(r80.brGap >= -0.5);
+        CHECK(r20.brGap >= -0.5);
+        CHECK(r80.brGap < 500.0);
+        // 可复现
+        const texas::TurnCfrResult again = texas::turnCfrSolve(turn, 0, {}, {}, c80);
+        CHECK(again.root.size() == r80.root.size());
+        if (again.root.size() == r80.root.size()) {
+            for (size_t i = 0; i < again.root.size(); ++i) {
+                CHECK(again.root[i].mv.kind == r80.root[i].mv.kind);
+                CHECK(std::fabs(again.root[i].ev - r80.root[i].ev) < 1e-6);
+            }
+        }
+    }
+
+    // turnCfrMove 合法性 + 拒绝非转牌局面
+    {
+        texas::TurnCfrConfig c;
+        c.iters = 15;
+        texas::Move mv{};
+        CHECK(texas::turnCfrMove(turn, c, mv, {}, {}, nullptr));
+        texas::LegalMove lm[texas::kNumActions];
+        const int nlm = texas::legalMoves(turn, lm);
+        bool legal = false;
+        for (int i = 0; i < nlm; ++i) {
+            if (mv.kind == texas::MK_RAISE || mv.kind == texas::MK_ALLIN) {
+                if (texas::canRaiseTo(turn, int(mv.to))) legal = true;
+            } else if (lm[i].mv.kind == mv.kind) {
+                legal = true;
+            }
+        }
+        CHECK(legal);
+        // 河牌局面应拒绝（那是 riverCfr 的活）
+        texas::HUState rv = turn;
+        rv.street = texas::ST_RIVER;
+        rv.boardN = 5;
+        rv.board[4] = static_cast<uint8_t>(texas::parseCard("2h"));
+        CHECK(!texas::turnCfrMove(rv, c, mv, {}, {}, nullptr));
+        // 翻牌局面应拒绝
+        texas::HUState fl = turn;
+        fl.street = texas::ST_FLOP;
+        fl.boardN = 3;
+        CHECK(!texas::turnCfrMove(fl, c, mv, {}, {}, nullptr));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -2177,6 +2415,7 @@ int main() {
     testPolicySearch();
     testRangeSearch();
     testRiverCfr();
+    testTurnCfr();
     testSlumbotState();
     testSlumbotLastOpp();
     testAllinAdjusted();

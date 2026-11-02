@@ -57,6 +57,10 @@ void applyTeam(RolloutConfig& cfg, const EvalTeam& team) {
     cfg.riverCfrMinPot = team.riverCfrMinPot;
     cfg.riverCfrMaxRaises = team.riverCfrMaxRaises;
     cfg.riverCfrAllin = team.riverCfrAllin;
+    cfg.turnCfrIters = team.turnCfrIters;
+    cfg.turnCfrMinPot = team.turnCfrMinPot;
+    cfg.turnCfrMaxRaises = team.turnCfrMaxRaises;
+    cfg.turnCfrAllin = team.turnCfrAllin;
     cfg.rangerAir = team.rangerAir;
     if (team.oppCfrIters > 0) {
         cfg.oppCfrProb = 1.0f;  // 评估路径：整局都用同一个对手，不混联赛

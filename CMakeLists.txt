@@ -37,6 +37,7 @@ add_library(perfecttexas_core STATIC
   src/eval.cpp
   src/slumbot.cpp
   src/rivercfr.cpp
+  src/turncfr.cpp
 )
 target_include_directories(perfecttexas_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
