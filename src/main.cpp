@@ -82,7 +82,8 @@ void usage() {
         "\n"
         "用法:\n"
         "  perfecttexas train [--updates N] [--games N] [--lr F] [--hidden N] [--lstm N]\n"
-        "                     [--out DIR] [--resume DIR] [--freeze-opponent DIR] [--mps] [--threads N]\n"
+        "                     [--out DIR] [--resume DIR] [--freeze-opponent DIR] [--threads N]\n"
+        "                     [--device auto|cpu|cuda|mps] [--mps]（采样恒在 CPU；设备只跑 PPO 更新）\n"
         "                     [--freeze-temp F] [--freeze-greedy]\n"
         "                     [--shared-actor]\n"
         "                     [--workers N] [--league F] [--rule-prob F] [--random-prob F]\n"
@@ -136,9 +137,13 @@ void usage() {
         "                     用日志里 Slumbot 的动作做行为克隆，得到它的对手模型\n"
         "  perfecttexas policy-stats --resume DIR [--hands N] [--temp F]\n"
         "                     自对局动作分布（翻前开牌/BB 应对/翻牌下注频率）\n"
+        "  perfecttexas bench-device [--iters N] [--batch N]...  CPU/MPS/CUDA 前后向基准\n"
         "  perfecttexas bench  [--hands N]\n"
         "\n"
         "说明:\n"
+        "  --device auto|cpu|cuda|mps  训练设备（默认 auto：CUDA > MPS > CPU）。注意\n"
+        "                  rollout/评估始终在 CPU，只有 PPO 更新跑在设备上；小 batch 在\n"
+        "                  MPS 上反而更慢，默认 minibatch 因此按设备取 512（CPU 仍是 128）\n"
         "  --freeze-opponent DIR 只用该检查点当对手，训练 best response（关掉联赛）\n"
         "  --freeze-temp F / --freeze-greedy  冻结对手侧的动作提取（默认同训练）\n"
         "  --league F      一局里对手是历史快照的概率（默认 0.30）\n"
@@ -321,9 +326,129 @@ bool buildTeam(texas::EvalTeam& team, const texas::nn::Actor actors[2],
 }
 
 torch::Device pickDevice(int argc, char** argv) {
-    if (hasFlag(argc, argv, "--mps") && torch::mps::is_available()) return torch::kMPS;
+    const std::string spec = argStr(argc, argv, "--device", "");
+    if (spec == "cpu") return torch::kCPU;
+    if (spec == "cuda") {
+        if (!torch::cuda::is_available()) {
+            std::printf("!! --device cuda 不可用（未编译 CUDA 或没有 GPU），回退 cpu\n");
+            return torch::kCPU;
+        }
+        return torch::kCUDA;
+    }
+    if (spec == "mps" || hasFlag(argc, argv, "--mps")) {
+        if (!torch::mps::is_available()) {
+            std::printf("!! --device mps 不可用（LibTorch 无 MPS 后端），回退 cpu\n");
+            return torch::kCPU;
+        }
+        return torch::kMPS;
+    }
+    // auto：有 CUDA 用 CUDA，否则 CPU。**不自动选 MPS**：bench-device 实测
+    // 256×128 网络在 M1 Pro 上 MPS 端到端比 CPU 慢 2~5×（小 kernel 启动 +
+    // 每步同步），只有显式 --device mps 才用。
+    if (torch::cuda::is_available()) return torch::kCUDA;
     return torch::kCPU;
 }
+
+const char* deviceName(const torch::Device& d) {
+    switch (d.type()) {
+        case torch::kCUDA: return "cuda";
+        case torch::kMPS: return "mps";
+        default: return "cpu";
+    }
+}
+
+// 训练/推理设备基准：同一套 Actor 在 CPU 与 MPS/CUDA 上跑不同 batch 的
+// 前向与"前向+反向+优化器步"，用来决定 --device 的默认值和最优 minibatch。
+// 小 batch 会被 kernel 启动/同步开销吃掉，必须实测，不能假设 GPU 一定更快。
+int cmdBenchDevice(int argc, char** argv) {
+    const int iters = argInt(argc, argv, "--iters", 8);
+    texas::nn::ModelConfig mc;
+    mc.hidden = argInt(argc, argv, "--hidden", 256);
+    mc.lstmHidden = argInt(argc, argv, "--lstm", 128);
+    std::printf("torch %s | cpu_threads=%d | cuda=%d | mps=%d\n", TORCH_VERSION,
+                torch::get_num_threads(), int(torch::cuda::is_available()),
+                int(torch::mps::is_available()));
+    std::vector<int64_t> batches;
+    for (const std::string& tok : argValues(argc, argv, "--batch")) {
+        batches.push_back(std::atoll(tok.c_str()));
+    }
+    if (batches.empty()) batches = {32, 64, 128, 256, 512, 1024, 2048};
+
+    std::vector<torch::Device> devs{torch::kCPU};
+    if (torch::mps::is_available()) devs.push_back(torch::kMPS);
+    if (torch::cuda::is_available()) devs.push_back(torch::kCUDA);
+
+    auto makeTensors = [&](int64_t B, const torch::Device& dev) {
+        const int64_t L = B * 5;
+        auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(dev);
+        torch::Tensor node = torch::rand({B, texas::kNodeInput}, opts);
+        torch::Tensor seq = torch::rand({B, texas::kHistSteps, texas::kHistDim}, opts);
+        torch::Tensor feat = torch::rand({L, texas::kActionInput}, opts);
+        torch::Tensor sample = torch::randint(0, B, {L},
+                            torch::TensorOptions().dtype(torch::kLong).device(dev));
+        torch::Tensor id = torch::randint(0, texas::kNumActions, {L},
+                          torch::TensorOptions().dtype(torch::kLong).device(dev));
+        torch::Tensor rq = torch::rand({B}, opts);
+        return std::make_tuple(node, seq, feat, sample, id, rq);
+    };
+
+    std::printf("\n%-5s %6s %14s %14s\n", "dev", "batch", "forward ms", "train ms");
+    for (const torch::Device& dev : devs) {
+        for (int64_t B : batches) {
+            texas::nn::Actor actor(std::make_shared<texas::nn::ActorImpl>(mc));
+            actor->to(dev);
+            actor->train();
+            auto opt = std::make_unique<torch::optim::Adam>(
+                actor->parameters(), torch::optim::AdamOptions(1e-4));
+            auto tup = makeTensors(B, dev);
+            auto& node = std::get<0>(tup);
+            auto& seq = std::get<1>(tup);
+            auto& feat = std::get<2>(tup);
+            auto& sample = std::get<3>(tup);
+            auto& id = std::get<4>(tup);
+            auto& rq = std::get<5>(tup);
+
+            auto sync = [&]() {
+                if (dev.type() == torch::kMPS) torch::mps::synchronize();
+                if (dev.type() == torch::kCUDA) torch::cuda::synchronize();
+            };
+            // 预热：第一次前向会触发内核编译/内存分配，不计入。
+            for (int k = 0; k < 2; ++k) {
+                actor->forward(node, seq, feat, sample, id, rq);
+                sync();
+            }
+            // 吞吐口径：一段内不逐次同步（GPU 是异步队列），只在段末同步一次。
+            // 真实训练要的是吞吐，不是单次延迟。
+            sync();
+            auto t1 = std::chrono::steady_clock::now();
+            for (int k = 0; k < iters; ++k) {
+                actor->forward(node, seq, feat, sample, id, rq);
+            }
+            sync();
+            const double fwdMs =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1)
+                    .count() / double(iters);
+
+            sync();
+            auto t2 = std::chrono::steady_clock::now();
+            for (int k = 0; k < iters; ++k) {
+                auto logits = actor->forward(node, seq, feat, sample, id, rq);
+                auto loss = logits.sum();
+                opt->zero_grad();
+                loss.backward();
+                opt->step();
+            }
+            sync();
+            const double trMs =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2)
+                    .count() / double(iters);
+            std::printf("%-5s %6lld %14.3f %14.3f\n", deviceName(dev),
+                        static_cast<long long>(B), fwdMs, trMs);
+        }
+    }
+    return 0;
+}
+
 
 // ---------------------------------------------------------------- train
 
@@ -350,11 +475,7 @@ int cmdTrain(int argc, char** argv) {
 
     const torch::Device device = pickDevice(argc, argv);
     if (hwThreads > 0) torch::set_num_threads(hwThreads);
-    if (workers > 1 && device.type() == torch::kMPS) {
-        // MPS 后端不保证多线程共享模块的安全，退回单线程采样。
-        workers = 1;
-        std::printf("!! --workers 与 --mps 不兼容，采样线程数退回 1\n");
-    }
+    // 采样始终在 CPU 上跑（行动模型留在 CPU），所以 MPS/CUDA 不再限制 --workers。
 
     // 预热牌力模型：桶分配是懒初始化的 mutable 缓存，第一次调用会写表。
     // 多线程采样时必须先在主线程把它初始化好，否则首轮会竞争。
@@ -463,7 +584,11 @@ int cmdTrain(int argc, char** argv) {
     const float entropyFinal =
         static_cast<float>(argDouble(argc, argv, "--entropy-final", pcfg.entCoef));
     pcfg.epochs = argInt(argc, argv, "--epochs", 4);
-    pcfg.minibatch = argInt(argc, argv, "--minibatch", 128);
+    // minibatch 默认值：CPU 128（历史配方）；设备上 512（bench-device 实测
+    // MPS 在 batch 512 的每样本训练吞吐约为 128 的 2 倍，同时保留足够多的
+    // 优化步数；更大的 1024/2048 吞吐更高，但会改变 PPO 的更新节奏）。
+    pcfg.minibatch = argInt(argc, argv, "--minibatch",
+                            device.type() == torch::kCPU ? 128 : 1024);
     pcfg.criticWeightDecay = static_cast<float>(argDouble(argc, argv, "--critic-weight-decay", 0.0));
     // critic 在每轮策略更新之后额外跑的 epoch 数。默认 0：600 轮同种子 A/B
     // 显示额外 epoch 越多、跨批泛化越差（README 第八节第 12 条）。
@@ -504,12 +629,64 @@ int cmdTrain(int argc, char** argv) {
                     pcfg.anchorCoef, pcfg.anchorMaxPot);
     }
 
+    // 设备与行动模型分离：rollout / 评估始终用 CPU 上的 models（避免每个决策
+    // 都做一次 H2D 拷贝，也避免 MPS 在多线程采样下不安全）；Learner 用一份
+    // 设备副本训练，每轮更新后把权重同步回 CPU。
+    //
+    // benchmark（bench-device，Apple M1 Pro 16 核 GPU）：forward 在 batch 128
+    // 时 MPS 是 CPU 的 ~3.8×；训练步在 batch 128 只有 ~1.3×，batch 1024 才
+    // ~2.1×。所以 GPU 的收益主要来自"更大的 minibatch + 推理"，不是小 batch。
+    const bool onDevice = device.type() != torch::kCPU;
+    texas::nn::Actor trainActor[2];
+    texas::nn::Critic trainCritic[2];
+    for (int s = 0; s < 2; ++s) {
+        if (onDevice) {
+            trainActor[s] = texas::nn::Actor(std::make_shared<texas::nn::ActorImpl>(mc));
+            trainCritic[s] = texas::nn::Critic(std::make_shared<texas::nn::CriticImpl>(mc));
+        } else {
+            trainActor[s] = models.actor[s];
+            trainCritic[s] = models.critic[s];
+        }
+    }
+    if (sharedActor && onDevice) trainActor[1] = trainActor[0];
+
     std::unique_ptr<texas::Learner> learners[2];
     for (int s = 0; s < 2; ++s) {
-        learners[s] = std::make_unique<texas::Learner>(models.actor[s], models.critic[s], pcfg, device);
+        learners[s] = std::make_unique<texas::Learner>(trainActor[s], trainCritic[s], pcfg, device);
         if (!anchorDir.empty()) learners[s]->anchor = &anchorActor[s];
         if (!resumeDir.empty()) learners[s]->loadOptimizers(resumeDir);
     }
+
+    // libtorch 的 C++ 前端没有 state_dict；同架构的参数顺序是确定的，按序 copy_。
+    // copy_ 支持跨设备（CPU -> MPS/CUDA），所以同步两个方向都用同一个函数。
+    auto copyParams = [](torch::nn::Module& dst, const torch::nn::Module& src) {
+        auto dp = dst.parameters();
+        auto sp = src.parameters();
+        if (dp.size() != sp.size()) return false;
+        torch::NoGradGuard ng;
+        for (size_t i = 0; i < dp.size(); ++i) dp[i].data().copy_(sp[i].data());
+        return true;
+    };
+    if (onDevice) {
+        for (int s = 0; s < 2; ++s) {
+            copyParams(*trainActor[s], *models.actor[s]);
+            copyParams(*trainCritic[s], *models.critic[s]);
+        }
+        if (device.type() == torch::kMPS) torch::mps::synchronize();
+        if (device.type() == torch::kCUDA) torch::cuda::synchronize();
+    }
+
+    // 每轮更新后把设备副本写回 CPU 行动模型；MPS/CUDA 先同步再拷，避免读到
+    // 还没算完的队列。权重只有 ~10MB，开销远小于一轮 rollout。
+    auto syncBackToCpu = [&]() {
+        if (!onDevice) return;
+        if (device.type() == torch::kMPS) torch::mps::synchronize();
+        if (device.type() == torch::kCUDA) torch::cuda::synchronize();
+        for (int s = 0; s < 2; ++s) {
+            copyParams(*models.actor[s], *trainActor[s]);
+            copyParams(*models.critic[s], *trainCritic[s]);
+        }
+    };
 
     texas::HistoricalPool pool;
     texas::RolloutConfig rcfg;
@@ -662,7 +839,7 @@ int cmdTrain(int argc, char** argv) {
     }
     std::printf("  hidden=%lld lstm=%lld | device=%s | games/update=%d | workers=%d\n",
                 static_cast<long long>(mc.hidden), static_cast<long long>(mc.lstmHidden),
-                device.type() == torch::kMPS ? "mps" : "cpu", games, workers);
+                deviceName(device), games, workers);
     if (rcfg.teacher) {
         std::printf("  teacher: coef=%.2f temp=%.3f prob=%.2f samples=%d styles=%d decay=%d\n",
                     pcfg.teacherCoef, pcfg.teacherTemp, rcfg.teacherProb, rcfg.teacherSamples,
@@ -940,6 +1117,9 @@ int cmdTrain(int argc, char** argv) {
             oppPred += st.oppPred;
             oppLab += st.oppLabel;
         }
+
+        // 设备副本 → CPU 行动模型：下一轮 rollout 与 eval 都读 CPU 版。
+        syncBackToCpu();
 
         const auto now = std::chrono::steady_clock::now();
         const double secs = std::chrono::duration<double>(now - t0).count();
@@ -3791,6 +3971,7 @@ int main(int argc, char** argv) {
     if (cmd == "policy-stats") return cmdPolicyStats(argc, argv);
     if (cmd == "bench") return cmdBench(argc, argv);
     if (cmd == "slumbot") return cmdSlumbot(argc, argv);
+    if (cmd == "bench-device") return cmdBenchDevice(argc, argv);
     if (cmd == "slumbot-analyze") return cmdSlumbotAnalyze(argc, argv);
     if (cmd == "allin-audit") return cmdAllinAudit(argc, argv);
     if (cmd == "commit-audit") return cmdCommitAudit(argc, argv);

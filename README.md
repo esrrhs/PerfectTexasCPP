@@ -39,6 +39,9 @@ ctest --test-dir build --output-on-failure      # 或直接跑 ./build/perfectte
 # 外部基准（Slumbot 公开 API，单会话）
 ./build/perfecttexas slumbot --resume /Users/mingming/models/stn2 \
   --hands 1500 --temp 0.5 --delay-ms 150 --log /tmp/ext_s1.csv
+
+# 设备基准（决定 --device 与 minibatch；本机结论见第一节末）
+./build/perfecttexas bench-device --iters 12 --batch 512 --batch 1024 --batch 2048
 ```
 
 ---
@@ -98,6 +101,39 @@ ctest --test-dir build --output-on-failure      # 或直接跑 ./build/perfectte
 - **内部锚点**：`rule / random / pro / search / solid / mix`，必须**全为正**。
 - **外部基准**：Slumbot 公开 API（规则完全一致），用终局 `bot_hole_cards` 做
   全下 EV 调整，剔除 runout 运气；只看调整后的数。
+
+### 训练设备与后端（本机实测，2026-11-03）
+
+| 项 | 事实 |
+|---|---|
+| 机器 | Apple **M1 Pro**，arm64，10 核 CPU、**16 核 GPU**、32 GB 统一内存 |
+| LibTorch | **2.5.1**（macOS arm64 官方包；`libtorch_cpu.dylib` 内含 `torch::mps::*` 符号） |
+| 运行时探测 | `torch::cuda::is_available() = 0`；`torch::mps::is_available() = 1` |
+| 目前训练 | 采样恒在 CPU；**设备只跑 PPO 更新**（模型副本 + 每轮权重回拷，~0.03s） |
+
+`bench-device` 实测（256×128，`--iters 12`，吞吐口径；多轮重复的区间，机器有
+±30% 抖动——睿频/后台负载，采纳前应在本机重跑）：
+
+| 设备 | batch 512 fwd / train | batch 1024 | batch 2048 |
+|---|---|---|---|
+| CPU（8 线程） | 14~21 / 38~56 ms | 35~39 / 82~96 ms | 57~75 / 105~177 ms |
+| MPS | 5~7 / 36~74 ms | 8~9 / 45~47 ms | 9~12 / 40~53 ms |
+
+**kernel 层面 MPS 快 2~4×（前向 3.8~8×），但端到端训练反而慢**（256 局/轮、3 采样线程）：
+
+| 配置 | 更新/秒 |
+|---|---|
+| CPU + minibatch 128（默认） | **1.00** |
+| CPU + minibatch 512 | 1.32 |
+| MPS + minibatch 512 | 0.22 |
+| MPS + minibatch 1024（设备默认） | 0.63 |
+
+拆分耗时：rollout 两边都是 0.10~0.14s，差距全在 PPO 更新（CPU 0.9~1.1s，MPS 1.5~4.5s）——
+小网络的算子启动/同步开销远超算力收益。所以：
+
+- **`--device auto` → CUDA（若有），否则 CPU**，**不自动选 MPS**；
+- 想用 GPU 必须显式 `--device mps`（或 `--mps`），并建议 `--minibatch 1024`；
+- 大网络（512×256）时 MPS 在 batch 2048 的训练吞吐约为 CPU 的 2.5×，但当前模型用不到。
 
 ---
 
@@ -166,6 +202,9 @@ ctest --test-dir build --output-on-failure      # 或直接跑 ./build/perfectte
 9. **只采纳可复现的改进**：外部 12000 手、点估计优于基线且 ≥2σ；否则记为“不可分辨”。
 10. **新训练输出写到 `/Users/mingming/models/`，禁止写 `/tmp`**（系统会清理，
     `stn1` 的权重就是这样丢的）。
+11. **GPU 不是默认项**：先跑 `bench-device`；本机 256×128 模型上 MPS 端到端比 CPU
+    慢 1.6~4.5×，`--device auto` 因此回退 CPU。GPU 只在 `--device cuda`（真 NVIDIA）
+    或显式 `--device mps --minibatch 1024` 时使用，且必须重新验证更新吞吐。
 
 ---
 
@@ -188,7 +227,7 @@ ctest --test-dir build --output-on-failure      # 或直接跑 ./build/perfectte
 ```bash
 ./build/perfecttexas train --resume /Users/mingming/models/stn2 \
   --out /Users/mingming/models/NEW --updates 1500 --games 512 --workers 3 --lr 3e-4 \
-  --seed 10101 --oracle-coef 0.30 --range-eq 16 --range-eq-iters 48 \
+  --device auto --seed 10101 --oracle-coef 0.30 --range-eq 16 --range-eq-iters 48 \
   --league 0.15 --rule-prob 0.08 --random-prob 0.05 --solid-prob 0.35 \
   --shark-prob 0.15 --folder-prob 0.07 --trapper-prob 0.05 --tight-prob 0.05 \
   --eval-every 250
@@ -228,22 +267,35 @@ done
 
 ## 七、待决策：离线 CFR blueprint
 
-部署期求解已经关闭（见第三节）。要再往前，唯一有量级意义的方向是**离线 CFR blueprint**：
+部署期求解已经关闭（见第三节）。要再往前，唯一有量级意义的方向是**离线 CFR blueprint**。
+关键前提：**GPU 帮不帮得上，取决于用哪一种 CFR**——这不是一台“有 GPU 就能快”的问题。
 
-- **抽象**：翻前 169 类；翻后每街 5~8 档牌力桶；每街 2~3 个下注尺寸（含全下）。
-- **算法**：外部采样 MCCFR（或 CFR+）训练，得到近似均衡的蓝图策略。
-- **接回网络**：用 blueprint 的逐决策动作分布在自对局中做教师/蒸馏，或把蓝图直接
-  作为联赛的固定强对手（注意：纯强对手配比已被证伪，必须与脚本锚点混用）。
-- **验收**：内部 BR/`commit-audit` 先验证可利用度，再走 12000 手外部 2σ。
+### 两条路线
 
-**算力估算（本机 8 线程 CPU，无 GPU）**：抽象设计 1~2 天；粗抽象约需 10^10 量级
-节点更新，按 8~10^7 节点更新/秒 ⇒ **训练 3~10 天**；蒸馏 + 外部验收 2~3 天。
-**总计约 1~2 周。**
+| | A. 表格 MCCFR（抽象 + regret 表） | B. Deep CFR（优势网络 + regret 网络） |
+|---|---|---|
+| 计算形态 | 纯 C++ 树遍历 + regret 表更新 | 遍历采样 + 批量前向/反向训练网络 |
+| 主要瓶颈 | **CPU 单核性能 + 内存带宽/缓存** | 遍历（CPU）+ 网络训练（GPU） |
+| GPU 加速 | **≈0**（表更新是随机写内存，GPU 反而更差） | 只加速网络训练那一半 |
+| 本机实测依据 | 同构 rollout：~0.10~0.14 秒 / 256 局（3 线程，约 2.5k 局/秒、~25k 决策/秒） | `bench-device`：256×128 网 B=2048 时 MPS 40ms vs CPU 177ms（4.4×）；512×256 网 B=2048 时 90ms vs 229ms（2.5×） |
+| 需要的抽象 | 必须更粗（翻前 169；翻后每街 5~8 桶；每街 2~3 尺寸） | 可以更细（桶数翻倍、尺寸多一档） |
+| 表/显存需求 | infoset ~10^7~10^8，regret 表 **1~4 GB**（32GB 统一内存可容纳） | 网络 <100 MB；采样/回放缓冲 1~4 GB；MPS 与 CPU 共享内存 |
+| 可实现强度上限 | 受抽象精度限制，粗抽象通常仍 **> 0.2 BB/手** 可利用度 | 上限更高，但遍历吞吐是硬约束：当前 ~25k 决策/秒，离 Deep CFR 需要的 10^6~10^7/秒差两个量级 |
+| 预计工期（本机） | 抽象设计 1~2 天 + MCCFR 实现 2~3 天 + 训练 **1~3 天** + 蒸馏/外部验收 2~3 天 ⇒ **约 1~1.5 周** | 实现 3~5 天 + 遍历向量化/并行 3~5 天 + 训练数天~数周 ⇒ **≥2~3 周**，且大概率卡在遍历 |
+| 风险 | 抽象过粗 ⇒ 追不上 Slumbot；过细则内存与收敛时间爆炸 | 遍历吞吐不足 ⇒ 训练规模上不去；蒸馏再遇“对手模型不匹配” |
 
-**风险**：
-1. 粗抽象的 blueprint 自身可利用度可能仍 > 0.2 BB/手，追不上 Slumbot；
-2. 蓝图与网络蒸馏之间会再出现“对手模型不匹配”的损失（第九节已反复踩过）；
-3. 2 周算力投入期间不能并行其它实验，机会成本高。
+**结论：推荐 A（表格 MCCFR）先做，B 暂不投入。** GPU 对本项目当前唯一的训练循环
+（PPO 更新）都帮不上（见第四节实测），对表格 MCCFR 更是无效；Deep CFR 的理论优势
+被遍历吞吐吃掉。若未来把游戏缩小（例如只做 turn/river 子博弈、或降到 100BB），
+B 才值得重新评估。
+
+### 交付与验收
+
+- **接回网络**：把 blueprint 的逐决策动作分布蒸馏进 actor，或作为联赛里的固定对手
+  （必须与脚本锚点混用，纯强对手配比已被证伪）。
+- **验收**：内部 BR / `commit-audit` 先验证可利用度，再走 12000 手外部、2σ 判据。
+- **风险点**：① 粗抽象蓝图自身可利用度可能 >0.2 BB/手；② 蒸馏阶段会再次遇到
+  “对手模型不匹配”；③ 1~1.5 周内不能并行其它实验。
 
 **当前状态：未启动，等确认。**
 
