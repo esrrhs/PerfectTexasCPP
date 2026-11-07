@@ -35,6 +35,8 @@
 #include "texas/strength.hpp"
 #include "texas/rollout.hpp"
 #include "texas/slumbot.hpp"
+#include "texas/blueprint.hpp"
+#include "texas/blueprint_br.hpp"
 
 namespace {
 
@@ -65,6 +67,12 @@ double argDouble(int argc, char** argv, const char* key, double def) {
 std::string argStr(int argc, char** argv, const char* key, const std::string& def) {
     const char* v = argValue(argc, argv, key, nullptr);
     return v ? std::string(v) : def;
+}
+
+// blueprint 长训的迭代数会超过 int 上限，单独用 64 位解析。
+uint64_t argU64(int argc, char** argv, const char* key, uint64_t def) {
+    const char* v = argValue(argc, argv, key, nullptr);
+    return v ? std::strtoull(v, nullptr, 10) : def;
 }
 
 // 收集同一个 key 的所有取值（可重复传参，例如多个 --ensemble DIR）。
@@ -139,6 +147,16 @@ void usage() {
         "                     自对局动作分布（翻前开牌/BB 应对/翻牌下注频率）\n"
         "  perfecttexas bench-device [--iters N] [--batch N]...  CPU/MPS/CUDA 前后向基准\n"
         "  perfecttexas bench  [--hands N]\n"
+        "  perfecttexas blueprint-train [--iters N] [--out DIR] [--resume DIR] [--seed N]\n"
+        "                     [--buckets N] [--raise-cap N] [--save-every N] [--log-every N]\n"
+        "                     离线表格 MCCFR 训练 CFR blueprint（检查点含 regret/平均策略/RNG）\n"
+        "  perfecttexas blueprint-br --bp DIR [--samples N] [--seed N]\n"
+        "                     抽样最优应对，量 blueprint 可利用度（G1）\n"
+        "  perfecttexas blueprint-distill --bp DIR --resume DIR --out DIR [--steps N]\n"
+        "                     [--eval-every N] [--patience N] [--eval-only]\n"
+        "                     把 blueprint 平均策略监督蒸馏进 actor（G2，留出集早停）\n"
+        "  perfecttexas blueprint-eval --bp DIR [--hands N] [--seed N]\n"
+        "                     blueprint 查表策略对内置基准的强度诊断\n"
         "\n"
         "说明:\n"
         "  --device auto|cpu|cuda|mps  训练设备（默认 auto：CUDA > MPS > CPU）。注意\n"
@@ -3955,6 +3973,654 @@ int cmdSlumbot(int argc, char** argv) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// 离线 CFR blueprint（docs/CFR_BLUEPRINT_PLAN.md）
+// ---------------------------------------------------------------------------
+
+struct BlueprintMeta {
+    uint64_t iters = 0;      // 已完成的总迭代数
+    uint64_t seed = 0;
+    int buckets = texas::kDefaultBuckets;
+    int raiseCap = texas::kDefaultRaiseCap;
+};
+
+bool writeBlueprintMeta(const std::string& dir, const BlueprintMeta& m) {
+    FILE* f = std::fopen((dir + "/meta.txt").c_str(), "w");
+    if (!f) return false;
+    std::fprintf(f, "iters %llu\nseed %llu\nbuckets %d\nraise_cap %d\nstride %d\n",
+                 static_cast<unsigned long long>(m.iters),
+                 static_cast<unsigned long long>(m.seed), m.buckets, m.raiseCap,
+                 texas::kAbstractStride);
+    std::fclose(f);
+    return true;
+}
+
+bool readBlueprintMetaFile(const std::string& path, BlueprintMeta& m) {
+    std::ifstream in(path);
+    if (!in) return false;
+    std::string line;
+    bool hasIters = false, hasB = false, hasR = false;
+    while (std::getline(in, line)) {
+        char k[32] = {};
+        long long v = 0;
+        if (std::sscanf(line.c_str(), "%31s %lld", k, &v) != 2) continue;
+        if (std::strcmp(k, "iters") == 0) { m.iters = static_cast<uint64_t>(v); hasIters = true; }
+        else if (std::strcmp(k, "seed") == 0) m.seed = static_cast<uint64_t>(v);
+        else if (std::strcmp(k, "buckets") == 0) { m.buckets = static_cast<int>(v); hasB = true; }
+        else if (std::strcmp(k, "raise_cap") == 0) { m.raiseCap = static_cast<int>(v); hasR = true; }
+        else if (std::strcmp(k, "stride") == 0 && v != texas::kAbstractStride) return false;
+    }
+    return hasIters && hasB && hasR;
+}
+
+bool readBlueprintMeta(const std::string& dir, BlueprintMeta& m) {
+    return readBlueprintMetaFile(dir + "/meta.txt", m);
+}
+
+bool saveBlueprintCheckpoint(const std::string& dir, const texas::RegretTable& tab,
+                             const BlueprintMeta& meta, const texas::Rng& rng) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        std::printf("!! 无法创建检查点目录 %s\n", dir.c_str());
+        return false;
+    }
+    if (!tab.save(dir + "/bp.bin")) return false;
+    if (!writeBlueprintMeta(dir, meta)) return false;
+    std::ofstream ro(dir + "/rng.txt");
+    if (ro) ro << rng;  // mt19937_64 全状态，续训逐位可复现
+    // 迭代快照：G1 要验证 BR 随迭代下降，必须留得住中间检查点。
+    const std::string snapDir = dir + "/snapshots";
+    std::filesystem::create_directories(snapDir, ec);
+    const std::string tag = std::to_string(meta.iters);
+    if (tab.save(snapDir + "/bp_" + tag + ".bin")) {
+        FILE* sf = std::fopen((snapDir + "/meta_" + tag + ".txt").c_str(), "w");
+        if (sf) {
+            std::fprintf(sf, "iters %llu\nbuckets %d\nraise_cap %d\n",
+                         static_cast<unsigned long long>(meta.iters), meta.buckets, meta.raiseCap);
+            std::fclose(sf);
+        }
+    }
+    return true;
+}
+
+int cmdBlueprintTrain(int argc, char** argv) {
+    const uint64_t iters = argU64(argc, argv, "--iters", 20000000ULL);
+    const uint64_t saveEvery = std::max<uint64_t>(1, argU64(argc, argv, "--save-every", 2000000ULL));
+    const uint64_t logEvery = std::max<uint64_t>(1, argU64(argc, argv, "--log-every", 1000000ULL));
+    const std::string outDir = argStr(argc, argv, "--out", "/Users/mingming/models/blueprint_v1");
+    const std::string resumeDir = argStr(argc, argv, "--resume", "");
+    const int buckets = argInt(argc, argv, "--buckets", texas::kDefaultBuckets);
+    const int raiseCap = argInt(argc, argv, "--raise-cap", texas::kDefaultRaiseCap);
+    const uint64_t seed = argU64(argc, argv, "--seed", 20261107ULL);
+    if (outDir.rfind("/tmp", 0) == 0) {
+        std::printf("!! 纪律：blueprint 检查点禁止写 /tmp（会被系统清理），请用 --out 指到 ~/models\n");
+        return 1;
+    }
+    if (iters == 0) { std::printf("--iters 必须 > 0\n"); return 1; }
+
+    texas::StrengthModel& sm = texas::StrengthModel::instance();  // 预热秩表，避免算进吞吐
+    texas::RegretTable tab(texas::kAbstractStride);
+    texas::Rng rng(seed);
+    BlueprintMeta meta;
+    meta.seed = seed;
+    meta.buckets = buckets;
+    meta.raiseCap = raiseCap;
+
+    if (!resumeDir.empty()) {
+        BlueprintMeta rm;
+        if (!readBlueprintMeta(resumeDir, rm)) {
+            std::printf("!! 读不到 %s/meta.txt\n", resumeDir.c_str());
+            return 1;
+        }
+        if (rm.buckets != buckets || rm.raiseCap != raiseCap) {
+            std::printf("!! 抽象不一致：检查点 B=%d R=%d，命令行 B=%d R=%d\n",
+                        rm.buckets, rm.raiseCap, buckets, raiseCap);
+            return 1;
+        }
+        if (!tab.load(resumeDir + "/bp.bin")) {
+            std::printf("!! 读不到 %s/bp.bin\n", resumeDir.c_str());
+            return 1;
+        }
+        std::ifstream rin(resumeDir + "/rng.txt");
+        if (rin) rin >> rng;
+        else {
+            std::printf("!! 缺 rng.txt，从 seed+iters 派生 RNG（续训非逐位复现）\n");
+            rng.seed(seed + rm.iters);
+        }
+        meta = rm;
+        std::printf("blueprint resume: %s @ %llu iters, %u infosets\n", resumeDir.c_str(),
+                    static_cast<unsigned long long>(rm.iters), tab.size());
+    }
+
+    texas::HUNLGame root(&rng, buckets, raiseCap, &sm);
+    const uint64_t start = meta.iters;
+    uint64_t done = 0;
+    uint64_t nextSave = (start / saveEvery + 1) * saveEvery;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::printf("blueprint-train: +%llu iters (总 %llu) | B=%d R=%d seed=%llu | out=%s\n",
+                static_cast<unsigned long long>(iters),
+                static_cast<unsigned long long>(start + iters), buckets, raiseCap,
+                static_cast<unsigned long long>(seed), outDir.c_str());
+    std::printf("  %10s %10s %12s %12s\n", "iters", "secs", "iter/s", "infosets");
+    std::fflush(stdout);
+
+    while (done < iters) {
+        const uint64_t n = std::min(logEvery, iters - done);
+        texas::mcfrTrain(root, tab, n, rng, start + done);
+        done += n;
+        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("  %10llu %10.1f %12.0f %12u\n",
+                    static_cast<unsigned long long>(start + done), sec,
+                    static_cast<double>(done) / std::max(sec, 1e-6), tab.size());
+        std::fflush(stdout);
+        if (start + done >= nextSave || done == iters) {
+            meta.iters = start + done;
+            if (!saveBlueprintCheckpoint(outDir, tab, meta, rng)) {
+                std::printf("!! 检查点写盘失败: %s\n", outDir.c_str());
+                return 1;
+            }
+            std::printf("  checkpoint -> %s (%llu iters)\n", outDir.c_str(),
+                        static_cast<unsigned long long>(meta.iters));
+            std::fflush(stdout);
+            while (nextSave <= start + done) nextSave += saveEvery;
+        }
+    }
+    std::printf("blueprint-train 完成: %llu iters, %u infosets, %.1f s\n",
+                static_cast<unsigned long long>(start + done), tab.size(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    return 0;
+}
+
+int cmdBlueprintBr(int argc, char** argv) {
+    const std::string bp = argStr(argc, argv, "--bp", "/Users/mingming/models/blueprint_v1");
+    const int samples = argInt(argc, argv, "--samples", 2000);
+    const uint64_t seed = argU64(argc, argv, "--seed", 20261107ULL);
+    const bool explicitB = argValue(argc, argv, "--buckets", nullptr) != nullptr;
+    const bool explicitR = argValue(argc, argv, "--raise-cap", nullptr) != nullptr;
+    int buckets = argInt(argc, argv, "--buckets", texas::kDefaultBuckets);
+    int raiseCap = argInt(argc, argv, "--raise-cap", texas::kDefaultRaiseCap);
+
+    texas::RegretTable tab(texas::kAbstractStride);
+    std::string binPath = bp;
+    BlueprintMeta m;
+    bool haveMeta = false;
+    if (std::filesystem::is_directory(bp)) {
+        binPath = bp + "/bp.bin";
+        haveMeta = readBlueprintMeta(bp, m);
+    } else {
+        // 迭代快照：snapshots/bp_5000000.bin -> snapshots/meta_5000000.txt
+        const std::filesystem::path p(bp);
+        const std::string stem = p.stem().string();
+        if (stem.rfind("bp_", 0) == 0) {
+            haveMeta = readBlueprintMetaFile(
+                (p.parent_path() / ("meta_" + stem.substr(3) + ".txt")).string(), m);
+        }
+    }
+    if (haveMeta) {
+        if (!explicitB) buckets = m.buckets;
+        if (!explicitR) raiseCap = m.raiseCap;
+    }
+    if (!tab.load(binPath)) {
+        std::printf("!! 读不到 blueprint 表: %s\n", binPath.c_str());
+        return 1;
+    }
+
+    texas::BrConfig cfg;
+    cfg.samples = samples;
+    cfg.seed = seed;
+    cfg.buckets = buckets;
+    cfg.raiseCap = raiseCap;
+    cfg.bothSeats = !hasFlag(argc, argv, "--one-seat");
+    cfg.selfPlayCheck = hasFlag(argc, argv, "--self-play-check");
+    cfg.maxNodesPerSample = argU64(argc, argv, "--max-nodes", 0);
+    std::printf("blueprint-br: %s | %u infosets | %d 抽样 | B=%d R=%d seed=%llu | %s\n",
+                binPath.c_str(), tab.size(), samples, buckets, raiseCap,
+                static_cast<unsigned long long>(seed),
+                cfg.bothSeats ? "双座位" : "单座位");
+    std::fflush(stdout);
+    const auto t0 = std::chrono::steady_clock::now();
+    const texas::BrResult r = texas::runBlueprintBR(tab, cfg);
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (!r.valid) {
+        std::printf("!! BR 评估失败（抽样数或表 stride 不合法）\n");
+        return 1;
+    }
+    std::printf("\nblueprint-br 结果: %llu 抽样, %.1f M 节点, %.1f 秒\n",
+                static_cast<unsigned long long>(r.samples), double(r.nodes) / 1e6, sec);
+    std::printf("  BR0 = %+0.2f ± %.2f 筹码/手\n  BR1 = %+0.2f ± %.2f 筹码/手\n",
+                r.br0, r.se0, r.br1, r.se1);
+    std::printf("  可利用度 BR0+BR1 = %+0.2f ± %.2f 筹码/手 = %+0.3f ± %.3f BB/手\n",
+                r.exploitChips, std::sqrt(r.se0 * r.se0 + r.se1 * r.se1), r.exploitBb, r.seBb);
+    std::printf("  G1 门 ≤ 0.500 BB/手: %s\n", r.exploitBb <= 0.5 ? "PASS" : "FAIL");
+    return 0;
+}
+
+// ---------------------------------------------------------------- 蒸馏（M4 / G2）
+
+struct DistillData {
+    std::deque<texas::TeacherSample> bySeat[2];
+};
+
+void makeDistillSample(const texas::HUState& s, const texas::RegretTable& tab, int buckets,
+                       int raiseCap, texas::TeacherSample& ts) {
+    float target[texas::kNumActions] = {};
+    texas::abstractToSlots(s, tab, buckets, raiseCap, target);
+    texas::Obs obs;
+    const float eq = static_cast<float>(texas::perfectEquity(s, s.toAct, 24));
+    texas::encodeObservation(s, obs, eq);
+    ts.node = obs.node;
+    ts.seq = obs.seq;
+    ts.rangeEq = 0.5f;  // 与部署 --range-eq 0（policyMove 默认 0.5）对齐
+    for (int i = 0; i < texas::kNumActions; ++i) ts.q[i] = 0.0f;
+    texas::LegalMove lm[texas::kNumActions];
+    const int m = texas::legalMoves(s, lm);
+    ts.actions.clear();
+    for (int j = 0; j < m; ++j) {
+        texas::ActionOption o;
+        o.slot = lm[j].slot;
+        o.mv = lm[j].mv;
+        o.hi = lm[j].toHi;
+        texas::encodeActionFeature(s, lm[j], o.feat);
+        ts.actions.push_back(o);
+        ts.q[lm[j].slot] = target[lm[j].slot];
+    }
+}
+
+texas::Move randomLegalMove(const texas::HUState& s, texas::Rng& rng) {
+    texas::LegalMove lm[texas::kNumActions];
+    const int m = texas::legalMoves(s, lm);
+    if (m <= 0) {
+        texas::Move mv;
+        mv.kind = texas::MK_CHECK;
+        mv.to = s.contrib[s.toAct];
+        return mv;
+    }
+    const int j = static_cast<int>(rng() % m);
+    texas::Move mv = lm[j].mv;
+    if (mv.kind == texas::MK_RAISE && lm[j].toHi > int(mv.to)) {
+        mv.to = static_cast<int16_t>(texas::amountInBand(
+            int(mv.to), lm[j].toHi, std::generate_canonical<double, 32>(rng)));
+    }
+    return mv;
+}
+
+// blueprint 自对弈 + 随机发牌/随机动作混合采样决策点（计划书 §4.1）。
+void generateDistillSamples(const texas::RegretTable& tab, int games, uint64_t seed,
+                            int buckets, int raiseCap, float mixRandom, float bpTemp,
+                            DistillData& out) {
+    texas::Rng rng(seed);
+    for (int g = 0; g < games; ++g) {
+        texas::HUState s = texas::dealNewHand(rng);
+        int steps = 0;
+        while (!s.finished && steps++ < 80) {
+            texas::TeacherSample ts;
+            makeDistillSample(s, tab, buckets, raiseCap, ts);
+            out.bySeat[s.toAct].push_back(std::move(ts));
+            const bool randomBranch = std::generate_canonical<double, 32>(rng) < mixRandom;
+            const texas::Move mv = randomBranch
+                ? randomLegalMove(s, rng)
+                : texas::sampleBlueprintMove(s, tab, buckets, raiseCap, rng, bpTemp);
+            texas::applyMove(s, mv, rng);
+        }
+    }
+}
+
+struct FidelityResult {
+    double top1 = 0.0;   // actor 与 blueprint 目标的 top-1 槽一致率（严格）
+    double top1Tie = 0.0;  // 目标 top 并列时，actor 选任一并列槽都算一致
+    double kl = 0.0;     // KL(target || actor)
+    double ent = 0.0;    // 目标分布自身熵 H(target)，给 KL 一个相对尺度
+    int count = 0;
+    bool valid = false;
+};
+
+// 单座位留出集保真度。蒸馏每个 step 会走完整一遍数据，等价于一个 epoch，
+// 所以训练中要按留出集挑最优点（见 cmdBlueprintDistill 的早停）。
+FidelityResult measureFidelitySeat(texas::nn::Actor& actor,
+                                   const std::deque<texas::TeacherSample>& samples) {
+    FidelityResult r;
+    const auto f32 = torch::TensorOptions().dtype(torch::kFloat32);
+    {
+        actor->eval();
+        for (const texas::TeacherSample& ts : samples) {
+            const int64_t L = static_cast<int64_t>(ts.actions.size());
+            if (L <= 0) continue;
+            torch::Tensor nodeT = torch::from_blob(
+                const_cast<float*>(ts.node.data()), {1, texas::kNodeInput}, f32).clone();
+            torch::Tensor seqT = torch::from_blob(
+                const_cast<float*>(ts.seq.data()), {1, texas::kHistSteps, texas::kHistDim}, f32)
+                .clone();
+            torch::Tensor featT = torch::zeros({L, texas::kActionInput}, f32);
+            torch::Tensor sampleT = torch::zeros({L}, torch::kLong);
+            torch::Tensor idT = torch::zeros({L}, torch::kLong);
+            float* pf = featT.data_ptr<float>();
+            int64_t* pid = idT.data_ptr<int64_t>();
+            for (int64_t j = 0; j < L; ++j) {
+                std::copy(ts.actions[j].feat.begin(), ts.actions[j].feat.end(),
+                          pf + j * texas::kActionInput);
+                pid[j] = ts.actions[j].slot;
+            }
+            torch::Tensor rqT = torch::tensor({ts.rangeEq}, f32);
+            torch::Tensor logits;
+            {
+                torch::NoGradGuard ng;
+                logits = actor->forward(nodeT, seqT, featT, sampleT, idT, rqT);
+            }
+            float probs[texas::kNumActions] = {};
+            texas::ppo::maskedSoftmax(logits.data_ptr<float>(), texas::kNumActions, probs);
+            int aTop = -1, bTop = -1;
+            double aBest = -1.0, bBest = -1.0, kl = 0.0, ent = 0.0;
+            for (int a = 0; a < texas::kNumActions; ++a) {
+                if (ts.q[a] > aBest) { aBest = ts.q[a]; aTop = a; }
+                if (probs[a] > bBest) { bBest = probs[a]; bTop = a; }
+                if (ts.q[a] > 1e-6) {
+                    kl += double(ts.q[a]) * std::log(double(ts.q[a]) /
+                                                     std::max(1e-9, double(probs[a])));
+                    ent -= double(ts.q[a]) * std::log(double(ts.q[a]));
+                }
+            }
+            if (aTop == bTop) r.top1 += 1.0;
+            // 目标在多个槽上并列最大时（同一个抽象动作落到多个尺寸槽），
+            // actor 选中任一并列槽都算保真，否则会低估蒸馏效果。
+            if (ts.q[bTop] > aBest - 1e-6) r.top1Tie += 1.0;
+            r.kl += kl;
+            r.ent += ent;
+            ++r.count;
+        }
+    }
+    if (r.count > 0) {
+        r.top1 /= r.count;
+        r.top1Tie /= r.count;
+        r.kl /= r.count;
+        r.ent /= r.count;
+        r.valid = true;
+    }
+    return r;
+}
+
+// 双座位合并读数（报告用）。按样本数加权，避免两座位样本量不同时被平均歪。
+FidelityResult measureFidelity(texas::nn::Actor actors[2], const DistillData& data) {
+    FidelityResult r;
+    for (int seat = 0; seat < 2; ++seat) {
+        const FidelityResult f = measureFidelitySeat(actors[seat], data.bySeat[seat]);
+        r.top1 += f.top1 * f.count;
+        r.top1Tie += f.top1Tie * f.count;
+        r.kl += f.kl * f.count;
+        r.ent += f.ent * f.count;
+        r.count += f.count;
+    }
+    if (r.count > 0) {
+        r.top1 /= r.count;
+        r.top1Tie /= r.count;
+        r.kl /= r.count;
+        r.ent /= r.count;
+        r.valid = true;
+    }
+    return r;
+}
+
+// 从 --bp（目录或快照 .bin）读抽象配置，避免与训练时不一致。
+void resolveBlueprintPath(const std::string& bp, std::string& binPath, int& buckets,
+                          int& raiseCap, bool explicitB, bool explicitR) {
+    BlueprintMeta m;
+    bool haveMeta = false;
+    binPath = bp;
+    if (std::filesystem::is_directory(bp)) {
+        binPath = bp + "/bp.bin";
+        haveMeta = readBlueprintMeta(bp, m);
+    } else {
+        const std::filesystem::path p(bp);
+        const std::string stem = p.stem().string();
+        if (stem.rfind("bp_", 0) == 0) {
+            haveMeta = readBlueprintMetaFile(
+                (p.parent_path() / ("meta_" + stem.substr(3) + ".txt")).string(), m);
+        }
+    }
+    if (haveMeta) {
+        if (!explicitB) buckets = m.buckets;
+        if (!explicitR) raiseCap = m.raiseCap;
+    }
+}
+
+int cmdBlueprintDistill(int argc, char** argv) {
+    const std::string bp = argStr(argc, argv, "--bp", "/Users/mingming/models/blueprint_v3");
+    const std::string resume = argStr(argc, argv, "--resume", "/Users/mingming/models/stn2");
+    const std::string outDir = argStr(argc, argv, "--out", "/Users/mingming/models/bp_distill_v1");
+    const int games = argInt(argc, argv, "--games", 1200);
+    const int holdout = argInt(argc, argv, "--holdout", 300);
+    const int steps = argInt(argc, argv, "--steps", 400);
+    const int minibatch = argInt(argc, argv, "--minibatch", 256);
+    const float lr = static_cast<float>(argDouble(argc, argv, "--lr", 3e-4));
+    // stn2 的 actor logits 实测高达 ±500（PPO 训出的极尖策略），直接做 KL 蒸馏
+    // 时 softmax 完全饱和、梯度推不动（CE 30~280）。只把四个输出末层的尺度压到
+    // 1/N，保留 LSTM/前层/信念头的全部表示，再监督微调即可（1.0 = 不缩放）。
+    const float logitScale = static_cast<float>(argDouble(argc, argv, "--logit-scale", 0.01));
+    const float mixRandom = static_cast<float>(argDouble(argc, argv, "--mix-random", 0.30));
+    const float bpTemp = static_cast<float>(argDouble(argc, argv, "--bp-temp", 1.0));
+    const uint64_t seed = argU64(argc, argv, "--seed", 20261107ULL);
+    const bool evalOnly = hasFlag(argc, argv, "--eval-only");
+    if (outDir.rfind("/tmp", 0) == 0) {
+        std::printf("!! 纪律：蒸馏输出禁止写 /tmp，请用 --out 指到 ~/models\n");
+        return 1;
+    }
+    const bool explicitB = argValue(argc, argv, "--buckets", nullptr) != nullptr;
+    const bool explicitR = argValue(argc, argv, "--raise-cap", nullptr) != nullptr;
+    int buckets = argInt(argc, argv, "--buckets", texas::kDefaultBuckets);
+    int raiseCap = argInt(argc, argv, "--raise-cap", texas::kDefaultRaiseCap);
+    std::string binPath;
+    resolveBlueprintPath(bp, binPath, buckets, raiseCap, explicitB, explicitR);
+
+    texas::RegretTable tab(texas::kAbstractStride);
+    if (!tab.load(binPath)) {
+        std::printf("!! 读不到 blueprint 表: %s\n", binPath.c_str());
+        return 1;
+    }
+    texas::nn::ModelConfig mc;
+    mc.hidden = argInt(argc, argv, "--hidden", 256);
+    mc.lstmHidden = argInt(argc, argv, "--lstm", 128);
+    texas::nn::Actor actors[2];
+    texas::nn::Critic critics[2];
+    for (int s = 0; s < 2; ++s) {
+        actors[s] = texas::nn::Actor(std::make_shared<texas::nn::ActorImpl>(mc));
+        critics[s] = texas::nn::Critic(std::make_shared<texas::nn::CriticImpl>(mc));
+    }
+    if (!loadModels(actors, critics, resume)) {
+        std::printf("!! 读不到基座模型: %s\n", resume.c_str());
+        return 1;
+    }
+    if (!evalOnly && logitScale > 0.0f && logitScale < 1.0f) {
+        auto shrink = [logitScale](torch::nn::Linear& lin) {
+            torch::NoGradGuard ng;
+            lin->weight.mul_(logitScale);
+            if (lin->bias.defined()) lin->bias.mul_(logitScale);
+        };
+        for (int s = 0; s < 2; ++s) {
+            shrink(actors[s]->head);
+            shrink(actors[s]->auxAct2);
+            shrink(actors[s]->oppAct2);
+            shrink(actors[s]->rngAct2);
+        }
+        std::printf("  输出末层 logit 尺度 × %.3f（保留全部特征层）\n", logitScale);
+    }
+
+    texas::ppo::Config pcfg;
+    pcfg.lr = lr;
+    pcfg.minibatch = minibatch;
+    texas::Learner learners[2] = {
+        texas::Learner(actors[0], critics[0], pcfg, torch::kCPU),
+        texas::Learner(actors[1], critics[1], pcfg, torch::kCPU),
+    };
+
+    std::printf("blueprint-distill: bp=%s (%u infosets) | 基座=%s | B=%d R=%d\n",
+                binPath.c_str(), tab.size(), resume.c_str(), buckets, raiseCap);
+    std::printf("  采样 %d 局训练 + %d 局留出, 混合随机 %.2f, 蓝图温度 %.2f, seed=%llu\n",
+                games, holdout, mixRandom, bpTemp, static_cast<unsigned long long>(seed));
+    std::fflush(stdout);
+    DistillData trainData, holdData;
+    generateDistillSamples(tab, games, seed, buckets, raiseCap, mixRandom, bpTemp, trainData);
+    generateDistillSamples(tab, holdout, seed + 7919ULL, buckets, raiseCap, mixRandom, bpTemp,
+                           holdData);
+    std::printf("  样本: 座位0 %zu / 座位1 %zu；留出 %zu\n", trainData.bySeat[0].size(),
+                trainData.bySeat[1].size(), holdData.bySeat[0].size() + holdData.bySeat[1].size());
+    if (trainData.bySeat[0].size() < 8 || trainData.bySeat[1].size() < 8) {
+        std::printf("!! 样本不足（每座位至少 8 条）\n");
+        return 1;
+    }
+    std::fflush(stdout);
+
+    // --eval-only：只对已有检查点（--resume 指向的目录）重算保真读数，
+    // 用于给不同蒸馏版本出一致口径的对照表（同一留出集、同一 seed）。
+    if (evalOnly) {
+        const FidelityResult f = measureFidelity(actors, holdData);
+        std::printf("\nG2 保真（留出 %d 决策点, 仅评估）:\n", f.count);
+        std::printf("  top-1 一致率 %.3f（并列容忍 %.3f）\n", f.top1, f.top1Tie);
+        std::printf("  KL(target||actor) %.4f / H(target) %.4f\n", f.kl, f.ent);
+        std::printf("  H(target) 是目标分布自身熵，KL 相对它看：占比 %.1f%%\n",
+                    100.0 * f.kl / std::max(1e-6, f.ent));
+        return 0;
+    }
+
+    const FidelityResult before = measureFidelity(actors, holdData);
+    // 早停：distill 的每个 step 都会完整扫一遍数据（= 一个 epoch），步数给多了
+    // 会直接过拟合训练局（v2 实测 1500 步反而比 400 步差）。因此按留出集 KL
+    // 分块选优，保留最优快照；--patience 个分块无改善即停。
+    const int evalEvery = std::max(1, argInt(argc, argv, "--eval-every", 50));
+    const int patience = std::max(1, argInt(argc, argv, "--patience", 4));
+    const std::string bestPath[2] = {outDir + "/.best0.pt", outDir + "/.best1.pt"};
+    for (int s = 0; s < 2; ++s) {
+        std::error_code ec;
+        std::filesystem::create_directories(outDir, ec);
+        FidelityResult base = measureFidelitySeat(actors[s], holdData.bySeat[s]);
+        double bestKl = base.kl;
+        int bestStep = 0, sinceBest = 0, done = 0;
+        actors[s]->saveTo(bestPath[s]);
+        std::printf("  座位 %d: 起点 KL %.4f / top-1 %.3f\n", s, base.kl, base.top1);
+        std::fflush(stdout);
+        while (done < steps) {
+            const int chunk = std::min(evalEvery, steps - done);
+            learners[s].distill(trainData.bySeat[s], chunk, 1.0f, 1.0f, minibatch, true);
+            done += chunk;
+            const FidelityResult f = measureFidelitySeat(actors[s], holdData.bySeat[s]);
+            std::printf("  座位 %d @ %d 步: 留出 KL %.4f / top-1 %.3f%s\n", s, done, f.kl,
+                        f.top1, f.kl < bestKl - 1e-4 ? "  *" : "");
+            std::fflush(stdout);
+            if (f.kl < bestKl - 1e-4) {
+                bestKl = f.kl;
+                bestStep = done;
+                sinceBest = 0;
+                actors[s]->saveTo(bestPath[s]);
+            } else if (++sinceBest >= patience) {
+                std::printf("  座位 %d: 早停于 %d 步（最优 %d 步, KL %.4f）\n", s, done,
+                            bestStep, bestKl);
+                break;
+            }
+        }
+        actors[s]->loadFrom(bestPath[s]);
+        std::printf("  座位 %d: 采用 %d 步快照, 留出 KL %.4f\n", s, bestStep, bestKl);
+    }
+    const FidelityResult after = measureFidelity(actors, holdData);
+    saveModels(actors, critics, outDir);
+    for (int s = 0; s < 2; ++s) {
+        std::error_code ec;
+        std::filesystem::remove(bestPath[s], ec);  // 只留正式检查点
+    }
+    std::printf("\nG2 保真（留出 %d 决策点）:\n", after.count);
+    std::printf("  top-1 一致率 %.3f -> %.3f（并列容忍 %.3f）(门 ≥ 0.700: %s)\n", before.top1,
+                after.top1, after.top1Tie, after.top1 >= 0.70 ? "PASS" : "FAIL");
+    std::printf("  KL(target||actor) %.4f -> %.4f (门 ≤ 0.100: %s)\n", before.kl, after.kl,
+                after.kl <= 0.10 ? "PASS" : "FAIL");
+    std::printf("  H(target) %.4f -> %.4f；KL 占目标熵 %.1f%%\n", before.ent, after.ent,
+                100.0 * after.kl / std::max(1e-6, after.ent));
+    std::printf("  模型已写入 %s\n", outDir.c_str());
+    std::printf("  内部锚点请用: ./build_rl/perfecttexas eval --resume %s --vs rule|random|pro|search|solid|mix --hands 8000 --temp 0.5\n",
+                outDir.c_str());
+    return 0;
+}
+
+texas::Move scriptMove(const std::string& vs, const texas::HUState& s, texas::Rng& rng) {
+    if (vs == "random") return randomLegalMove(s, rng);
+    if (vs == "pro") return texas::proAgentMove(s, rng);
+    if (vs == "solid") return texas::solidAgentMove(s, rng);
+    if (vs == "search") return texas::searchAgentMove(s, rng, 16, 3);
+    if (vs == "tight") return texas::tightAgentMove(s, rng);
+    return texas::ruleAgentMove(s, rng);
+}
+
+int cmdBlueprintEval(int argc, char** argv) {
+    const std::string bp = argStr(argc, argv, "--bp", "/Users/mingming/models/blueprint_v3");
+    const std::string resume = argStr(argc, argv, "--resume", "");
+    const int hands = argInt(argc, argv, "--hands", 2000);
+    const uint64_t seed = argU64(argc, argv, "--seed", 90001ULL);
+    const std::string vs = argStr(argc, argv, "--vs", "rule");
+    const bool explicitB = argValue(argc, argv, "--buckets", nullptr) != nullptr;
+    const bool explicitR = argValue(argc, argv, "--raise-cap", nullptr) != nullptr;
+    int buckets = argInt(argc, argv, "--buckets", texas::kDefaultBuckets);
+    int raiseCap = argInt(argc, argv, "--raise-cap", texas::kDefaultRaiseCap);
+    std::string binPath;
+    resolveBlueprintPath(bp, binPath, buckets, raiseCap, explicitB, explicitR);
+    texas::RegretTable tab(texas::kAbstractStride);
+    if (!tab.load(binPath)) {
+        std::printf("!! 读不到 blueprint 表: %s\n", binPath.c_str());
+        return 1;
+    }
+
+    if (!resume.empty()) {
+        // 蒸馏后 actor 的保真复核（不需要训练，只看留出一致率/KL）。
+        texas::nn::ModelConfig mc;
+        mc.hidden = argInt(argc, argv, "--hidden", 256);
+        mc.lstmHidden = argInt(argc, argv, "--lstm", 128);
+        texas::nn::Actor actors[2];
+        for (int s = 0; s < 2; ++s)
+            actors[s] = texas::nn::Actor(std::make_shared<texas::nn::ActorImpl>(mc));
+        if (!loadActors(actors, resume)) {
+            std::printf("!! 读不到 actors: %s\n", resume.c_str());
+            return 1;
+        }
+        DistillData data;
+        generateDistillSamples(tab, std::max(1, hands / 8), seed + 7919ULL, buckets, raiseCap,
+                               0.30f, 1.0f, data);
+        const FidelityResult f = measureFidelity(actors, data);
+        std::printf("blueprint-eval 保真: %s | %d 决策点 | top-1 %.3f (门 0.700) | KL %.4f (门 0.100)\n",
+                    resume.c_str(), f.count, f.top1, f.kl);
+        return 0;
+    }
+
+    // blueprint 查表策略直接对打内置脚本基准（与 eval 的 nn::Actor 路径独立）。
+    texas::Rng rng(seed);
+    double sum = 0.0, sq = 0.0;
+    int n = 0, trainedHits = 0, decisions = 0;
+    for (int h = 0; h < hands; ++h) {
+        texas::HUState s = texas::dealNewHand(rng);
+        const int bpSeat = h & 1;  // 交替座位，抵消盲注位置偏差
+        int steps = 0;
+        while (!s.finished && steps++ < 80) {
+            texas::Move mv;
+            if (s.toAct == bpSeat) {
+                float abs[texas::kAbstractStride] = {};
+                if (texas::queryBlueprint(s, tab, buckets, raiseCap, abs)) ++trainedHits;
+                ++decisions;
+                mv = texas::sampleBlueprintMove(s, tab, buckets, raiseCap, rng, 1.0f);
+            } else {
+                mv = scriptMove(vs, s, rng);
+            }
+            texas::applyMove(s, mv, rng);
+        }
+        const double u = double(texas::payoff(s, bpSeat));
+        sum += u;
+        sq += u * u;
+        ++n;
+    }
+    const double mean = sum / n;
+    const double var = std::max(0.0, sq / n - mean * mean);
+    const double se = std::sqrt(var / n);
+    std::printf("blueprint-eval 查表策略 vs %s: %d 手, %+0.2f ± %.2f 筹码/手 "
+                "(%+0.2f ± %.2f BB/手) | 查表命中 %.1f%% (%d/%d 决策)\n",
+                vs.c_str(), n, mean, se, mean / 100.0, se / 100.0,
+                decisions > 0 ? 100.0 * trainedHits / decisions : 0.0, trainedHits, decisions);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3979,6 +4645,10 @@ int main(int argc, char** argv) {
     if (cmd == "river-ranges") return cmdRiverRanges(argc, argv);
     if (cmd == "showdown") return cmdShowdown(argc, argv);
     if (cmd == "slumbot-fit") return cmdSlumbotFit(argc, argv);
+    if (cmd == "blueprint-train") return cmdBlueprintTrain(argc, argv);
+    if (cmd == "blueprint-br") return cmdBlueprintBr(argc, argv);
+    if (cmd == "blueprint-distill") return cmdBlueprintDistill(argc, argv);
+    if (cmd == "blueprint-eval") return cmdBlueprintEval(argc, argv);
     usage();
     return 0;
 }

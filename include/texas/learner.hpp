@@ -72,8 +72,11 @@ public:
 
     // 教师回放：在最近 N 轮的带标注样本上多跑几步纯蒸馏。
     // 返回平均交叉熵（未乘系数），用于日志。只更新 actor。
+    // qIsTarget=true 时 TeacherSample::q 已是目标概率分布（非法槽为 0），
+    // 直接最小化 CE(target, actor) = KL(target||actor) + H(target)；
+    // 默认 false 保持原有「Q 值标准化成 softmax 教师」语义。
     double distill(const std::deque<TeacherSample>& samples, int steps, float coef, float temp,
-                   int minibatch);
+                   int minibatch, bool qIsTarget = false);
 
     // 价值回放：在最近 N 轮的价值样本上只更新 critic。返回平均价值损失。
     // 每轮在 update() 之后调用，相当于给 critic 一个跨轮的小型经验池。

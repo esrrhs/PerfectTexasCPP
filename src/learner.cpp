@@ -742,7 +742,7 @@ double Learner::updateCriticOnly(BatchTensors& batch, int epochs) {
 }
 
 double Learner::distill(const std::deque<TeacherSample>& samples, int steps, float coef,
-                        float temp, int minibatch) {
+                        float temp, int minibatch, bool qIsTarget) {
     const int64_t B = static_cast<int64_t>(samples.size());
     if (B < 8 || steps <= 0 || coef <= 0.0f) return 0.0;
 
@@ -821,15 +821,26 @@ double Learner::distill(const std::deque<TeacherSample>& samples, int steps, flo
 
             torch::Tensor legalF = legalT.index_select(0, mbIdx).to(device);
             torch::Tensor raw = qT.index_select(0, mbIdx).to(device);
-            torch::Tensor cnt = legalF.sum(1, /*keepdim=*/true).clamp_min(1.0f);
-            torch::Tensor mean = (raw * legalF).sum(1, /*keepdim=*/true) / cnt;
-            torch::Tensor centered = (raw - mean) * legalF;
-            torch::Tensor scale =
-                (centered.pow(2).sum(1, /*keepdim=*/true) / cnt).sqrt().clamp_min(1e-3f);
-            torch::Tensor tq = centered / scale / t;
-            tq = tq.masked_fill(legalF < 0.5f, -1e9f);
-            torch::Tensor tlog = torch::log_softmax(tq, 1);
-            torch::Tensor ce = -(torch::exp(tlog) * logProbs).sum(1).mean();
+            torch::Tensor ce;
+            if (qIsTarget) {
+                // q 已是目标概率：CE = KL(target||actor) + H(target)，H 与参数无关，
+                // 所以最小化它就是精确最小化 KL(target||actor)。非法槽先置 0 再归一，
+                // 避免 mask 掉的 logits(-1e9) 参与乘法。
+                torch::Tensor target = (raw * legalF).clamp_min(0.0f);
+                target = target / target.sum(1, /*keepdim=*/true).clamp_min(1e-6f);
+                torch::Tensor lp = logProbs.masked_fill(legalF < 0.5f, 0.0f);
+                ce = -(target * lp).sum(1).mean();
+            } else {
+                torch::Tensor cnt = legalF.sum(1, /*keepdim=*/true).clamp_min(1.0f);
+                torch::Tensor mean = (raw * legalF).sum(1, /*keepdim=*/true) / cnt;
+                torch::Tensor centered = (raw - mean) * legalF;
+                torch::Tensor scale =
+                    (centered.pow(2).sum(1, /*keepdim=*/true) / cnt).sqrt().clamp_min(1e-3f);
+                torch::Tensor tq = centered / scale / t;
+                tq = tq.masked_fill(legalF < 0.5f, -1e9f);
+                torch::Tensor tlog = torch::log_softmax(tq, 1);
+                ce = -(torch::exp(tlog) * logProbs).sum(1).mean();
+            }
 
             actorOpt->zero_grad();
             (coef * ce).backward();

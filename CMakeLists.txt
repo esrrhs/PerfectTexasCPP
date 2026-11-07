@@ -38,6 +38,8 @@ add_library(perfecttexas_core STATIC
   src/slumbot.cpp
   src/rivercfr.cpp
   src/turncfr.cpp
+  src/blueprint.cpp
+  src/blueprint_br.cpp
 )
 target_include_directories(perfecttexas_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include

@@ -27,6 +27,8 @@
 #include "texas/slumbot.hpp"
 #include "texas/strength.hpp"
 #include "texas/turncfr.hpp"
+#include "texas/blueprint.hpp"
+#include "texas/blueprint_br.hpp"
 
 namespace {
 
@@ -2396,6 +2398,294 @@ void testTurnCfr() {
 
 }  // namespace
 
+// ---------------------------------------------------------------- blueprint / MCCFR
+
+// Kuhn poker（J/Q/K 三张牌）适配器，用来验证 MCCFR 核心收敛到已知纳什。
+struct KuhnGame {
+    int card[2] = {0, 0};
+    int node = 0;  // 0..3 决策；4..7 终局
+    texas::Rng* rng = nullptr;
+    KuhnGame() = default;
+    explicit KuhnGame(texas::Rng* r) : rng(r) {}
+    void deal(texas::Rng& r) { card[0] = r() % 3; card[1] = (card[0] + 1 + r() % 2) % 3; node = 0; }
+    bool terminal() const { return node >= 4; }
+    int currentPlayer() const { return (node == 0 || node == 2) ? 0 : 1; }
+    int actionStride() const { return 2; }
+    void legalMask(bool* m) const { m[0] = true; m[1] = true; }
+    uint64_t infosetKey() const { return static_cast<uint64_t>(card[currentPlayer()]) * 4 + node; }
+    double payoff(int p) const {
+        const int winner = card[0] > card[1] ? 0 : 1;
+        int p0 = 0;
+        switch (node) {
+            case 4: p0 = winner == 0 ? 1 : -1; break;  // check-check 摊牌 ±1
+            case 5: p0 = -1; break;                    // check-bet-fold，P0 弃
+            case 6: p0 = winner == 0 ? 2 : -2; break;  // 摊牌 ±2
+            case 7: p0 = 1; break;                     // bet-fold，P1 弃
+        }
+        return p == 0 ? p0 : -p0;
+    }
+    void apply(int a) {
+        switch (node) {
+            case 0: node = a == 0 ? 1 : 3; break;
+            case 1: node = a == 0 ? 4 : 2; break;
+            case 2: node = a == 0 ? 5 : 6; break;
+            case 3: node = a == 0 ? 7 : 6; break;
+        }
+    }
+    KuhnGame clone() const { return *this; }
+};
+
+// Kuhn 的最优应对（best response）。对手底牌不是已知量，而是 reach 向量：
+// BR 节点必须在**所有**对手牌上共享同一个动作，对手节点才按各自底牌的策略概率
+// 分流。若像旧版那样对每对具体底牌单独取 max，等于让 BR 偷看对手底牌，
+// 可利用度会被虚高一个数量级（实测 0.33 vs 真值 0.004）。
+int gKuhnBrSeat = 0;
+const texas::RegretTable* gKuhnBrTable = nullptr;
+
+int kuhnNext(int node, int a) {
+    switch (node) {
+        case 0: return a == 0 ? 1 : 3;
+        case 1: return a == 0 ? 4 : 2;
+        case 2: return a == 0 ? 5 : 6;
+        default: return a == 0 ? 7 : 6;
+    }
+}
+
+double kuhnBRRec(int node, int cardBr, const double* reach) {
+    if (node >= 4) {
+        double v = 0.0;
+        for (int c = 0; c < 3; ++c) {
+            if (reach[c] <= 0.0) continue;
+            KuhnGame g;
+            g.card[0] = gKuhnBrSeat == 0 ? cardBr : c;
+            g.card[1] = gKuhnBrSeat == 0 ? c : cardBr;
+            g.node = node;
+            v += reach[c] * g.payoff(gKuhnBrSeat);
+        }
+        return v;
+    }
+    const int p = (node == 0 || node == 2) ? 0 : 1;
+    if (p == gKuhnBrSeat) {
+        double best = -1e9;
+        for (int a = 0; a < 2; ++a) best = std::max(best, kuhnBRRec(kuhnNext(node, a), cardBr, reach));
+        return best;
+    }
+    double v = 0.0;
+    for (int a = 0; a < 2; ++a) {
+        double nr[3] = {0, 0, 0};
+        bool any = false;
+        for (int c = 0; c < 3; ++c) {
+            if (reach[c] <= 0.0) continue;
+            bool legal[2] = {true, true};
+            float sig[8] = {};
+            const int64_t idx = gKuhnBrTable->find(static_cast<uint64_t>(c) * 4 + node);
+            if (idx >= 0) gKuhnBrTable->averageStrategy(static_cast<uint32_t>(idx), legal, sig);
+            else { sig[0] = sig[1] = 0.5f; }
+            nr[c] = reach[c] * static_cast<double>(sig[a]);
+            if (nr[c] > 0.0) any = true;
+        }
+        if (any) v += kuhnBRRec(kuhnNext(node, a), cardBr, nr);
+    }
+    return v;
+}
+
+double kuhnBRValue(int br, int cardBr, const texas::RegretTable& tab) {
+    gKuhnBrSeat = br;
+    gKuhnBrTable = &tab;
+    double reach[3] = {0, 0, 0};
+    int cnt = 0;
+    for (int c = 0; c < 3; ++c) if (c != cardBr) { reach[c] = 1.0; ++cnt; }
+    for (int c = 0; c < 3; ++c) reach[c] /= cnt;
+    return kuhnBRRec(0, cardBr, reach);
+}
+
+void testBlueprint() {
+    section("CFR blueprint / MCCFR");
+    using namespace texas;
+
+    // Kuhn 收敛：可利用度 -> 0，P0 博弈值 -> -1/18。
+    {
+        Rng rng(12345);
+        RegretTable tab(2);
+        KuhnGame root(&rng);
+        mcfrTrain(root, tab, 500000, rng);
+        double br0 = 0.0, br1 = 0.0;
+        for (int c = 0; c < 3; ++c) {
+            br0 += kuhnBRValue(0, c, tab) / 3.0;
+            br1 += kuhnBRValue(1, c, tab) / 3.0;
+        }
+        const double exploit = br0 + br1;
+        CHECK(exploit < 0.02);
+        CHECK(exploit >= -0.001);
+        CHECK_NEAR(br0, -1.0 / 18.0, 0.02);
+    }
+
+    // 底池桶单调 + 信息集 key 唯一性。
+    {
+        CHECK(potBucketOf(150) == 0);
+        CHECK(potBucketOf(300) == 4);
+        CHECK(potBucketOf(600) == 8);
+        CHECK(potBucketOf(100000) <= 31);
+        uint8_t s1[2] = {AB_RAISE_05, AB_ALLIN};
+        uint8_t s2[2] = {AB_RAISE_10, AB_ALLIN};
+        CHECK(packInfoset(ST_FLOP, 300, 3, s1, 2) != packInfoset(ST_FLOP, 300, 3, s2, 2));
+        CHECK(packInfoset(ST_FLOP, 300, 3, s1, 2) != packInfoset(ST_TURN, 300, 3, s1, 2));
+        CHECK(packInfoset(ST_FLOP, 300, 3, s1, 2) != packInfoset(ST_FLOP, 300, 4, s1, 2));
+    }
+
+    // 抽象动作合法性 + seqFromState 与训练侧携带序列一致。
+    {
+        Rng rng(999);
+        StrengthModel& sm = StrengthModel::instance();
+        int checked = 0;
+        for (int g = 0; g < 1500; ++g) {
+            HUNLGame game(&rng, kDefaultBuckets, kDefaultRaiseCap, &sm);
+            game.deal(rng);
+            int steps = 0;
+            while (!game.terminal() && steps++ < 40) {
+                AbstractMove am[kAbstractStride];
+                const int n = legalAbstract(game.state, kDefaultRaiseCap, am);
+                CHECK(n >= 1 && n <= kAbstractStride);
+                const int gap = toCall(game.state, game.state.toAct);
+                bool hasCC = false;
+                for (int i = 0; i < n; ++i) {
+                    if (am[i].id == AB_CHECK_CALL) hasCC = true;
+                    if (am[i].id == AB_FOLD) CHECK(gap > 0);
+                    if (am[i].id == AB_RAISE_05 || am[i].id == AB_RAISE_10)
+                        CHECK(canRaiseTo(game.state, am[i].mv.to));
+                    if (am[i].id == AB_ALLIN) CHECK(am[i].mv.to == maxRaiseTo(game.state));
+                }
+                CHECK(hasCC);
+                uint8_t seq[kMaxStreetSeq] = {};
+                const int sl = seqFromState(game.state, kDefaultRaiseCap, seq);
+                CHECK(sl == game.seqLen);
+                bool same = true;
+                for (int i = 0; i < sl; ++i) if (seq[i] != game.seq[i]) same = false;
+                CHECK(same);
+                game.apply(am[rng() % n].id);
+                ++checked;
+            }
+        }
+        CHECK(checked > 1000);
+    }
+
+    // HUNL 短训 + regret 表存盘往返。
+    {
+        Rng rng(777);
+        StrengthModel& sm = StrengthModel::instance();
+        RegretTable tab(kAbstractStride);
+        HUNLGame root(&rng, kDefaultBuckets, kDefaultRaiseCap, &sm);
+        mcfrTrain(root, tab, 20000, rng);
+        CHECK(tab.size() > 100);
+
+        HUNLGame g(&rng, kDefaultBuckets, kDefaultRaiseCap, &sm);
+        g.deal(rng);
+        const uint64_t key = g.infosetKey();
+        const uint32_t idx = tab.intern(key);
+        bool legal[kAbstractStride];
+        g.legalMask(legal);
+        float before[8] = {};
+        tab.averageStrategy(idx, legal, before);
+
+        const std::string path = "bp_test_roundtrip.bin";
+        CHECK(tab.save(path));
+        RegretTable tab2(kAbstractStride);
+        CHECK(tab2.load(path));
+        CHECK(tab2.size() == tab.size());
+        const int64_t idx2 = tab2.find(key);
+        CHECK(idx2 >= 0);
+        float after[8] = {};
+        tab2.averageStrategy(static_cast<uint32_t>(idx2), legal, after);
+        bool same = true;
+        for (int a = 0; a < kAbstractStride; ++a) if (std::fabs(before[a] - after[a]) > 1e-6) same = false;
+        CHECK(same);
+        std::remove(path.c_str());
+
+        // 平均策略归一。
+        bool all[kAbstractStride] = {true, true, true, true, true};
+        float avg[8] = {};
+        tab.averageStrategy(idx, all, avg);
+        float sum = 0.0f;
+        for (int a = 0; a < kAbstractStride; ++a) sum += avg[a];
+        CHECK_NEAR(sum, 1.0, 1e-5);
+    }
+
+    // 座位必须进 infoset key：SB / BB 同街同序列也不能共用一行 regret。
+    {
+        uint8_t seq[2] = {AB_RAISE_05, AB_CHECK_CALL};
+        CHECK(packInfoset(ST_FLOP, 300, 3, seq, 2, 0) !=
+              packInfoset(ST_FLOP, 300, 3, seq, 2, 1));
+        CHECK(packInfoset(ST_RIVER, 4800, 7, seq, 2, 1) ==
+              packInfoset(ST_RIVER, 4800, 7, seq, 2, 1));
+    }
+
+    // 蒸馏槽映射（abstract -> 19 槽）：归一、只落在合法槽、部署翻译可执行。
+    {
+        Rng rng(31337);
+        StrengthModel& sm = StrengthModel::instance();
+        RegretTable tab(kAbstractStride);
+        HUNLGame root(&rng, kDefaultBuckets, kDefaultRaiseCap, &sm);
+        mcfrTrain(root, tab, 3000, rng);
+        int checked = 0;
+        for (int g = 0; g < 120; ++g) {
+            HUState s = dealNewHand(rng);
+            int steps = 0;
+            while (!s.finished && steps++ < 30) {
+                float target[kNumActions] = {};
+                abstractToSlots(s, tab, kDefaultBuckets, kDefaultRaiseCap, target);
+                LegalMove lm[kNumActions];
+                const int m = legalMoves(s, lm);
+                bool isLegal[kNumActions] = {};
+                for (int j = 0; j < m; ++j) isLegal[lm[j].slot] = true;
+                double sum = 0.0;
+                for (int a = 0; a < kNumActions; ++a) {
+                    CHECK(target[a] >= 0.0f);
+                    if (!isLegal[a]) CHECK(target[a] == 0.0f);
+                    sum += target[a];
+                }
+                CHECK_NEAR(sum, 1.0, 1e-4);
+                float abs[kAbstractStride] = {};
+                queryBlueprint(s, tab, kDefaultBuckets, kDefaultRaiseCap, abs);
+                AbstractMove am[kAbstractStride];
+                const int n = legalAbstract(s, kDefaultRaiseCap, am);
+                for (int i = 0; i < n; ++i) {
+                    if (am[i].id == AB_CHECK_CALL)
+                        CHECK(target[kSlotCheckCall] >= abs[AB_CHECK_CALL] - 1e-4f);
+                }
+                const Move mv = sampleBlueprintMove(s, tab, kDefaultBuckets, kDefaultRaiseCap,
+                                                    rng, 1.0f);
+                if (mv.kind == MK_RAISE) CHECK(canRaiseTo(s, mv.to));
+                applyMove(s, mv, rng);
+                ++checked;
+            }
+        }
+        CHECK(checked > 300);
+    }
+
+    // BR 工具自洽：空表（均匀策略）与训练表都能跑出有限值；双方都按蓝图走时
+    // 零和值有限（精确自洽由 blueprint-br --self-play-check 的大样本检查）。
+    {
+        Rng rng(555);
+        StrengthModel& sm = StrengthModel::instance();
+        RegretTable emptyTab(kAbstractStride);
+        RegretTable trainedTab(kAbstractStride);
+        HUNLGame root(&rng, kDefaultBuckets, kDefaultRaiseCap, &sm);
+        mcfrTrain(root, trainedTab, 20000, rng);
+        BrConfig cfg;
+        cfg.samples = 2;
+        cfg.seed = 8080;
+        cfg.bothSeats = true;
+        const BrResult ru = runBlueprintBR(emptyTab, cfg);
+        const BrResult rt = runBlueprintBR(trainedTab, cfg);
+        CHECK(ru.valid && rt.valid);
+        CHECK(ru.nodes > 0 && rt.nodes > 0);
+        CHECK(std::isfinite(ru.exploitBb) && std::isfinite(rt.exploitBb));
+        cfg.selfPlayCheck = true;
+        const BrResult rz = runBlueprintBR(trainedTab, cfg);
+        CHECK(rz.valid && std::isfinite(rz.exploitBb));
+    }
+}
+
 int main() {
     testCards();
     testRules();
@@ -2416,6 +2706,7 @@ int main() {
     testRangeSearch();
     testRiverCfr();
     testTurnCfr();
+    testBlueprint();
     testSlumbotState();
     testSlumbotLastOpp();
     testAllinAdjusted();
