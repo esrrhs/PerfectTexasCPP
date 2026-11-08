@@ -161,7 +161,7 @@
 - **结论**：**关闭，不再开任何部署期求解算子**。除非先有与 Slumbot 行为拟合的范围模型，
   而那条已证伪（行为克隆平衡 acc ≈ 0.30，raise 预测 10.6% vs 真实 16.4%）。
 
-### R5 — 2026-11-08 — 大池优势加权（训练臂，单变量）
+### R5 — 2026-11-08 — 大池优势加权（训练臂，**拒绝**）
 
 - **假设**：大池决策只占样本的百分之几，却承担几乎全部 EV 方差；PPO 的批内优势标准化
   不会按底池重新分配梯度份额。按决策时底池给策略梯度加权，应把优化容量推到大池，
@@ -170,8 +170,20 @@
   `--pot-adv-weight 1.0`，权重 `w = clamp(底池/1500, 1, 3)^1`（1500→1.0，3000→2.0，≥4500→3.0），
   只乘在 PPO 优势上，critic 的回报不改。代码位置：`Transition::potWeight`（`rollout.hpp`）、
   写入点在 `rollout.cpp` 记录 `gameId` 之后、加权点在 `learner.cpp::buildBatch` 的标准化之后。
-- **快速环**：待训练完成（1,500 update × 512 局，从 `stn2` 续训）。
-- **外部**：未打。
+- **快速环**（16k H2H vs `stn2`，seed 424242，与 `abl_ctrl` 同口径）：
+
+| 臂 | H2H 筹码/手 | >4000 底池 | solid | rule |
+|---|---:|---:|---:|---:|
+| `abl_ctrl`（对照，无加权） | **+13.0 ± 20.5** | 1762 手 **+227.5** | +503.3 | +1933.7 |
+| `r4_potw`（加权） | **−62.0 ± 19.0** | 2349 手 **−327.2** | +490.2 | +1838.0 |
+
+  动作分布显示**机制性塌缩**：BB 面对开牌从 `fold 74.5% / raise 14.5%` 变成
+  `fold 16.3% / raise 72.4%`（翻前变成 3-bet 机器），BB 河牌面对下注 `fold 100%`（n=20）。
+  训练末锚点也同步下滑（rule +1748 vs 对照 +2194，self −306 vs −144）。
+- **外部**：未打（快速环已崩，按纪律不占外部机时）。
+- **结论**：**拒绝**。按底池加权把“别在大池犯错”学成了“大池少投入”的保守塌缩，
+  与目标方向相反；说明大池的瓶颈不是梯度份额，而是**没有对手范围信息可用**
+  （与 R4 的结论一致）。该开关保留在代码里但默认 0，并列入 README 关闭项。
 - **可复现**：
   ```
   ./build_rl/perfecttexas train --resume /Users/mingming/models/stn2 --updates 1500 --games 512 \
@@ -180,6 +192,25 @@
     --folder-prob 0.07 --spammer-prob 0 --maniac-prob 0 --pot-adv-weight 1.0 \
     --eval-every 250 --out /Users/mingming/models/r4_potw
   sh tools/fastloop.sh /Users/mingming/models/r4_potw
+  ```
+
+### R6 — 2026-11-09 — 辅助权益校准头（训练臂，进行中）
+
+- **假设**：R4 的结论是“大池决策缺的是对手范围/权益校准”。`--aux-equity-coef` 让共享
+  主干用不完全信息回归开天眼胜率（标签只在训练期可得，部署不可见），应把策略的胜率
+  表征校准到可泛化的程度，改善大池的弃/跟边界。
+- **改动**（唯一变量 = 辅助损失系数）：`--aux-equity-coef 0.3`；其余（联赛配比、
+  1,500 update × 512 局、从 `stn2` 续训、seed 10101）与对照 `abl_ctrl` 完全一致。
+- **快速环**：训练中。对照 = `abl_ctrl`（+13.0 ± 20.5，>4000 底池 +227.5）。
+- **外部**：未打。
+- **可复现**：
+  ```
+  ./build_rl/perfecttexas train --resume /Users/mingming/models/stn2 --updates 1500 --games 512 \
+    --workers 2 --seed 10101 --oracle-coef 0.30 --league 0.15 --rule-prob 0.08 --random-prob 0.05 \
+    --solid-prob 0.35 --tight-prob 0.05 --trapper-prob 0.05 --shark-prob 0.15 \
+    --folder-prob 0.07 --spammer-prob 0 --maniac-prob 0 --aux-equity-coef 0.3 \
+    --eval-every 250 --out /Users/mingming/models/r6_aux
+  sh tools/fastloop.sh /Users/mingming/models/r6_aux
   ```
 
 ## 3. 已拒绝 / 已回滚
