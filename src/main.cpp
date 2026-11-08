@@ -722,6 +722,7 @@ int cmdTrain(int argc, char** argv) {
     rcfg.spammerProb = static_cast<float>(argDouble(argc, argv, "--spammer-prob", 0.0));
     rcfg.maniacProb = static_cast<float>(argDouble(argc, argv, "--maniac-prob", 0.0));
     rcfg.potAdvWeight = static_cast<float>(argDouble(argc, argv, "--pot-adv-weight", 0.0));
+    rcfg.rewardPower = static_cast<float>(argDouble(argc, argv, "--reward-power", 1.0));
     rcfg.rangerProb = static_cast<float>(argDouble(argc, argv, "--ranger-prob", 0.0));
     rcfg.rangerAir = static_cast<float>(argDouble(argc, argv, "--ranger-air", 0.28));
     rcfg.oppCfrProb = static_cast<float>(argDouble(argc, argv, "--opp-cfr-prob", 0.0));

@@ -2459,7 +2459,11 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         for (int p = 0; p < 2; ++p) {
             if (g.lastIdx[p] < 0) continue;
             auto& t = out[static_cast<size_t>(p)][static_cast<size_t>(g.lastIdx[p])];
-            t.reward += float(payoff(g.st, p)) * cfg.rewardScale;
+            float rw = float(payoff(g.st, p)) * cfg.rewardScale;
+            if (cfg.rewardPower != 1.0f) {
+                rw = std::copysign(std::pow(std::abs(rw), cfg.rewardPower), rw);
+            }
+            t.reward += rw;
             t.terminal = true;
         }
         if (g.st.folded == 255) ++stats.showdowns;

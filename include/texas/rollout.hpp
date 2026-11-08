@@ -184,6 +184,9 @@ struct RolloutConfig {
     // 大池优势加权指数（R4）。0 = 关闭；>0 时权重 = clamp(底池/1500, 1, 3)^该指数，
     // 只乘在 PPO 的策略梯度上（critic 仍用未加权回报）。
     float potAdvWeight = 0.0f;
+    // 风险调整回报（R7）：以起始筹码为单位的回报取 sign(x)*|x|^p，1.0 = 原始筹码（关闭）。
+    // <1 会压低大输赢的边际效用，主要用于抑制大池里的高方差跟注/全下。
+    float rewardPower = 1.0f;
     float rewardScale = 1.0f / float(kStartingStack);  // 筹码 -> 起始筹码的倍数
     int forceRuleSeat = -1;        // 评估用：强制某个座位打规则机器人
     int forceRandomSeat = -1;      // 评估用：强制某个座位均匀随机
