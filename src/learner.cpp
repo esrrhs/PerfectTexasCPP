@@ -85,7 +85,7 @@ void buildBatch(const std::vector<Transition>& tr, BatchTensors& batch, float ad
     const double var = std::max(sq / double(N) - mean * mean, 0.0);
     const float inv = 1.0f / float(std::sqrt(var + advNormEps));
     for (int64_t i = 0; i < N; ++i) {
-        pAdv[i] = (pAdv[i] - float(mean)) * inv;
+        pAdv[i] = (pAdv[i] - float(mean)) * inv * tr[static_cast<size_t>(i)].potWeight;
     }
 }
 

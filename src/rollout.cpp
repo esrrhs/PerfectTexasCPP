@@ -2569,6 +2569,10 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
                 encodeActionFeature(g.st, lm[k], a.feat);
             }
             t.gameId = idx[static_cast<size_t>(i)];
+            if (cfg.potAdvWeight > 0.0f) {
+                const float pr = float(g.st.pot()) / 1500.0f;
+                t.potWeight = std::pow(std::min(3.0f, std::max(1.0f, pr)), cfg.potAdvWeight);
+            }
 
             // 只有学习座位（带 critic 的那批）才做教师标注。快照 / 评估座位
             // 只负责推进牌局，标了也不会进训练集。

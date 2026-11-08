@@ -34,6 +34,9 @@ struct Transition {
     float reward = 0.0f;
     float adv = 0.0f;
     float ret = 0.0f;
+    // 策略梯度权重（R4）：按决策时底池给优势加权，只影响 PG，不影响 critic。
+    // 1.0 = 关闭。大池决策只占样本的百分之几，却贡献几乎全部 EV 方差。
+    float potWeight = 1.0f;
     // 脚本教师的反事实动作价值（同牌分支续演，单位 = 起始筹码）。
     // 只有 hasTeacher 为真的样本参与蒸馏损失；索引是 slot，非法 slot 填 0。
     std::array<float, kNumActions> teacherQ{};
@@ -178,6 +181,9 @@ struct RolloutConfig {
     int teacherSamples = 1;         // >1：对隐藏牌（对手底牌 + 未发公共牌）取平均
     int teacherStyles = 3;          // 2~4：紧/标准/松规则，4 再加翻前胜率机器人
 
+    // 大池优势加权指数（R4）。0 = 关闭；>0 时权重 = clamp(底池/1500, 1, 3)^该指数，
+    // 只乘在 PPO 的策略梯度上（critic 仍用未加权回报）。
+    float potAdvWeight = 0.0f;
     float rewardScale = 1.0f / float(kStartingStack);  // 筹码 -> 起始筹码的倍数
     int forceRuleSeat = -1;        // 评估用：强制某个座位打规则机器人
     int forceRandomSeat = -1;      // 评估用：强制某个座位均匀随机
