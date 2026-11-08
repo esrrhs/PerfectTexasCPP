@@ -28,17 +28,20 @@ int cardBucketOf(const HUState& s, int buckets) {
 }
 
 uint64_t packInfoset(int street, int pot, int cardBucket, const uint8_t* seq, int seqLen,
-                     int seat, int hist) {
+                     int seat, int hist, int slim) {
     if (seqLen < 0) seqLen = 0;
     if (seqLen > kMaxStreetSeq) seqLen = kMaxStreetSeq;
     uint64_t packed = 0;
     for (int i = 0; i < seqLen; ++i) packed |= static_cast<uint64_t>(seq[i] & 7) << (3 * i);
     const uint64_t cb = static_cast<uint64_t>(cardBucket) & 0xFF;       // bit 0..7
     const uint64_t se = seat > 0 ? 1ULL : 0ULL;                          // bit 8
-    const uint64_t pb = static_cast<uint64_t>(potBucketOf(pot)) & 0x1F;  // bit 9..13
+    // slim：底池桶与跨街历史都不入 key（R2 对照），只留街/牌桶/街内序列/座位。
+    const uint64_t pb = slim ? 0ULL
+                             : (static_cast<uint64_t>(potBucketOf(pot)) & 0x1F);  // bit 9..13
     const uint64_t st = static_cast<uint64_t>(street) & 3;                // bit 14..15
     const uint64_t ln = static_cast<uint64_t>(seqLen) & 0xF;              // bit 16..19
-    const uint64_t hb = static_cast<uint64_t>(hist) & 0xFF;               // bit 44..51
+    const uint64_t hb = slim ? 0ULL
+                             : (static_cast<uint64_t>(hist) & 0xFF);      // bit 44..51
     return cb | (se << 8) | (pb << 9) | (st << 14) | (ln << 16) | (packed << 20) | (hb << 44);
 }
 
@@ -151,13 +154,13 @@ int seqFromState(const HUState& s, int raiseCap, uint8_t* out, uint8_t* histOut)
 }
 
 bool queryBlueprint(const HUState& s, const RegretTable& tab, int buckets, int raiseCap,
-                    float* out, int recall) {
+                    float* out, int recall, int slim) {
     uint8_t seq[kMaxStreetSeq] = {};
     uint8_t hist = 0;
     const int seqLen = seqFromState(s, raiseCap, seq, recall ? &hist : nullptr);
     const int cb = cardBucketOf(s, buckets);
     const uint64_t key = packInfoset(s.street, s.pot(), cb, seq, seqLen, s.toAct,
-                                     recall ? hist : 0);
+                                     recall ? hist : 0, slim);
     bool legal[kAbstractStride] = {};
     AbstractMove am[kAbstractStride];
     const int n = legalAbstract(s, raiseCap, am);
@@ -194,10 +197,10 @@ static int slotForAbstractRaise(const HUState& s, int amount) {
 }
 
 bool abstractToSlots(const HUState& s, const RegretTable& tab, int buckets, int raiseCap,
-                     float* target, int recall) {
+                     float* target, int recall, int slim) {
     for (int i = 0; i < kNumActions; ++i) target[i] = 0.0f;
     float abs[kAbstractStride] = {};
-    const bool trained = queryBlueprint(s, tab, buckets, raiseCap, abs, recall);
+    const bool trained = queryBlueprint(s, tab, buckets, raiseCap, abs, recall, slim);
     AbstractMove am[kAbstractStride];
     const int n = legalAbstract(s, raiseCap, am);
     for (int i = 0; i < n; ++i) {
@@ -225,9 +228,9 @@ bool abstractToSlots(const HUState& s, const RegretTable& tab, int buckets, int 
 }
 
 Move sampleBlueprintMove(const HUState& s, const RegretTable& tab, int buckets, int raiseCap,
-                         Rng& rng, float temp, int recall) {
+                         Rng& rng, float temp, int recall, int slim) {
     float abs[kAbstractStride] = {};
-    queryBlueprint(s, tab, buckets, raiseCap, abs, recall);
+    queryBlueprint(s, tab, buckets, raiseCap, abs, recall, slim);
     AbstractMove am[kAbstractStride];
     const int n = legalAbstract(s, raiseCap, am);
     if (n <= 0) {

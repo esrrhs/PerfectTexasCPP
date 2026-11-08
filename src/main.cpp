@@ -134,6 +134,7 @@ void usage() {
         "                       [--river-cfr N] [--river-cfr-min-pot N] [--river-cfr-raises N]\n"
         "  perfecttexas slumbot-analyze --csv FILE.csv  逐决策算事后胜率，定位漏点\n"
         "  perfecttexas allin-audit --csv FILE.csv...  全下决策审计（按座位/街/推接）\n"
+        "  perfecttexas slumbot-merge --csv FILE.csv... 合并多段外部日志的调整后 EV ± SE\n"
         "  perfecttexas commit-audit --csv FILE.csv... 弃牌前投入审计（按投入深度/弃牌街）\n"
         "  perfecttexas slumbot-decisions --csv FILE.csv... 导出 Slumbot 逐决策样本（含手牌百分位）\n"
         "  perfecttexas showdown --resume DIR --vs solid|rule|pro|search|random|ranger|cfr\n"
@@ -2691,6 +2692,58 @@ int cmdAllinAudit(int argc, char** argv) {
     return 0;
 }
 
+// 合并多段外部日志的裁决读数：与 slumbot 运行结束同公式（总体方差），
+// 只读 winnings/adjusted 两列；裁决只看调整后的 BB/手 ± SE。
+int cmdSlumbotMerge(int argc, char** argv) {
+    const std::vector<std::string> csvs = argValues(argc, argv, "--csv");
+    if (csvs.empty()) {
+        std::printf("slumbot-merge 需要 --csv FILE（可重复）\n");
+        return 1;
+    }
+    struct Agg {
+        long long n = 0;
+        double sumW = 0.0, sumWSq = 0.0, sumA = 0.0, sumASq = 0.0;
+        void add(double w, double a) {
+            ++n; sumW += w; sumWSq += w * w; sumA += a; sumASq += a * a;
+        }
+        void print(const char* label) const {
+            if (n < 2) { std::printf("  %s: %lld 手（不足）\n", label, n); return; }
+            const double d = double(n);
+            const double mw = sumW / d, ma = sumA / d;
+            const double sew = std::sqrt(std::max(sumWSq / d - mw * mw, 0.0) / d);
+            const double sea = std::sqrt(std::max(sumASq / d - ma * ma, 0.0) / d);
+            std::printf("  %s: %lld 手 | 原始 %+.2f ± %.2f 筹码/手 | 调整后 %+.2f ± %.2f 筹码/手"
+                        " = %+.3f ± %.3f BB/手\n",
+                        label, n, mw, sew, ma, sea, ma / 100.0, sea / 100.0);
+        }
+    };
+    Agg tot;
+    for (const std::string& path : csvs) {
+        std::ifstream in(path);
+        if (!in) {
+            std::printf("打不开 %s\n", path.c_str());
+            return 1;
+        }
+        std::string line;
+        std::getline(in, line);  // header
+        if (line.rfind("hand,client_pos,winnings,adjusted,", 0) != 0) {
+            std::printf("%s: 表头不是 slumbot 日志格式\n", path.c_str());
+            return 1;
+        }
+        Agg a;
+        while (std::getline(in, line)) {
+            const auto f = splitCsvLine(line);
+            if (f.size() < 10) continue;
+            a.add(std::atof(f[2].c_str()), std::atof(f[3].c_str()));
+        }
+        a.print(path.c_str());
+        tot.n += a.n; tot.sumW += a.sumW; tot.sumWSq += a.sumWSq;
+        tot.sumA += a.sumA; tot.sumASq += a.sumASq;
+    }
+    tot.print("合并");
+    return 0;
+}
+
 // 承诺审计：外部日志里"我们投了一大笔之后弃牌"的手，按投入深度和弃牌街分组。
 // #111(c) 显示 rng1 的赤字 62% 来自这类手（投 76BB 再弃），但当时是一次性脚本；
 // 这个子命令把同一测量变成可复现指标，训练/部署改动前后可直接对比。
@@ -3146,6 +3199,299 @@ int cmdSlumbotDecisions(int argc, char** argv) {
     }
     std::fprintf(stderr, "slumbot-decisions: %d 手，%d 行，重放失败 %d\n", hands, rows,
                  badReplay);
+    return 0;
+}
+
+// ---------------------------------------------------------------- 快速环：外部状态决策评估
+
+// 在**外部真实牌局状态**上给策略打分。外部亏损集中在转/河牌的跟注-弃牌
+// （README 按街分解：两座位在翻前/翻牌都是正收益，亏损全在到河牌的摊牌），
+// 所以这里把 Slumbot 日志里的每一个"我们的决策"原样回放：状态固定（同一批
+// 手牌、同一副公共牌、同一个对手底牌），用枚举剩余公共牌算精确胜率，得到
+// "弃牌 / 跟注"两个动作的事后 EV，再看策略在这两个动作上的概率质量。
+//
+// 指标 = 策略相对事后最优的可回收 EV 损失（筹码/手，除以 100 即 BB/手）。
+// 事后最优用到了对手底牌，绝对数值是上界，只能在**同一批固定状态**上做 A/B。
+// 优点：完全本地、秒级、无发牌方差（状态固定，输出对权重是确定性的）。
+int cmdSlumbotPolicyEval(int argc, char** argv) {
+    const std::vector<std::string> csvs = argValues(argc, argv, "--csv");
+    const std::string dir = argStr(argc, argv, "--resume", "");
+    const int maxHands = argInt(argc, argv, "--hands", 0);
+    const float temp = static_cast<float>(argDouble(argc, argv, "--temp", 0.5));
+    if (csvs.empty() || dir.empty()) {
+        std::printf("slumbot-policy-eval 需要 --resume DIR --csv FILE（可重复）\n");
+        return 1;
+    }
+    texas::nn::ModelConfig mc;
+    mc.hidden = argInt(argc, argv, "--hidden", 256);
+    mc.lstmHidden = argInt(argc, argv, "--lstm", 128);
+    texas::nn::Actor actors[2];
+    for (int s = 0; s < 2; ++s) {
+        actors[s] = texas::nn::Actor(std::make_shared<texas::nn::ActorImpl>(mc));
+    }
+    if (!loadActors(actors, dir)) {
+        std::printf("cannot load actors from %s\n", dir.c_str());
+        return 1;
+    }
+    for (int s = 0; s < 2; ++s) actors[s]->eval();
+
+    // 某个固定局面上的策略概率。与 policyMove 同一条前向路径（T 温度、rangeEq
+    // 取部署默认 0.5）。
+    auto policyProbs = [&](const texas::HUState& st, const texas::LegalMove* lm, int n,
+                           float* probs) {
+        const int seat = st.toAct;
+        torch::NoGradGuard ng;
+        torch::Tensor nodeT = torch::zeros({1, texas::kNodeInput}, torch::kFloat32);
+        torch::Tensor seqT =
+            torch::zeros({1, texas::kHistSteps, texas::kHistDim}, torch::kFloat32);
+        torch::Tensor featT = torch::zeros({n, texas::kActionInput}, torch::kFloat32);
+        torch::Tensor sampleT = torch::zeros({n}, torch::kLong);
+        torch::Tensor idT = torch::zeros({n}, torch::kLong);
+        texas::Obs obs;
+        texas::encodeObservation(st, obs, 24);
+        std::copy(obs.node.begin(), obs.node.end(), nodeT.data_ptr<float>());
+        std::copy(obs.seq.begin(), obs.seq.end(), seqT.data_ptr<float>());
+        for (int i = 0; i < n; ++i) {
+            std::array<float, texas::kActionInput> af;
+            texas::encodeActionFeature(st, lm[i], af);
+            std::copy(af.begin(), af.end(), featT.data_ptr<float>() + i * texas::kActionInput);
+            idT.data_ptr<int64_t>()[i] = lm[i].slot;
+        }
+        torch::Tensor logits = actors[seat]->forward(nodeT, seqT, featT, sampleT, idT);
+        const float* lp = logits.data_ptr<float>();
+        float scaled[texas::kNumActions];
+        for (int i = 0; i < texas::kNumActions; ++i) {
+            scaled[i] = (temp == 1.0f) ? lp[i] : lp[i] / temp;
+        }
+        texas::ppo::maskedSoftmax(scaled, texas::kNumActions, probs);
+        return true;
+    };
+
+    // 双方底牌已知、公共牌已发 boardN 张时的精确摊牌胜率（枚举剩余公共牌）。
+    auto exactEquity = [](const texas::Card* mine, const texas::Card* theirs,
+                          const texas::Card* board, int boardN) {
+        bool used[texas::kNumCards] = {};
+        used[mine[0]] = used[mine[1]] = used[theirs[0]] = used[theirs[1]] = true;
+        texas::Card known[5];
+        for (int k = 0; k < boardN; ++k) {
+            known[k] = board[k];
+            used[board[k]] = true;
+        }
+        texas::Card deck[texas::kNumCards];
+        int nDeck = 0;
+        for (int c = 0; c < texas::kNumCards; ++c) {
+            if (!used[c]) deck[nDeck++] = static_cast<texas::Card>(c);
+        }
+        double win = 0.0, tie = 0.0, total = 0.0;
+        auto evalOne = [&](const texas::Card* run, int nRun) {
+            texas::Card a[7], b[7];
+            a[0] = mine[0];
+            a[1] = mine[1];
+            b[0] = theirs[0];
+            b[1] = theirs[1];
+            int n = 2;
+            for (int k = 0; k < boardN; ++k) {
+                a[n] = b[n] = known[k];
+                ++n;
+            }
+            for (int k = 0; k < nRun; ++k) {
+                a[n] = b[n] = run[k];
+                ++n;
+            }
+            const int s0 = texas::evaluate7(a);
+            const int s1 = texas::evaluate7(b);
+            if (s0 > s1) win += 1.0;
+            else if (s0 == s1) tie += 1.0;
+            total += 1.0;
+        };
+        const int need = 5 - boardN;
+        if (need <= 0) {
+            evalOne(nullptr, 0);
+        } else if (need == 1) {
+            for (int x = 0; x < nDeck; ++x) evalOne(&deck[x], 1);
+        } else if (need == 2) {
+            for (int x = 0; x < nDeck; ++x) {
+                for (int y = x + 1; y < nDeck; ++y) {
+                    const texas::Card run[2] = {deck[x], deck[y]};
+                    evalOne(run, 2);
+                }
+            }
+        } else {
+            return -1.0;  // 翻前不做（太贵，且外部亏损不在翻前）
+        }
+        return (total > 0) ? (win + 0.5 * tie) / total : 0.5;
+    };
+
+    struct Agg {
+        int n = 0;       // 可评决策（s 有跟注压力且策略质量落在弃/跟）
+        int hits = 0;    // argmax(弃/跟) 命中事后最优
+        int skipped = 0; // 有跟注压力但策略质量几乎全在加注/弃跟之外
+        double loss = 0.0;
+        double lossSq = 0.0;
+        double raiseMass = 0.0;
+    };
+    Agg total, byStreet[5], byBucket[5];
+    const int potEdge[4] = {300, 600, 1500, 4000};
+    auto bucketOf = [&](int pot) {
+        int b = 0;
+        while (b < 4 && pot >= potEdge[b]) ++b;
+        return b;
+    };
+
+    int handsDone = 0, badReplay = 0, oppDecisions = 0;
+    for (const std::string& path : csvs) {
+        std::ifstream in(path);
+        if (!in) {
+            std::printf("打不开 %s\n", path.c_str());
+            continue;
+        }
+        std::string line;
+        std::getline(in, line);
+        texas::Rng rng(11);
+        while (std::getline(in, line)) {
+            if (maxHands > 0 && handsDone >= maxHands) break;
+            const auto f = splitCsvLine(line);
+            if (f.size() < 10 || f[6].empty()) continue;
+            const int clientPos = std::atoi(f[1].c_str());
+            const int mySeat = (clientPos == 0) ? 1 : 0;
+            const auto hole = splitWs(f[7]);
+            const auto bot = splitWs(f[8]);
+            const auto boardS = splitWs(f[9]);
+            if (hole.size() < 2 || bot.size() < 2) continue;
+            texas::Card mine[2] = {texas::parseCard(hole[0].c_str()),
+                                   texas::parseCard(hole[1].c_str())};
+            texas::Card theirs[2] = {texas::parseCard(bot[0].c_str()),
+                                     texas::parseCard(bot[1].c_str())};
+            texas::Card bd[5] = {0, 0, 0, 0, 0};
+            bool ok = mine[0] >= 0 && mine[1] >= 0 && theirs[0] >= 0 && theirs[1] >= 0;
+            for (size_t k = 0; ok && k < boardS.size() && k < 5; ++k) {
+                bd[k] = texas::parseCard(boardS[k].c_str());
+                ok = bd[k] >= 0;
+            }
+            if (!ok) continue;
+            ++handsDone;
+            texas::HUState st = (clientPos == 0) ? texas::makeState(theirs, mine, bd, 0)
+                                                 : texas::makeState(mine, theirs, bd, 0);
+            const std::string& action = f[6];
+            size_t i = 0;
+            bool broke = false;
+            while (i < action.size() && !st.finished) {
+                const char c = action[i++];
+                texas::Move m{};
+                if (c == '/') continue;
+                if (c == 'k') {
+                    m.kind = texas::MK_CHECK;
+                    m.to = st.contrib[st.toAct];
+                } else if (c == 'c') {
+                    m.kind = texas::MK_CALL;
+                    m.to = st.contrib[1 - st.toAct];
+                } else if (c == 'f') {
+                    m.kind = texas::MK_FOLD;
+                    m.to = st.contrib[st.toAct];
+                } else if (c == 'b') {
+                    int v = 0;
+                    const size_t start = i;
+                    while (i < action.size() && action[i] >= '0' && action[i] <= '9') {
+                        v = v * 10 + (action[i] - '0');
+                        ++i;
+                    }
+                    if (i == start) {
+                        broke = true;
+                        break;
+                    }
+                    m.kind = texas::MK_RAISE;
+                    m.to = static_cast<int16_t>(v);
+                } else {
+                    broke = true;
+                    break;
+                }
+                // 应用动作**之前**给我们的策略打分（状态与外部日志完全一致）。
+                if (st.toAct != mySeat) {
+                    ++oppDecisions;
+                } else if (st.street >= texas::ST_FLOP) {
+                    texas::LegalMove lm[texas::kNumActions];
+                    const int n = texas::legalMoves(st, lm);
+                    if (n > 0) {
+                        float probs[texas::kNumActions] = {};
+                        policyProbs(st, lm, n, probs);
+                        float pFold = 0.0f, pCall = 0.0f;
+                        bool hasFold = false, hasCall = false;
+                        for (int k = 0; k < n; ++k) {
+                            if (lm[k].slot == texas::kSlotFold) {
+                                pFold = probs[lm[k].slot];
+                                hasFold = true;
+                            } else if (lm[k].slot == texas::kSlotCheckCall) {
+                                pCall = probs[lm[k].slot];
+                                hasCall = true;
+                            }
+                        }
+                        const int need = texas::toCall(st, mySeat);
+                        const double pFC = double(pFold) + double(pCall);
+                        if (need > 0 && hasFold && hasCall && pFC > 1e-3) {
+                            const int boardN = int(st.street) + 2;
+                            const double eq = exactEquity(mine, theirs, bd, boardN);
+                            if (eq >= 0.0) {
+                                const int contrib = int(st.contrib[mySeat]);
+                                const int pot = st.pot();
+                                const double evFold = -double(contrib);
+                                const double evCall =
+                                    eq * double(pot + need) - double(contrib + need);
+                                const double best = std::max(evFold, evCall);
+                                const double loss = (double(pFold) * (best - evFold) +
+                                                     double(pCall) * (best - evCall)) /
+                                                    pFC;
+                                const bool hitBest =
+                                    (evCall >= evFold) ? (pCall >= pFold) : (pFold >= pCall);
+                                Agg* as[2] = {&total, &byStreet[int(st.street)]};
+                                Agg* ab = &byBucket[bucketOf(pot)];
+                                for (Agg* a : as) {
+                                    ++a->n;
+                                    a->loss += loss;
+                                    a->lossSq += loss * loss;
+                                    a->raiseMass += 1.0 - pFC;
+                                    if (hitBest) ++a->hits;
+                                }
+                                ++ab->n;
+                                ab->loss += loss;
+                                ab->lossSq += loss * loss;
+                                ab->raiseMass += 1.0 - pFC;
+                                if (hitBest) ++ab->hits;
+                            }
+                        } else {
+                            ++total.skipped;
+                            ++byStreet[int(st.street)].skipped;
+                        }
+                    }
+                }
+                texas::applyMove(st, m, rng);
+                if (st.finished) break;
+            }
+            if (broke) ++badReplay;
+        }
+    }
+
+    const char* streetNames[4] = {"flop", "turn", "river", "?"};
+    auto show = [&](const char* name, const Agg& a) {
+        if (a.n <= 0) {
+            std::printf("  %-9s n=0\n", name);
+            return;
+        }
+        const double mean = a.loss / double(a.n);
+        const double var = std::max(0.0, a.lossSq / double(a.n) - mean * mean);
+        const double se = std::sqrt(var / double(a.n));
+        std::printf("  %-9s dec=%5d | 命中 %5.1f%% | 事后损失 %7.1f ± %5.1f 筹码/决策 "
+                    "| %+6.2f BB/手归一 | 加注质量 %.2f\n",
+                    name, a.n, 100.0 * double(a.hits) / double(a.n), mean, se,
+                    handsDone > 0 ? a.loss / double(handsDone) / 100.0 : 0.0, a.raiseMass / a.n);
+    };
+    std::printf("slumbot-policy-eval: %s | T=%.2f | %d 手，重放失败 %d | 对手决策 %d\n",
+                dir.c_str(), double(temp), handsDone, badReplay, oppDecisions);
+    show("合计", total);
+    std::printf("  按街：\n");
+    for (int s = 1; s <= 3; ++s) show(streetNames[s - 1], byStreet[s]);
+    std::printf("  按底池：\n");
+    const char* potNames[5] = {"0-300", "300-600", "600-1500", "1500-4000", ">4000"};
+    for (int b = 0; b < 5; ++b) show(potNames[b], byBucket[b]);
     return 0;
 }
 
@@ -3983,14 +4329,16 @@ struct BlueprintMeta {
     int buckets = texas::kDefaultBuckets;
     int raiseCap = texas::kDefaultRaiseCap;
     int recall = 0;          // 1 = 压缩完美召回（每街 2 bit 加注历史入 key）
+    int slim = 0;            // 1 = 瘦 key（底池桶/跨街历史不入 key，R2 对照）
 };
 
 bool writeBlueprintMeta(const std::string& dir, const BlueprintMeta& m) {
     FILE* f = std::fopen((dir + "/meta.txt").c_str(), "w");
     if (!f) return false;
-    std::fprintf(f, "iters %llu\nseed %llu\nbuckets %d\nraise_cap %d\nrecall %d\nstride %d\n",
+    std::fprintf(f,
+                 "iters %llu\nseed %llu\nbuckets %d\nraise_cap %d\nrecall %d\nslim %d\nstride %d\n",
                  static_cast<unsigned long long>(m.iters),
-                 static_cast<unsigned long long>(m.seed), m.buckets, m.raiseCap, m.recall,
+                 static_cast<unsigned long long>(m.seed), m.buckets, m.raiseCap, m.recall, m.slim,
                  texas::kAbstractStride);
     std::fclose(f);
     return true;
@@ -4010,6 +4358,7 @@ bool readBlueprintMetaFile(const std::string& path, BlueprintMeta& m) {
         else if (std::strcmp(k, "buckets") == 0) { m.buckets = static_cast<int>(v); hasB = true; }
         else if (std::strcmp(k, "raise_cap") == 0) { m.raiseCap = static_cast<int>(v); hasR = true; }
         else if (std::strcmp(k, "recall") == 0) m.recall = static_cast<int>(v);
+        else if (std::strcmp(k, "slim") == 0) m.slim = static_cast<int>(v);
         else if (std::strcmp(k, "stride") == 0 && v != texas::kAbstractStride) return false;
     }
     return hasIters && hasB && hasR;
@@ -4038,9 +4387,9 @@ bool saveBlueprintCheckpoint(const std::string& dir, const texas::RegretTable& t
     if (tab.save(snapDir + "/bp_" + tag + ".bin")) {
         FILE* sf = std::fopen((snapDir + "/meta_" + tag + ".txt").c_str(), "w");
         if (sf) {
-            std::fprintf(sf, "iters %llu\nbuckets %d\nraise_cap %d\nrecall %d\n",
+            std::fprintf(sf, "iters %llu\nbuckets %d\nraise_cap %d\nrecall %d\nslim %d\n",
                          static_cast<unsigned long long>(meta.iters), meta.buckets, meta.raiseCap,
-                         meta.recall);
+                         meta.recall, meta.slim);
             std::fclose(sf);
         }
     }
@@ -4056,6 +4405,7 @@ int cmdBlueprintTrain(int argc, char** argv) {
     int buckets = argInt(argc, argv, "--buckets", texas::kDefaultBuckets);
     int raiseCap = argInt(argc, argv, "--raise-cap", texas::kDefaultRaiseCap);
     int recall = argInt(argc, argv, "--recall", 0);  // 1 = 压缩完美召回
+    int slim = argInt(argc, argv, "--key-slim", 0);  // 1 = 瘦 key（R2 对照）
     const uint64_t seed = argU64(argc, argv, "--seed", 20261107ULL);
     if (outDir.rfind("/tmp", 0) == 0) {
         std::printf("!! 纪律：blueprint 检查点禁止写 /tmp（会被系统清理），请用 --out 指到 ~/models\n");
@@ -4071,6 +4421,7 @@ int cmdBlueprintTrain(int argc, char** argv) {
     meta.buckets = buckets;
     meta.raiseCap = raiseCap;
     meta.recall = recall;
+    meta.slim = slim;
 
     if (!resumeDir.empty()) {
         BlueprintMeta rm;
@@ -4081,9 +4432,10 @@ int cmdBlueprintTrain(int argc, char** argv) {
         // 抽象口径决定 key 布局，不能混训：未显式传参时跟随检查点（与 br/distill 同口径）。
         if (argValue(argc, argv, "--buckets", nullptr) == nullptr) buckets = rm.buckets;
         if (argValue(argc, argv, "--raise-cap", nullptr) == nullptr) raiseCap = rm.raiseCap;
-        if (rm.buckets != buckets || rm.raiseCap != raiseCap) {
-            std::printf("!! 抽象不一致：检查点 B=%d R=%d，命令行 B=%d R=%d\n",
-                        rm.buckets, rm.raiseCap, buckets, raiseCap);
+        if (argValue(argc, argv, "--key-slim", nullptr) == nullptr) slim = rm.slim;
+        if (rm.buckets != buckets || rm.raiseCap != raiseCap || rm.slim != slim) {
+            std::printf("!! 抽象不一致：检查点 B=%d R=%d slim=%d，命令行 B=%d R=%d slim=%d\n",
+                        rm.buckets, rm.raiseCap, rm.slim, buckets, raiseCap, slim);
             return 1;
         }
         // 召回口径决定 key 布局，不能混训：未显式传 --recall 时跟随检查点。
@@ -4105,8 +4457,10 @@ int cmdBlueprintTrain(int argc, char** argv) {
         }
         meta = rm;
         meta.recall = recall;
-        std::printf("blueprint resume: %s @ %llu iters, %u infosets, recall=%d\n", resumeDir.c_str(),
-                    static_cast<unsigned long long>(rm.iters), tab.size(), recall);
+        meta.slim = slim;
+        std::printf("blueprint resume: %s @ %llu iters, %u infosets, recall=%d slim=%d\n",
+                    resumeDir.c_str(), static_cast<unsigned long long>(rm.iters), tab.size(),
+                    recall, slim);
     }
 
     // key 的牌桶字段只有 8 bit：B=0 静默退化、B>256 截断碰撞，都必须拒跑
@@ -4116,16 +4470,17 @@ int cmdBlueprintTrain(int argc, char** argv) {
         return 1;
     }
 
-    texas::HUNLGame root(&rng, buckets, raiseCap, &sm, recall);
+    texas::HUNLGame root(&rng, buckets, raiseCap, &sm, recall, slim);
     const uint64_t start = meta.iters;
     uint64_t done = 0;
     uint64_t nextSave = (start / saveEvery + 1) * saveEvery;
     const auto t0 = std::chrono::steady_clock::now();
-    std::printf("blueprint-train: +%llu iters (总 %llu) | B=%d R=%d recall=%d seed=%llu | out=%s\n",
+    std::printf("blueprint-train: +%llu iters (总 %llu) | B=%d R=%d recall=%d slim=%d seed=%llu | out=%s\n",
                 static_cast<unsigned long long>(iters),
-                static_cast<unsigned long long>(start + iters), buckets, raiseCap, recall,
+                static_cast<unsigned long long>(start + iters), buckets, raiseCap, recall, slim,
                 static_cast<unsigned long long>(seed), outDir.c_str());
-    std::printf("  %10s %10s %12s %12s\n", "iters", "secs", "iter/s", "infosets");
+    // 访问密度 = 累计迭代 / 当前表大小：ε 只作为诊断量看它的斜率，不再当采纳门（见计划书 §9.1）。
+    std::printf("  %10s %10s %12s %12s %10s\n", "iters", "secs", "iter/s", "infosets", "访问/角");
     std::fflush(stdout);
 
     while (done < iters) {
@@ -4133,9 +4488,11 @@ int cmdBlueprintTrain(int argc, char** argv) {
         texas::mcfrTrain(root, tab, n, rng, start + done);
         done += n;
         const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::printf("  %10llu %10.1f %12.0f %12u\n",
+        const double visitsPerInfoset =
+            tab.size() ? static_cast<double>(start + done) / static_cast<double>(tab.size()) : 0.0;
+        std::printf("  %10llu %10.1f %12.0f %12u %10.1f\n",
                     static_cast<unsigned long long>(start + done), sec,
-                    static_cast<double>(done) / std::max(sec, 1e-6), tab.size());
+                    static_cast<double>(done) / std::max(sec, 1e-6), tab.size(), visitsPerInfoset);
         std::fflush(stdout);
         if (start + done >= nextSave || done == iters) {
             meta.iters = start + done;
@@ -4162,9 +4519,11 @@ int cmdBlueprintBr(int argc, char** argv) {
     const bool explicitB = argValue(argc, argv, "--buckets", nullptr) != nullptr;
     const bool explicitR = argValue(argc, argv, "--raise-cap", nullptr) != nullptr;
     const bool explicitRec = argValue(argc, argv, "--recall", nullptr) != nullptr;
+    const bool explicitSlim = argValue(argc, argv, "--key-slim", nullptr) != nullptr;
     int buckets = argInt(argc, argv, "--buckets", texas::kDefaultBuckets);
     int raiseCap = argInt(argc, argv, "--raise-cap", texas::kDefaultRaiseCap);
     int recall = argInt(argc, argv, "--recall", 0);
+    int slim = argInt(argc, argv, "--key-slim", 0);
 
     texas::RegretTable tab(texas::kAbstractStride);
     std::string binPath = bp;
@@ -4186,6 +4545,7 @@ int cmdBlueprintBr(int argc, char** argv) {
         if (!explicitB) buckets = m.buckets;
         if (!explicitR) raiseCap = m.raiseCap;
         if (!explicitRec) recall = m.recall;
+        if (!explicitSlim) slim = m.slim;
     }
     if (!tab.load(binPath)) {
         std::printf("!! 读不到 blueprint 表: %s\n", binPath.c_str());
@@ -4198,14 +4558,20 @@ int cmdBlueprintBr(int argc, char** argv) {
     cfg.buckets = buckets;
     cfg.raiseCap = raiseCap;
     cfg.recall = recall;
+    cfg.slim = slim;
     cfg.byStreet = hasFlag(argc, argv, "--by-street");
     cfg.bothSeats = !hasFlag(argc, argv, "--one-seat");
     cfg.selfPlayCheck = hasFlag(argc, argv, "--self-play-check");
     cfg.maxNodesPerSample = argU64(argc, argv, "--max-nodes", 0);
-    std::printf("blueprint-br: %s | %u infosets | %d 抽样 | B=%d R=%d recall=%d seed=%llu | %s%s\n",
-                binPath.c_str(), tab.size(), samples, buckets, raiseCap, recall,
+    std::printf("blueprint-br: %s | %u infosets | %d 抽样 | B=%d R=%d recall=%d slim=%d seed=%llu | %s%s\n",
+                binPath.c_str(), tab.size(), samples, buckets, raiseCap, recall, slim,
                 static_cast<unsigned long long>(seed),
                 cfg.bothSeats ? "双座位" : "单座位", cfg.byStreet ? " +按街分解" : "");
+    if (haveMeta && tab.size()) {
+        std::printf("  训练访问密度 = %.0f 次/角（%llu iters / %u infosets）\n",
+                    static_cast<double>(m.iters) / static_cast<double>(tab.size()),
+                    static_cast<unsigned long long>(m.iters), tab.size());
+    }
     std::fflush(stdout);
     const auto t0 = std::chrono::steady_clock::now();
     const texas::BrResult r = texas::runBlueprintBR(tab, cfg);
@@ -4227,7 +4593,8 @@ int cmdBlueprintBr(int argc, char** argv) {
             std::printf("%s %+.3f  ", kStreetName[st], r.exploitByStreetBb[st]);
         std::printf("BB/手\n");
     }
-    std::printf("  G1 门 ≤ 0.150 BB/手（§9 收紧）: %s\n", r.exploitBb <= 0.15 ? "PASS" : "FAIL");
+    // ε 是诊断量（对最坏对手的保证），不是采纳门；采纳看外部 12k 手 ≥ 基线 + 2σ（计划书 §9.1）。
+    std::printf("  诊断（非采纳门）：ε = %+0.3f BB/手；同时看访问密度与 ε 的斜率\n", r.exploitBb);
     return 0;
 }
 
@@ -4238,9 +4605,9 @@ struct DistillData {
 };
 
 void makeDistillSample(const texas::HUState& s, const texas::RegretTable& tab, int buckets,
-                       int raiseCap, texas::TeacherSample& ts, int recall = 0) {
+                       int raiseCap, texas::TeacherSample& ts, int recall = 0, int slim = 0) {
     float target[texas::kNumActions] = {};
-    texas::abstractToSlots(s, tab, buckets, raiseCap, target, recall);
+    texas::abstractToSlots(s, tab, buckets, raiseCap, target, recall, slim);
     texas::Obs obs;
     const float eq = static_cast<float>(texas::perfectEquity(s, s.toAct, 24));
     texas::encodeObservation(s, obs, eq);
@@ -4283,19 +4650,19 @@ texas::Move randomLegalMove(const texas::HUState& s, texas::Rng& rng) {
 // blueprint 自对弈 + 随机发牌/随机动作混合采样决策点（计划书 §4.1）。
 void generateDistillSamples(const texas::RegretTable& tab, int games, uint64_t seed,
                             int buckets, int raiseCap, float mixRandom, float bpTemp,
-                            DistillData& out, int recall = 0) {
+                            DistillData& out, int recall = 0, int slim = 0) {
     texas::Rng rng(seed);
     for (int g = 0; g < games; ++g) {
         texas::HUState s = texas::dealNewHand(rng);
         int steps = 0;
         while (!s.finished && steps++ < 80) {
             texas::TeacherSample ts;
-            makeDistillSample(s, tab, buckets, raiseCap, ts, recall);
+            makeDistillSample(s, tab, buckets, raiseCap, ts, recall, slim);
             out.bySeat[s.toAct].push_back(std::move(ts));
             const bool randomBranch = std::generate_canonical<double, 32>(rng) < mixRandom;
             const texas::Move mv = randomBranch
                 ? randomLegalMove(s, rng)
-                : texas::sampleBlueprintMove(s, tab, buckets, raiseCap, rng, bpTemp, recall);
+                : texas::sampleBlueprintMove(s, tab, buckets, raiseCap, rng, bpTemp, recall, slim);
             texas::applyMove(s, mv, rng);
         }
     }
@@ -4397,7 +4764,7 @@ FidelityResult measureFidelity(texas::nn::Actor actors[2], const DistillData& da
 
 // 从 --bp（目录或快照 .bin）读抽象配置，避免与训练时不一致。
 void resolveBlueprintPath(const std::string& bp, std::string& binPath, int& buckets,
-                          int& raiseCap, int& recall, bool explicitB, bool explicitR) {
+                          int& raiseCap, int& recall, int& slim, bool explicitB, bool explicitR) {
     BlueprintMeta m;
     bool haveMeta = false;
     binPath = bp;
@@ -4416,6 +4783,7 @@ void resolveBlueprintPath(const std::string& bp, std::string& binPath, int& buck
         if (!explicitB) buckets = m.buckets;
         if (!explicitR) raiseCap = m.raiseCap;
         recall = m.recall;
+        slim = m.slim;
     }
 }
 
@@ -4445,8 +4813,9 @@ int cmdBlueprintDistill(int argc, char** argv) {
     int buckets = argInt(argc, argv, "--buckets", texas::kDefaultBuckets);
     int raiseCap = argInt(argc, argv, "--raise-cap", texas::kDefaultRaiseCap);
     int recall = 0;
+    int slim = 0;
     std::string binPath;
-    resolveBlueprintPath(bp, binPath, buckets, raiseCap, recall, explicitB, explicitR);
+    resolveBlueprintPath(bp, binPath, buckets, raiseCap, recall, slim, explicitB, explicitR);
 
     texas::RegretTable tab(texas::kAbstractStride);
     if (!tab.load(binPath)) {
@@ -4496,9 +4865,9 @@ int cmdBlueprintDistill(int argc, char** argv) {
     std::fflush(stdout);
     DistillData trainData, holdData;
     generateDistillSamples(tab, games, seed, buckets, raiseCap, mixRandom, bpTemp, trainData,
-                           recall);
+                           recall, slim);
     generateDistillSamples(tab, holdout, seed + 7919ULL, buckets, raiseCap, mixRandom, bpTemp,
-                           holdData, recall);
+                           holdData, recall, slim);
     std::printf("  样本: 座位0 %zu / 座位1 %zu；留出 %zu\n", trainData.bySeat[0].size(),
                 trainData.bySeat[1].size(), holdData.bySeat[0].size() + holdData.bySeat[1].size());
     if (trainData.bySeat[0].size() < 8 || trainData.bySeat[1].size() < 8) {
@@ -4596,8 +4965,9 @@ int cmdBlueprintEval(int argc, char** argv) {
     int buckets = argInt(argc, argv, "--buckets", texas::kDefaultBuckets);
     int raiseCap = argInt(argc, argv, "--raise-cap", texas::kDefaultRaiseCap);
     int recall = 0;
+    int slim = 0;
     std::string binPath;
-    resolveBlueprintPath(bp, binPath, buckets, raiseCap, recall, explicitB, explicitR);
+    resolveBlueprintPath(bp, binPath, buckets, raiseCap, recall, slim, explicitB, explicitR);
     texas::RegretTable tab(texas::kAbstractStride);
     if (!tab.load(binPath)) {
         std::printf("!! 读不到 blueprint 表: %s\n", binPath.c_str());
@@ -4618,7 +4988,7 @@ int cmdBlueprintEval(int argc, char** argv) {
         }
         DistillData data;
         generateDistillSamples(tab, std::max(1, hands / 8), seed + 7919ULL, buckets, raiseCap,
-                               0.30f, 1.0f, data);
+                               0.30f, 1.0f, data, recall, slim);
         const FidelityResult f = measureFidelity(actors, data);
         std::printf("blueprint-eval 保真: %s | %d 决策点 | top-1 %.3f (门 0.700) | KL %.4f (门 0.100)\n",
                     resume.c_str(), f.count, f.top1, f.kl);
@@ -4637,9 +5007,9 @@ int cmdBlueprintEval(int argc, char** argv) {
             texas::Move mv;
             if (s.toAct == bpSeat) {
                 float abs[texas::kAbstractStride] = {};
-                if (texas::queryBlueprint(s, tab, buckets, raiseCap, abs, recall)) ++trainedHits;
+                if (texas::queryBlueprint(s, tab, buckets, raiseCap, abs, recall, slim)) ++trainedHits;
                 ++decisions;
-                mv = texas::sampleBlueprintMove(s, tab, buckets, raiseCap, rng, 1.0f, recall);
+                mv = texas::sampleBlueprintMove(s, tab, buckets, raiseCap, rng, 1.0f, recall, slim);
             } else {
                 mv = scriptMove(vs, s, rng);
             }
@@ -4679,8 +5049,10 @@ int main(int argc, char** argv) {
     if (cmd == "bench-device") return cmdBenchDevice(argc, argv);
     if (cmd == "slumbot-analyze") return cmdSlumbotAnalyze(argc, argv);
     if (cmd == "allin-audit") return cmdAllinAudit(argc, argv);
+    if (cmd == "slumbot-merge") return cmdSlumbotMerge(argc, argv);
     if (cmd == "commit-audit") return cmdCommitAudit(argc, argv);
     if (cmd == "slumbot-decisions") return cmdSlumbotDecisions(argc, argv);
+    if (cmd == "slumbot-policy-eval") return cmdSlumbotPolicyEval(argc, argv);
     if (cmd == "river-ranges") return cmdRiverRanges(argc, argv);
     if (cmd == "showdown") return cmdShowdown(argc, argv);
     if (cmd == "slumbot-fit") return cmdSlumbotFit(argc, argv);

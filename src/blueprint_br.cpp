@@ -26,6 +26,7 @@ struct BrCtx {
     int buckets = kDefaultBuckets;
     int raiseCap = kDefaultRaiseCap;
     int recall = 0;
+    int slim = 0;
     int brSeat = 0;
     int brBucket[4] = {0, 0, 0, 0};  // 自洽性检查用：BR 固定底牌在四条街的桶
     bool policyMode = false;
@@ -202,7 +203,7 @@ Val brWalk(const HUState& s, const Reach& gr, const uint8_t* seq, int seqLen, ui
     float brSig[kAbstractStride] = {};
     if (needOwn) {
         const uint64_t key = packInfoset(s.street, s.pot(), c.brBucket[s.street], seq, seqLen,
-                                         s.toAct, c.recall ? hist : 0);
+                                         s.toAct, c.recall ? hist : 0, c.slim);
         const int64_t idx = c.tab->find(key);
         if (idx >= 0) {
             c.tab->averageStrategy(static_cast<uint32_t>(idx), legal, brSig);
@@ -220,7 +221,7 @@ Val brWalk(const HUState& s, const Reach& gr, const uint8_t* seq, int seqLen, ui
         for (int b = 0; b < kMaxGroups; ++b) {
             if (gr[b] <= 0.0f) continue;
             const uint64_t key = packInfoset(s.street, s.pot(), b, seq, seqLen, s.toAct,
-                                             c.recall ? hist : 0);
+                                             c.recall ? hist : 0, c.slim);
             const int64_t idx = c.tab->find(key);
             if (idx >= 0) {
                 c.tab->averageStrategy(static_cast<uint32_t>(idx), legal, sig[b]);
@@ -291,6 +292,7 @@ BrResult runBlueprintBR(const RegretTable& tab, const BrConfig& cfg) {
     c.nodeBudget = cfg.maxNodesPerSample;
     c.policyMode = cfg.selfPlayCheck;
     c.recall = cfg.recall;
+    c.slim = cfg.slim;
     buildCombos(c);
 
     double sum0 = 0.0, sq0 = 0.0, sum1 = 0.0, sq1 = 0.0;

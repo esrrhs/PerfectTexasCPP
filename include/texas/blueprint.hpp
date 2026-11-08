@@ -64,8 +64,11 @@ int potBucketOf(int pot);
 //
 // hist 是「每街 2 bit 的压缩加注历史」（bit 2k..2k+1 = 第 k 街加注档 0..3），
 // recall=1 时入 key，把跨街 imperfect recall 升到「压缩完美召回」。0 = 旧口径。
+//
+// slim=1 时把 potBucket 与 hist 都置零（R2 瘦 key 对照）：key 只剩
+// street + 牌桶 + 当前街序列 + seat，用来验证「把底池/跨街历史移出表」的取舍。
 uint64_t packInfoset(int street, int pot, int cardBucket, const uint8_t* seq, int seqLen,
-                     int seat = -1, int hist = 0);
+                     int seat = -1, int hist = 0, int slim = 0);
 
 // 从 HUState.hist 重建当前街抽象动作序列（蒸馏/部署查表用）。返回长度。
 // histOut 非空时同时输出压缩加注历史（与训练侧 HUNLGame 同口径）。
@@ -196,6 +199,7 @@ struct HUNLGame {
     int buckets = kDefaultBuckets;
     int raiseCap = kDefaultRaiseCap;
     int recall = 0;  // 1 = 压缩完美召回（每街 2 bit 加注历史入 key）
+    int slim = 0;    // 1 = 瘦 key（底池桶与跨街历史都不入 key，R2 对照）
     StrengthModel* sm = nullptr;
     int street = ST_PREFLOP;
     int seqLen = 0;
@@ -209,8 +213,8 @@ struct HUNLGame {
     mutable int bucketCache[2][4] = {{-1, -1, -1, -1}, {-1, -1, -1, -1}};
 
     HUNLGame() = default;
-    HUNLGame(Rng* r, int B, int cap, StrengthModel* m, int rec = 0)
-        : rng(r), buckets(B), raiseCap(cap), recall(rec), sm(m) {}
+    HUNLGame(Rng* r, int B, int cap, StrengthModel* m, int rec = 0, int sl = 0)
+        : rng(r), buckets(B), raiseCap(cap), recall(rec), slim(sl), sm(m) {}
 
     void deal(Rng& r) {
         state = dealNewHand(r);
@@ -242,7 +246,7 @@ struct HUNLGame {
             bucketCache[p][state.street] = cb;
         }
         return packInfoset(state.street, state.pot(), cb, seq, seqLen, state.toAct,
-                           recall ? histBits : 0);
+                           recall ? histBits : 0, slim);
     }
 
     void apply(int id) {
@@ -272,17 +276,17 @@ struct HUNLGame {
 // 查表：对一个独立 HUState 输出 blueprint 平均策略（抽象动作分布，长度 kAbstractStride）。
 // 返回 false 表示该 infoset 未被训练过（输出均匀）。
 bool queryBlueprint(const HUState& s, const RegretTable& tab, int buckets, int raiseCap,
-                    float* out, int recall = 0);
+                    float* out, int recall = 0, int slim = 0);
 
 // 蒸馏槽映射（计划书 §4.2）：把 5 个抽象动作的概率质量投到 19 个 actor 槽。
 // fold/check-call/all-in 直接对位；两个 pot 比例加注按其真实金额落入 legalMoves
 // 的尺寸带（带内金额任意，槽只表示量级），找不到覆盖带时取最近的带。
 // 输出 target[kNumActions]，非法槽为 0、总和为 1。
 bool abstractToSlots(const HUState& s, const RegretTable& tab, int buckets, int raiseCap,
-                     float* target, int recall = 0);
+                     float* target, int recall = 0, int slim = 0);
 
 // 部署/采样翻译（计划书 §4.3）：按平均策略采样抽象动作，返回对应的真实 Move。
 Move sampleBlueprintMove(const HUState& s, const RegretTable& tab, int buckets, int raiseCap,
-                         Rng& rng, float temp = 1.0f, int recall = 0);
+                         Rng& rng, float temp = 1.0f, int recall = 0, int slim = 0);
 
 }  // namespace texas

@@ -23,6 +23,7 @@ struct BrConfig {
     int buckets = kDefaultBuckets;
     int raiseCap = kDefaultRaiseCap;
     int recall = 0;             // 1 = 与压缩完美召回训练的表对齐（每街 2 bit）
+    int slim = 0;               // 1 = 与瘦 key 表对齐（底池桶/跨街历史不入 key）
     bool bothSeats = true;      // 每抽样同时算 BR0/BR1（方差低，成本 2×）
     bool selfPlayCheck = false; // 诊断：BR 座位也按蓝图策略行动（不再是 max），
                                 // 双座位收益之和应接近 0，用来校验遍历/结算自洽
