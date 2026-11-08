@@ -3864,6 +3864,217 @@ int cmdRiverRanges(int argc, char** argv) {
     return 0;
 }
 
+// 全知 vs 范围：河牌"知道对手具体两张底牌"的最优动作，和"只看该尺寸/底池桶
+// 的经验范围"的最优动作，差多少。纯分析工具，不改训练/评测。
+// 范围表按 (底池桶, 下注尺寸桶) 收集对手实际亮出的两张底牌；样本里只保留
+// 我们（客户端座位）在河牌面对下注（need > 0）的决策，动作只考虑 fold/call。
+int cmdSlumbotOracleGap(int argc, char** argv) {
+    const std::vector<std::string> csvs = argValues(argc, argv, "--csv");
+    if (csvs.empty()) {
+        std::printf("slumbot-oracle-gap 需要 --csv FILE（可重复）\n");
+        return 1;
+    }
+
+    struct GapSample {
+        texas::Card mine[2] = {0, 0};
+        texas::Card theirs[2] = {0, 0};
+        texas::Card board[5] = {0, 0, 0, 0, 0};
+        int pot = 0;
+        int need = 0;
+        int sizeBucket = 0;
+        int potBucket = 0;
+    };
+    std::vector<GapSample> samples;
+    // 范围表：key = 小牌 * 52 + 大牌，先收集后去重。
+    std::vector<int> rangeKeys[2][4];
+    int handsSeen = 0;
+    texas::Rng rng(7);
+
+    for (const std::string& path : csvs) {
+        std::ifstream in(path);
+        if (!in) {
+            std::printf("cannot open %s\n", path.c_str());
+            return 1;
+        }
+        std::string line;
+        std::getline(in, line);  // header
+        while (std::getline(in, line)) {
+            const auto f = splitCsvLine(line);
+            if (f.size() < 10 || f[6].empty()) continue;
+            const int clientPos = std::atoi(f[1].c_str());
+            const int mySeat = (clientPos == 0) ? 1 : 0;
+            const auto hole = splitWs(f[7]);
+            const auto bot = splitWs(f[8]);
+            const auto board = splitWs(f[9]);
+            if (hole.size() < 2 || bot.size() < 2 || board.size() < 5) continue;
+            texas::Card mine[2] = {texas::parseCard(hole[0].c_str()),
+                                   texas::parseCard(hole[1].c_str())};
+            texas::Card theirs[2] = {texas::parseCard(bot[0].c_str()),
+                                     texas::parseCard(bot[1].c_str())};
+            texas::Card bd[5] = {0, 0, 0, 0, 0};
+            bool ok = mine[0] >= 0 && mine[1] >= 0 && theirs[0] >= 0 && theirs[1] >= 0;
+            for (size_t k = 0; ok && k < 5; ++k) {
+                bd[k] = texas::parseCard(board[k].c_str());
+                ok = bd[k] >= 0;
+            }
+            if (!ok) continue;
+
+            texas::HUState st = (clientPos == 0) ? texas::makeState(theirs, mine, bd, 0)
+                                                 : texas::makeState(mine, theirs, bd, 0);
+            ++handsSeen;
+
+            const std::string& action = f[6];
+            size_t i = 0;
+            while (i < action.size()) {
+                const char c = action[i++];
+                if (c == '/') continue;
+                texas::Move m{};
+                if (c == 'k') {
+                    m.kind = texas::MK_CHECK;
+                    m.to = st.contrib[st.toAct];
+                } else if (c == 'c') {
+                    m.kind = texas::MK_CALL;
+                    m.to = st.contrib[1 - st.toAct];
+                } else if (c == 'f') {
+                    m.kind = texas::MK_FOLD;
+                    m.to = st.contrib[st.toAct];
+                } else if (c == 'b') {
+                    int v = 0;
+                    const size_t start = i;
+                    while (i < action.size() && action[i] >= '0' && action[i] <= '9') {
+                        v = v * 10 + (action[i] - '0');
+                        ++i;
+                    }
+                    if (i == start) break;
+                    m.kind = texas::MK_RAISE;
+                    m.to = static_cast<int16_t>(v);
+                } else {
+                    break;
+                }
+
+                if (st.street == texas::ST_RIVER && st.boardN == 5 && st.toAct == mySeat) {
+                    const int actor = st.toAct;
+                    const int need = texas::toCall(st, actor);
+                    if (need > 0) {
+                        const int pot = st.pot();
+                        const float betRatio = float(need) / float(std::max(1, pot - need));
+                        GapSample s;
+                        s.mine[0] = mine[0];
+                        s.mine[1] = mine[1];
+                        s.theirs[0] = theirs[0];
+                        s.theirs[1] = theirs[1];
+                        for (int k = 0; k < 5; ++k) s.board[k] = bd[k];
+                        s.pot = pot;
+                        s.need = need;
+                        s.sizeBucket = (betRatio < 0.5f) ? 0
+                                       : (betRatio < 0.8f) ? 1
+                                       : (betRatio < 1.3f) ? 2 : 3;
+                        s.potBucket = (pot >= 1500) ? 1 : 0;
+                        samples.push_back(s);
+                        // 该样本面对的就是对手这个尺寸的下注，顺手把对手底牌计入范围表。
+                        const int lo = std::min(theirs[0], theirs[1]);
+                        const int hi = std::max(theirs[0], theirs[1]);
+                        rangeKeys[s.potBucket][s.sizeBucket].push_back(lo * 52 + hi);
+                    }
+                }
+                texas::applyMove(st, m, rng);
+                if (st.finished) break;
+            }
+        }
+    }
+
+    for (int pb = 0; pb < 2; ++pb) {
+        for (int sb = 0; sb < 4; ++sb) {
+            auto& v = rangeKeys[pb][sb];
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+        }
+    }
+
+    const char* potName[2] = {"<1500", ">=1500"};
+    const char* sizeName[4] = {"<0.5x", "0.5-0.8x", "0.8-1.3x", ">1.3x"};
+    std::printf("slumbot-oracle-gap: %d 个文件, %d 手, %d 个河牌面对下注样本\n",
+                int(csvs.size()), handsSeen, int(samples.size()));
+
+    std::printf("  桶样本数 (pot桶 × 尺寸桶):\n");
+    for (int pb = 0; pb < 2; ++pb) {
+        std::printf("    pot %s:", potName[pb]);
+        for (int sb = 0; sb < 4; ++sb) {
+            int n = 0;
+            for (const GapSample& s : samples) {
+                if (s.potBucket == pb && s.sizeBucket == sb) ++n;
+            }
+            std::printf(" %s=%d(range %d)", sizeName[sb], n, int(rangeKeys[pb][sb].size()));
+        }
+        std::printf("\n");
+    }
+
+    int same = 0, used = 0, emptySkipped = 0, lossN = 0;
+    int conf[2][2] = {{0, 0}, {0, 0}};  // [oracle call][range call]
+    double sumEqOracle = 0.0, sumEqRange = 0.0, lossSum = 0.0;
+    for (const GapSample& s : samples) {
+        texas::Card my7[7] = {s.mine[0], s.mine[1], s.board[0], s.board[1],
+                              s.board[2], s.board[3], s.board[4]};
+        const int myScore = texas::evaluate7(my7);
+        texas::Card opp7[7] = {s.theirs[0], s.theirs[1], s.board[0], s.board[1],
+                               s.board[2], s.board[3], s.board[4]};
+        const int oppScore = texas::evaluate7(opp7);
+        const double eqOracle = (myScore > oppScore) ? 1.0 : (myScore == oppScore ? 0.5 : 0.0);
+
+        double eqSum = 0.0;
+        int n = 0;
+        for (int key : rangeKeys[s.potBucket][s.sizeBucket]) {
+            const texas::Card a = key / 52;
+            const texas::Card b = key % 52;
+            bool conflict = false;
+            for (int k = 0; k < 2 && !conflict; ++k) {
+                conflict = (a == s.mine[k] || b == s.mine[k]);
+            }
+            for (int k = 0; k < 5 && !conflict; ++k) {
+                conflict = (a == s.board[k] || b == s.board[k]);
+            }
+            if (conflict) continue;
+            texas::Card c7[7] = {a, b, s.board[0], s.board[1], s.board[2], s.board[3], s.board[4]};
+            const int sc = texas::evaluate7(c7);
+            eqSum += (myScore > sc) ? 1.0 : (myScore == sc ? 0.5 : 0.0);
+            ++n;
+        }
+        if (n == 0) {
+            ++emptySkipped;
+            continue;
+        }
+        const double eqRange = eqSum / double(n);
+        const double potAfter = double(s.pot + s.need);
+        const double evCallOracle = eqOracle * potAfter - double(s.need);
+        const double evCallRange = eqRange * potAfter - double(s.need);
+        const bool callOracle = evCallOracle > 0.0;
+        const bool callRange = evCallRange > 0.0;
+        ++conf[callOracle ? 1 : 0][callRange ? 1 : 0];
+        if (callOracle == callRange) ++same;
+        // 按 range 打（fold）而全知会 call 时，事后的确定性损失。
+        if (callOracle && !callRange) {
+            lossSum += evCallOracle;
+            ++lossN;
+        }
+        sumEqOracle += eqOracle;
+        sumEqRange += eqRange;
+        ++used;
+    }
+
+    const double denom = used > 0 ? double(used) : 1.0;
+    std::printf("  有效样本 %d（范围为空跳过 %d）\n", used, emptySkipped);
+    std::printf("  最佳动作一致率: %.1f%% (%d/%d)\n", 100.0 * same / denom, same, used);
+    std::printf("  混淆表 (行=oracle 最佳, 列=range 最佳):\n");
+    std::printf("                range call  range fold\n");
+    std::printf("    oracle call  %10d  %10d\n", conf[1][1], conf[1][0]);
+    std::printf("    oracle fold  %10d  %10d\n", conf[0][1], conf[0][0]);
+    std::printf("  平均 eq_oracle: %.4f | 平均 eq_range: %.4f\n", sumEqOracle / denom,
+                sumEqRange / denom);
+    std::printf("  range=fold 但 oracle=call: %d 个样本, 事后损失合计 %.1f 筹码（平均 %.1f）\n",
+                lossN, lossSum, lossN > 0 ? lossSum / lossN : 0.0);
+    return 0;
+}
+
 int cmdSlumbotFit(int argc, char** argv) {
     std::vector<std::string> csvs = argValues(argc, argv, "--csv");
     // --holdout-csv：整份文件只做留出。跨会话留出比同批交错切分更诚实
@@ -5056,6 +5267,7 @@ int main(int argc, char** argv) {
     if (cmd == "slumbot-decisions") return cmdSlumbotDecisions(argc, argv);
     if (cmd == "slumbot-policy-eval") return cmdSlumbotPolicyEval(argc, argv);
     if (cmd == "river-ranges") return cmdRiverRanges(argc, argv);
+    if (cmd == "slumbot-oracle-gap") return cmdSlumbotOracleGap(argc, argv);
     if (cmd == "showdown") return cmdShowdown(argc, argv);
     if (cmd == "slumbot-fit") return cmdSlumbotFit(argc, argv);
     if (cmd == "blueprint-train") return cmdBlueprintTrain(argc, argv);

@@ -250,6 +250,49 @@
   sh tools/fastloop.sh /Users/mingming/models/r7_sqrt
   ```
 
+### R8 评估 — 2026-11-09 — 天眼教师（PerfectDou 式）可行性，**不开**
+
+- **触发**：外部提出“用开天眼的东西实现纳什均衡去指导 RL”，参考同级 `PerfectDouCpp`。
+- **参考实现实测**（`/Users/mingming/project/PerfectDouCpp`）：
+  - 完美信息只进 **critic**：`src/ddz/features.cpp:105-109` 把对手手牌矩阵与 `minSteps` 写进 `extra`，
+    `src/torch_nn/models.h:56-71` 中只有 `CriticImpl` 接收 `extra`，Actor 不接收。
+  - 天眼还以**势函数差分奖励**进入策略：`src/algo/rollout.cpp:269-285` 用三家手牌算 `oracleAdvantage`，
+    `:378-385` 把 `deltaAdv` 写进 `Transition.reward`。
+  - 没有“天眼策略教师”，也没有“搜索教师”；是 **critic 开眼 + 势函数塑形**。
+- **与我们的对照**：这两件我们**都已经有**——`rollout.cpp:105-107` 的 `phiOf =
+  (胜率×底池 − 已投入)/起始筹码` 就是开天眼势能，`rollout.cpp:2452/2725-2727` 以
+  `--oracle-coef 0.30` 做差分塑形；critic 也用真实底牌算的胜率。
+  **关键差别只有一个**：斗地主的 `minSteps` 是完美信息下**精确、离散、无噪**的距离目标，
+  而我们的势函数是“胜率×底池”这个**估计量**，同样开眼但在扑克里它是带噪的。
+- **量化“全知动作 vs 范围动作”**（新工具 `slumbot-oracle-gap`，12k 日志里 1,877 手完整牌局、
+  531 个“我们河牌面对下注”样本，只比较 fold/call）：
+  - 最佳动作**一致率 61.8%（328/531）**，即 **38% 的决策会给出相反动作**。
+  - 混淆表：oracle 跟/range 跟 79；**oracle 跟/range 弃 16**；**oracle 弃/range 跟 187**；都弃 249。
+  - 平均胜率：`eq_oracle` 0.170 vs `eq_range` 0.331（范围里含诈唬）。
+  - 方向极不对称：**35% 的样本里，“知道对手底牌”会让我们弃掉一个对范围而言是 +EV 的跟注**。
+    天眼**动作**教师因此会系统性教会过弃，和 R4 的漏点方向一致但更极端。
+- **现场范围解耗时**（`match stn2 vs stn2 --hands 200`，训练占 7 核时测得，空机更快）：
+
+| 配置 | 墙钟 | 增量 |
+|---|---:|---:|
+| 不求解 | 2.23 s | — |
+| `--river-cfr 100` | 4.94 s | +2.71 s |
+| `--river-cfr 400` | 7.96 s | +5.73 s |
+
+  400 手里约 28 个河牌决策、求解只发生在 A 侧 ≈ **14 次**：
+  **100 迭代 ≈ 190 ms/决策；边际 ≈0.72 ms/迭代 → 300ms 预算约能跑 250 次迭代。**
+  结论：**延迟能塞进 300ms**（100–250 次迭代），但这恰好就是我们部署期已经两次证伪的那个求解器
+  （河牌接管 12% → −0.69±0.29；转牌 4.2s/手 → solid −219.9）。
+- **结论：不开 R8**。理由不是算力/延迟，而是①38% 的动作分歧证明“全知动作”不能当教师；
+  ②能塞进预算的求解器，其解的质量已被外部两次证伪；③“范围”这一侧我们只能用自指先验
+  （README 第三节共同机制），换汤不换药。若将来要重开，前置条件是先有一个
+  **能预测对手尺寸分桶范围的模型**（行为克隆 acc 0.30 那条线），否则只是把 R6 的失败重跑一遍。
+- **可复现**：
+  ```
+  ./build_rl/perfecttexas slumbot-oracle-gap --csv ~/models/ext_stn2/s1.csv ... --csv ~/models/ext_stn2/s96009.csv
+  ./build_rl/perfecttexas match --a ~/models/stn2 --b ~/models/stn2 --hands 200 --seed 7 --river-cfr 100 --river-cfr-min-pot 0
+  ```
+
 ## 3. 已拒绝 / 已回滚
 
 | 轮次 | 改动 | 拒绝原因 | 证据 |
