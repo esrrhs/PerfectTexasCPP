@@ -2539,7 +2539,7 @@ void testBlueprint() {
         StrengthModel& sm = StrengthModel::instance();
         int checked = 0;
         for (int g = 0; g < 1500; ++g) {
-            HUNLGame game(&rng, kDefaultBuckets, kDefaultRaiseCap, &sm);
+            HUNLGame game(&rng, kDefaultBuckets, kDefaultRaiseCap, &sm, 1);
             game.deal(rng);
             int steps = 0;
             while (!game.terminal() && steps++ < 40) {
@@ -2557,11 +2557,18 @@ void testBlueprint() {
                 }
                 CHECK(hasCC);
                 uint8_t seq[kMaxStreetSeq] = {};
-                const int sl = seqFromState(game.state, kDefaultRaiseCap, seq);
+                uint8_t hist = 0;
+                const int sl = seqFromState(game.state, kDefaultRaiseCap, seq, &hist);
                 CHECK(sl == game.seqLen);
+                CHECK(hist == game.histBits);
                 bool same = true;
                 for (int i = 0; i < sl; ++i) if (seq[i] != game.seq[i]) same = false;
                 CHECK(same);
+                // 查表 key 与训练侧 key 必须完全一致（含召回位）。
+                const uint64_t qk = packInfoset(game.state.street, game.state.pot(),
+                                                cardBucketOf(game.state, kDefaultBuckets), seq, sl,
+                                                game.state.toAct, hist);
+                CHECK(qk == game.infosetKey());
                 game.apply(am[rng() % n].id);
                 ++checked;
             }
@@ -2617,6 +2624,19 @@ void testBlueprint() {
               packInfoset(ST_FLOP, 300, 3, seq, 2, 1));
         CHECK(packInfoset(ST_RIVER, 4800, 7, seq, 2, 1) ==
               packInfoset(ST_RIVER, 4800, 7, seq, 2, 1));
+    }
+
+    // 压缩历史（每街 2 bit）必须独立进 key，且不覆盖旧口径。
+    {
+        uint8_t seq[2] = {AB_RAISE_05, AB_CHECK_CALL};
+        CHECK(packInfoset(ST_TURN, 600, 3, seq, 2, 0, 0) ==
+              packInfoset(ST_TURN, 600, 3, seq, 2, 0));
+        CHECK(packInfoset(ST_TURN, 600, 3, seq, 2, 0, 1) !=
+              packInfoset(ST_TURN, 600, 3, seq, 2, 0, 0));
+        CHECK(packInfoset(ST_TURN, 600, 3, seq, 2, 0, 2) !=
+              packInfoset(ST_TURN, 600, 3, seq, 2, 0, 1));
+        CHECK(packInfoset(ST_TURN, 600, 3, seq, 2, 1, 2) !=
+              packInfoset(ST_TURN, 600, 3, seq, 2, 0, 2));
     }
 
     // 蒸馏槽映射（abstract -> 19 槽）：归一、只落在合法槽、部署翻译可执行。
@@ -2683,6 +2703,40 @@ void testBlueprint() {
         cfg.selfPlayCheck = true;
         const BrResult rz = runBlueprintBR(trainedTab, cfg);
         CHECK(rz.valid && std::isfinite(rz.exploitBb));
+
+        // 按终局街分解：四个分量必须有限（样本少，不做精确加总校验）。
+        cfg.selfPlayCheck = false;
+        cfg.byStreet = true;
+        const BrResult rb = runBlueprintBR(trainedTab, cfg);
+        CHECK(rb.valid);
+        for (int st = 0; st < 4; ++st) CHECK(std::isfinite(rb.exploitByStreetBb[st]));
+    }
+
+    // 召回口径贯通：recall=1 训练的表可用 recall=1 查到，key 与训练侧一致。
+    {
+        Rng rng(2468);
+        StrengthModel& sm = StrengthModel::instance();
+        RegretTable tab(kAbstractStride);
+        HUNLGame root(&rng, kDefaultBuckets, kDefaultRaiseCap, &sm, 1);
+        mcfrTrain(root, tab, 20000, rng);
+        CHECK(tab.size() > 500);
+        HUNLGame g(&rng, kDefaultBuckets, kDefaultRaiseCap, &sm, 1);
+        g.deal(rng);
+        int steps = 0;
+        int hits = 0;
+        while (!g.terminal() && steps++ < 20) {
+            float abs[kAbstractStride] = {};
+            const bool found = queryBlueprint(g.state, tab, kDefaultBuckets, kDefaultRaiseCap,
+                                              abs, 1);
+            if (found) ++hits;
+            // 旧口径（recall=0）不应命中同一行。
+            const int64_t idx1 = tab.find(g.infosetKey());
+            CHECK(idx1 >= 0);
+            AbstractMove am[kAbstractStride];
+            const int n = legalAbstract(g.state, kDefaultRaiseCap, am);
+            g.apply(am[rng() % n].id);
+        }
+        CHECK(hits > 0);
     }
 }
 

@@ -25,6 +25,7 @@ struct BrCtx {
     const RegretTable* tab = nullptr;
     int buckets = kDefaultBuckets;
     int raiseCap = kDefaultRaiseCap;
+    int recall = 0;
     int brSeat = 0;
     int brBucket[4] = {0, 0, 0, 0};  // 自洽性检查用：BR 固定底牌在四条街的桶
     bool policyMode = false;
@@ -142,7 +143,13 @@ Reach remapStreet(const BrCtx& c, const Reach& gr, int oldSt, int newSt) {
     return out;
 }
 
-double terminalValue(const HUState& s, const Reach& gr, const BrCtx& c) {
+struct Val {
+    double v = 0.0;
+    double by[4] = {0.0, 0.0, 0.0, 0.0};  // 按终局街分解的收益（筹码/手）
+};
+
+Val terminalValue(const HUState& s, const Reach& gr, const BrCtx& c) {
+    Val out;
     const int pot = s.pot();
     const int tb = s.total[c.brSeat];
     if (s.folded != 255) {
@@ -150,7 +157,9 @@ double terminalValue(const HUState& s, const Reach& gr, const BrCtx& c) {
         const double u = (s.folded == c.brSeat) ? -double(tb) : double(pot - tb);
         double mass = 0.0;
         for (int b = 0; b < kMaxGroups; ++b) mass += gr[b];
-        return mass * u;
+        out.v = mass * u;
+        out.by[s.street] = out.v;
+        return out;
     }
     // 摊牌：平局时奇数筹码给 0 号位（与 HUState::payoff 一致）。
     const double tieChips = (c.brSeat == 0) ? double(pot - pot / 2) : double(pot / 2);
@@ -166,10 +175,13 @@ double terminalValue(const HUState& s, const Reach& gr, const BrCtx& c) {
                            / static_cast<double>(cnt);
         v += double(gr[b]) * avg;
     }
-    return v;
+    out.v = v;
+    out.by[st] = v;
+    return out;
 }
 
-double brWalk(const HUState& s, const Reach& gr, const uint8_t* seq, int seqLen, BrCtx& c) {
+Val brWalk(const HUState& s, const Reach& gr, const uint8_t* seq, int seqLen, uint8_t hist,
+           uint8_t raises, BrCtx& c) {
     ++c.nodes;
     if (s.finished) return terminalValue(s, gr, c);
     if (c.nodeBudget && c.nodes > c.nodeBudget) {
@@ -185,11 +197,12 @@ double brWalk(const HUState& s, const Reach& gr, const uint8_t* seq, int seqLen,
 
     const int p = s.toAct;
     const bool takeMax = (p == c.brSeat) && !c.policyMode;
-    // 自洽性检查：BR 座位也按蓝图策略走，需要查自己固定底牌对应的桶。
+    // 自洽性检查：BR 座位也要按蓝图策略走，需要查自己固定底牌对应的桶。
+    const bool needOwn = c.policyMode && p == c.brSeat;
     float brSig[kAbstractStride] = {};
-    if (c.policyMode && p == c.brSeat) {
+    if (needOwn) {
         const uint64_t key = packInfoset(s.street, s.pot(), c.brBucket[s.street], seq, seqLen,
-                                         s.toAct);
+                                         s.toAct, c.recall ? hist : 0);
         const int64_t idx = c.tab->find(key);
         if (idx >= 0) {
             c.tab->averageStrategy(static_cast<uint32_t>(idx), legal, brSig);
@@ -206,7 +219,8 @@ double brWalk(const HUState& s, const Reach& gr, const uint8_t* seq, int seqLen,
     if (p != c.brSeat) {
         for (int b = 0; b < kMaxGroups; ++b) {
             if (gr[b] <= 0.0f) continue;
-            const uint64_t key = packInfoset(s.street, s.pot(), b, seq, seqLen, s.toAct);
+            const uint64_t key = packInfoset(s.street, s.pot(), b, seq, seqLen, s.toAct,
+                                             c.recall ? hist : 0);
             const int64_t idx = c.tab->find(key);
             if (idx >= 0) {
                 c.tab->averageStrategy(static_cast<uint32_t>(idx), legal, sig[b]);
@@ -219,7 +233,8 @@ double brWalk(const HUState& s, const Reach& gr, const uint8_t* seq, int seqLen,
         }
     }
 
-    double ret = takeMax ? -1e18 : 0.0;
+    Val ret;
+    bool haveBest = false;
     for (int ai = 0; ai < n; ++ai) {
         const int id = am[ai].id;
         Reach childGr = gr;
@@ -231,17 +246,32 @@ double brWalk(const HUState& s, const Reach& gr, const uint8_t* seq, int seqLen,
         applyMove(child, am[ai].mv, *c.rng);
         uint8_t childSeq[kMaxStreetSeq] = {};
         int childLen = 0;
+        uint8_t childHist = hist;
+        uint8_t childRaises = static_cast<uint8_t>(raises + (id >= AB_RAISE_05 ? 1 : 0));
         if (child.street == s.street) {
             for (int k = 0; k < seqLen; ++k) childSeq[k] = seq[k];
             childLen = seqLen;
             if (childLen < kMaxStreetSeq) childSeq[childLen++] = static_cast<uint8_t>(id);
+        } else {
+            // 街切换：把刚结束街道的加注档（0..3）压进压缩历史，再清空本街计数。
+            const int lvl = std::min<int>(childRaises, 3);
+            childHist = static_cast<uint8_t>(childHist | (lvl << (2 * s.street)));
+            childRaises = 0;
         }
         if (child.street != s.street) childGr = remapStreet(c, childGr, s.street, child.street);
 
-        const double v = brWalk(child, childGr, childSeq, childLen, c);
-        if (takeMax) ret = std::max(ret, v);
-        else if (c.policyMode && p == c.brSeat) ret += double(brSig[id]) * v;
-        else ret += v;
+        const Val v = brWalk(child, childGr, childSeq, childLen, childHist, childRaises, c);
+        if (takeMax) {
+            if (!haveBest || v.v > ret.v) ret = v;
+            haveBest = true;
+        } else if (c.policyMode && p == c.brSeat) {
+            const double w = double(brSig[id]);
+            ret.v += w * v.v;
+            for (int st = 0; st < 4; ++st) ret.by[st] += w * v.by[st];
+        } else {
+            ret.v += v.v;
+            for (int st = 0; st < 4; ++st) ret.by[st] += v.by[st];
+        }
     }
     return ret;
 }
@@ -260,9 +290,12 @@ BrResult runBlueprintBR(const RegretTable& tab, const BrConfig& cfg) {
     c.rng = &rng;
     c.nodeBudget = cfg.maxNodesPerSample;
     c.policyMode = cfg.selfPlayCheck;
+    c.recall = cfg.recall;
     buildCombos(c);
 
     double sum0 = 0.0, sq0 = 0.0, sum1 = 0.0, sq1 = 0.0;
+    double byBr[2][4] = {};
+    double byPol[2][4] = {};
     int n0 = 0, n1 = 0;
     for (int sample = 0; sample < cfg.samples; ++sample) {
         const HUState root = dealNewHand(rng);
@@ -273,10 +306,21 @@ BrResult runBlueprintBR(const RegretTable& tab, const BrConfig& cfg) {
             prepareSample(c, root, seat);
             const Reach gr = initialReach(c);
             uint8_t seq[kMaxStreetSeq] = {};
-            const double v = brWalk(root, gr, seq, 0, c);
+            const Val v = brWalk(root, gr, seq, 0, 0, 0, c);
             r.nodes += c.nodes;
-            if (seat == 0) { sum0 += v; sq0 += v * v; ++n0; }
-            else { sum1 += v; sq1 += v * v; ++n1; }
+            for (int st = 0; st < 4; ++st) byBr[seat][st] += v.by[st];
+            // 按终局街分解需要「同分布下按蓝图行动」的对照值；两次遍历共用抽样。
+            if (cfg.byStreet && !cfg.selfPlayCheck) {
+                c.nodes = 0;
+                c.truncated = false;
+                c.policyMode = true;
+                const Val pv = brWalk(root, gr, seq, 0, 0, 0, c);
+                c.policyMode = false;
+                r.nodes += c.nodes;
+                for (int st = 0; st < 4; ++st) byPol[seat][st] += pv.by[st];
+            }
+            if (seat == 0) { sum0 += v.v; sq0 += v.v * v.v; ++n0; }
+            else { sum1 += v.v; sq1 += v.v * v.v; ++n1; }
         }
         if ((sample + 1) % 100 == 0) {
             std::printf("  blueprint-br: %d/%d 抽样, %.1f M 节点\n", sample + 1, cfg.samples,
@@ -295,6 +339,13 @@ BrResult runBlueprintBR(const RegretTable& tab, const BrConfig& cfg) {
     r.exploitChips = r.br0 + r.br1;
     r.exploitBb = r.exploitChips / 100.0;
     r.seBb = std::sqrt(r.se0 * r.se0 + r.se1 * r.se1) / 100.0;
+    if (cfg.byStreet) {
+        for (int st = 0; st < 4; ++st) {
+            const double brAvg = byBr[0][st] / n0 + byBr[1][st] / n1;
+            const double polAvg = byPol[0][st] / n0 + byPol[1][st] / n1;
+            r.exploitByStreetBb[st] = (brAvg - polAvg) / 100.0;
+        }
+    }
     r.samples = static_cast<uint64_t>(cfg.samples);
     r.valid = true;
     return r;

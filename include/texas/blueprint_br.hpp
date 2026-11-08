@@ -22,9 +22,11 @@ struct BrConfig {
     uint64_t seed = 20261107;
     int buckets = kDefaultBuckets;
     int raiseCap = kDefaultRaiseCap;
+    int recall = 0;             // 1 = 与压缩完美召回训练的表对齐（每街 2 bit）
     bool bothSeats = true;      // 每抽样同时算 BR0/BR1（方差低，成本 2×）
     bool selfPlayCheck = false; // 诊断：BR 座位也按蓝图策略行动（不再是 max），
                                 // 双座位收益之和应接近 0，用来校验遍历/结算自洽
+    bool byStreet = false;      // 额外按「决策街」分解可利用度（每节点多一次查表）
     uint64_t maxNodesPerSample = 0;  // 0 = 不限；保护性预算
 };
 
@@ -36,6 +38,8 @@ struct BrResult {
     double exploitChips = 0.0;  // br0 + br1
     double exploitBb = 0.0;     // ÷100
     double seBb = 0.0;
+    // byStreet=true 时有效：可利用度按决策街分解（预/翻/转/河，BB/手）
+    double exploitByStreetBb[4] = {0.0, 0.0, 0.0, 0.0};
     uint64_t samples = 0;
     uint64_t nodes = 0;
     bool valid = false;

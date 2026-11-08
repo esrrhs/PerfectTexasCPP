@@ -13,6 +13,7 @@
 //   动作：fold / check-call / raise 0.5pot / raise 1.0pot / all-in（每街加注上限 R=3）。
 //   信息集 key：当前街桶 + 量化底池 + 当前街抽象动作序列（跨街 imperfect recall）。
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -60,11 +61,15 @@ int potBucketOf(int pot);
 // (街, 底池桶, 牌桶, 街内序列) 下需要完全不同的策略。共享 key 会让两个座位的
 // regret 交替写同一张表、互相抵消，实测策略停在四不像且 BR 不随迭代下降。
 // 默认 -1 只用于早期单测的 key 唯一性检查；训练/查表/BR 必须传真实 toAct。
+//
+// hist 是「每街 2 bit 的压缩加注历史」（bit 2k..2k+1 = 第 k 街加注档 0..3），
+// recall=1 时入 key，把跨街 imperfect recall 升到「压缩完美召回」。0 = 旧口径。
 uint64_t packInfoset(int street, int pot, int cardBucket, const uint8_t* seq, int seqLen,
-                     int seat = -1);
+                     int seat = -1, int hist = 0);
 
 // 从 HUState.hist 重建当前街抽象动作序列（蒸馏/部署查表用）。返回长度。
-int seqFromState(const HUState& s, int raiseCap, uint8_t* out);
+// histOut 非空时同时输出压缩加注历史（与训练侧 HUNLGame 同口径）。
+int seqFromState(const HUState& s, int raiseCap, uint8_t* out, uint8_t* histOut = nullptr);
 
 // ---------------------------------------------------------------- RegretTable
 
@@ -190,10 +195,13 @@ struct HUNLGame {
     Rng* rng = nullptr;
     int buckets = kDefaultBuckets;
     int raiseCap = kDefaultRaiseCap;
+    int recall = 0;  // 1 = 压缩完美召回（每街 2 bit 加注历史入 key）
     StrengthModel* sm = nullptr;
     int street = ST_PREFLOP;
     int seqLen = 0;
     uint8_t seq[kMaxStreetSeq] = {};
+    uint8_t histBits = 0;   // 已完成街道的加注档（2 bit/街）
+    uint8_t streetRaises = 0;  // 当前街加注次数（含 all-in）
 
     // 一手牌里底牌/公共牌固定，牌力桶最多只有 2 座位 × 4 街 = 8 个不同取值。
     // postflopBucket 要跑摊牌评估 + 听牌出路 + 秩表二分，若每个遍历节点都算一遍
@@ -201,12 +209,15 @@ struct HUNLGame {
     mutable int bucketCache[2][4] = {{-1, -1, -1, -1}, {-1, -1, -1, -1}};
 
     HUNLGame() = default;
-    HUNLGame(Rng* r, int B, int cap, StrengthModel* m) : rng(r), buckets(B), raiseCap(cap), sm(m) {}
+    HUNLGame(Rng* r, int B, int cap, StrengthModel* m, int rec = 0)
+        : rng(r), buckets(B), raiseCap(cap), recall(rec), sm(m) {}
 
     void deal(Rng& r) {
         state = dealNewHand(r);
         street = state.street;
         seqLen = 0;
+        histBits = 0;
+        streetRaises = 0;
         for (int p = 0; p < 2; ++p)
             for (int st = 0; st < 4; ++st) bucketCache[p][st] = -1;
     }
@@ -230,7 +241,8 @@ struct HUNLGame {
             cb = cardBucketOf(state, buckets);
             bucketCache[p][state.street] = cb;
         }
-        return packInfoset(state.street, state.pot(), cb, seq, seqLen, state.toAct);
+        return packInfoset(state.street, state.pot(), cb, seq, seqLen, state.toAct,
+                           recall ? histBits : 0);
     }
 
     void apply(int id) {
@@ -240,8 +252,13 @@ struct HUNLGame {
         for (int i = 0; i < n; ++i) if (am[i].id == id) { mv = &am[i].mv; break; }
         if (!mv) return;  // 非法动作不应被选中
         const int prevStreet = state.street;
+        if (id >= AB_RAISE_05) ++streetRaises;
         applyMove(state, *mv, *rng);
         if (state.street != prevStreet) {
+            // 街切换：把刚结束街道的加注档（0..3）压进 histBits，再清空本街计数。
+            const int lvl = std::min<int>(streetRaises, 3);
+            histBits = static_cast<uint8_t>(histBits | (lvl << (2 * prevStreet)));
+            streetRaises = 0;
             street = state.street;
             seqLen = 0;
         } else if (seqLen < kMaxStreetSeq) {
@@ -255,17 +272,17 @@ struct HUNLGame {
 // 查表：对一个独立 HUState 输出 blueprint 平均策略（抽象动作分布，长度 kAbstractStride）。
 // 返回 false 表示该 infoset 未被训练过（输出均匀）。
 bool queryBlueprint(const HUState& s, const RegretTable& tab, int buckets, int raiseCap,
-                    float* out);
+                    float* out, int recall = 0);
 
 // 蒸馏槽映射（计划书 §4.2）：把 5 个抽象动作的概率质量投到 19 个 actor 槽。
 // fold/check-call/all-in 直接对位；两个 pot 比例加注按其真实金额落入 legalMoves
 // 的尺寸带（带内金额任意，槽只表示量级），找不到覆盖带时取最近的带。
 // 输出 target[kNumActions]，非法槽为 0、总和为 1。
 bool abstractToSlots(const HUState& s, const RegretTable& tab, int buckets, int raiseCap,
-                     float* target);
+                     float* target, int recall = 0);
 
 // 部署/采样翻译（计划书 §4.3）：按平均策略采样抽象动作，返回对应的真实 Move。
 Move sampleBlueprintMove(const HUState& s, const RegretTable& tab, int buckets, int raiseCap,
-                         Rng& rng, float temp = 1.0f);
+                         Rng& rng, float temp = 1.0f, int recall = 0);
 
 }  // namespace texas

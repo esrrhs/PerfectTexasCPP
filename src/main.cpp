@@ -3982,14 +3982,15 @@ struct BlueprintMeta {
     uint64_t seed = 0;
     int buckets = texas::kDefaultBuckets;
     int raiseCap = texas::kDefaultRaiseCap;
+    int recall = 0;          // 1 = 压缩完美召回（每街 2 bit 加注历史入 key）
 };
 
 bool writeBlueprintMeta(const std::string& dir, const BlueprintMeta& m) {
     FILE* f = std::fopen((dir + "/meta.txt").c_str(), "w");
     if (!f) return false;
-    std::fprintf(f, "iters %llu\nseed %llu\nbuckets %d\nraise_cap %d\nstride %d\n",
+    std::fprintf(f, "iters %llu\nseed %llu\nbuckets %d\nraise_cap %d\nrecall %d\nstride %d\n",
                  static_cast<unsigned long long>(m.iters),
-                 static_cast<unsigned long long>(m.seed), m.buckets, m.raiseCap,
+                 static_cast<unsigned long long>(m.seed), m.buckets, m.raiseCap, m.recall,
                  texas::kAbstractStride);
     std::fclose(f);
     return true;
@@ -4008,6 +4009,7 @@ bool readBlueprintMetaFile(const std::string& path, BlueprintMeta& m) {
         else if (std::strcmp(k, "seed") == 0) m.seed = static_cast<uint64_t>(v);
         else if (std::strcmp(k, "buckets") == 0) { m.buckets = static_cast<int>(v); hasB = true; }
         else if (std::strcmp(k, "raise_cap") == 0) { m.raiseCap = static_cast<int>(v); hasR = true; }
+        else if (std::strcmp(k, "recall") == 0) m.recall = static_cast<int>(v);
         else if (std::strcmp(k, "stride") == 0 && v != texas::kAbstractStride) return false;
     }
     return hasIters && hasB && hasR;
@@ -4036,8 +4038,9 @@ bool saveBlueprintCheckpoint(const std::string& dir, const texas::RegretTable& t
     if (tab.save(snapDir + "/bp_" + tag + ".bin")) {
         FILE* sf = std::fopen((snapDir + "/meta_" + tag + ".txt").c_str(), "w");
         if (sf) {
-            std::fprintf(sf, "iters %llu\nbuckets %d\nraise_cap %d\n",
-                         static_cast<unsigned long long>(meta.iters), meta.buckets, meta.raiseCap);
+            std::fprintf(sf, "iters %llu\nbuckets %d\nraise_cap %d\nrecall %d\n",
+                         static_cast<unsigned long long>(meta.iters), meta.buckets, meta.raiseCap,
+                         meta.recall);
             std::fclose(sf);
         }
     }
@@ -4050,8 +4053,9 @@ int cmdBlueprintTrain(int argc, char** argv) {
     const uint64_t logEvery = std::max<uint64_t>(1, argU64(argc, argv, "--log-every", 1000000ULL));
     const std::string outDir = argStr(argc, argv, "--out", "/Users/mingming/models/blueprint_v1");
     const std::string resumeDir = argStr(argc, argv, "--resume", "");
-    const int buckets = argInt(argc, argv, "--buckets", texas::kDefaultBuckets);
-    const int raiseCap = argInt(argc, argv, "--raise-cap", texas::kDefaultRaiseCap);
+    int buckets = argInt(argc, argv, "--buckets", texas::kDefaultBuckets);
+    int raiseCap = argInt(argc, argv, "--raise-cap", texas::kDefaultRaiseCap);
+    int recall = argInt(argc, argv, "--recall", 0);  // 1 = 压缩完美召回
     const uint64_t seed = argU64(argc, argv, "--seed", 20261107ULL);
     if (outDir.rfind("/tmp", 0) == 0) {
         std::printf("!! 纪律：blueprint 检查点禁止写 /tmp（会被系统清理），请用 --out 指到 ~/models\n");
@@ -4066,6 +4070,7 @@ int cmdBlueprintTrain(int argc, char** argv) {
     meta.seed = seed;
     meta.buckets = buckets;
     meta.raiseCap = raiseCap;
+    meta.recall = recall;
 
     if (!resumeDir.empty()) {
         BlueprintMeta rm;
@@ -4073,9 +4078,19 @@ int cmdBlueprintTrain(int argc, char** argv) {
             std::printf("!! 读不到 %s/meta.txt\n", resumeDir.c_str());
             return 1;
         }
+        // 抽象口径决定 key 布局，不能混训：未显式传参时跟随检查点（与 br/distill 同口径）。
+        if (argValue(argc, argv, "--buckets", nullptr) == nullptr) buckets = rm.buckets;
+        if (argValue(argc, argv, "--raise-cap", nullptr) == nullptr) raiseCap = rm.raiseCap;
         if (rm.buckets != buckets || rm.raiseCap != raiseCap) {
             std::printf("!! 抽象不一致：检查点 B=%d R=%d，命令行 B=%d R=%d\n",
                         rm.buckets, rm.raiseCap, buckets, raiseCap);
+            return 1;
+        }
+        // 召回口径决定 key 布局，不能混训：未显式传 --recall 时跟随检查点。
+        if (argValue(argc, argv, "--recall", nullptr) == nullptr) {
+            recall = rm.recall;
+        } else if (rm.recall != recall) {
+            std::printf("!! 召回不一致：检查点 recall=%d，命令行 recall=%d\n", rm.recall, recall);
             return 1;
         }
         if (!tab.load(resumeDir + "/bp.bin")) {
@@ -4089,18 +4104,26 @@ int cmdBlueprintTrain(int argc, char** argv) {
             rng.seed(seed + rm.iters);
         }
         meta = rm;
-        std::printf("blueprint resume: %s @ %llu iters, %u infosets\n", resumeDir.c_str(),
-                    static_cast<unsigned long long>(rm.iters), tab.size());
+        meta.recall = recall;
+        std::printf("blueprint resume: %s @ %llu iters, %u infosets, recall=%d\n", resumeDir.c_str(),
+                    static_cast<unsigned long long>(rm.iters), tab.size(), recall);
     }
 
-    texas::HUNLGame root(&rng, buckets, raiseCap, &sm);
+    // key 的牌桶字段只有 8 bit：B=0 静默退化、B>256 截断碰撞，都必须拒跑
+    // （放在 resume 跟随之后，无效检查点也逃不过）。
+    if (buckets < 1 || buckets > 256) {
+        std::printf("!! --buckets 必须在 [1,256]（key 牌桶字段 8 bit），当前 %d\n", buckets);
+        return 1;
+    }
+
+    texas::HUNLGame root(&rng, buckets, raiseCap, &sm, recall);
     const uint64_t start = meta.iters;
     uint64_t done = 0;
     uint64_t nextSave = (start / saveEvery + 1) * saveEvery;
     const auto t0 = std::chrono::steady_clock::now();
-    std::printf("blueprint-train: +%llu iters (总 %llu) | B=%d R=%d seed=%llu | out=%s\n",
+    std::printf("blueprint-train: +%llu iters (总 %llu) | B=%d R=%d recall=%d seed=%llu | out=%s\n",
                 static_cast<unsigned long long>(iters),
-                static_cast<unsigned long long>(start + iters), buckets, raiseCap,
+                static_cast<unsigned long long>(start + iters), buckets, raiseCap, recall,
                 static_cast<unsigned long long>(seed), outDir.c_str());
     std::printf("  %10s %10s %12s %12s\n", "iters", "secs", "iter/s", "infosets");
     std::fflush(stdout);
@@ -4138,8 +4161,10 @@ int cmdBlueprintBr(int argc, char** argv) {
     const uint64_t seed = argU64(argc, argv, "--seed", 20261107ULL);
     const bool explicitB = argValue(argc, argv, "--buckets", nullptr) != nullptr;
     const bool explicitR = argValue(argc, argv, "--raise-cap", nullptr) != nullptr;
+    const bool explicitRec = argValue(argc, argv, "--recall", nullptr) != nullptr;
     int buckets = argInt(argc, argv, "--buckets", texas::kDefaultBuckets);
     int raiseCap = argInt(argc, argv, "--raise-cap", texas::kDefaultRaiseCap);
+    int recall = argInt(argc, argv, "--recall", 0);
 
     texas::RegretTable tab(texas::kAbstractStride);
     std::string binPath = bp;
@@ -4160,6 +4185,7 @@ int cmdBlueprintBr(int argc, char** argv) {
     if (haveMeta) {
         if (!explicitB) buckets = m.buckets;
         if (!explicitR) raiseCap = m.raiseCap;
+        if (!explicitRec) recall = m.recall;
     }
     if (!tab.load(binPath)) {
         std::printf("!! 读不到 blueprint 表: %s\n", binPath.c_str());
@@ -4171,13 +4197,15 @@ int cmdBlueprintBr(int argc, char** argv) {
     cfg.seed = seed;
     cfg.buckets = buckets;
     cfg.raiseCap = raiseCap;
+    cfg.recall = recall;
+    cfg.byStreet = hasFlag(argc, argv, "--by-street");
     cfg.bothSeats = !hasFlag(argc, argv, "--one-seat");
     cfg.selfPlayCheck = hasFlag(argc, argv, "--self-play-check");
     cfg.maxNodesPerSample = argU64(argc, argv, "--max-nodes", 0);
-    std::printf("blueprint-br: %s | %u infosets | %d 抽样 | B=%d R=%d seed=%llu | %s\n",
-                binPath.c_str(), tab.size(), samples, buckets, raiseCap,
+    std::printf("blueprint-br: %s | %u infosets | %d 抽样 | B=%d R=%d recall=%d seed=%llu | %s%s\n",
+                binPath.c_str(), tab.size(), samples, buckets, raiseCap, recall,
                 static_cast<unsigned long long>(seed),
-                cfg.bothSeats ? "双座位" : "单座位");
+                cfg.bothSeats ? "双座位" : "单座位", cfg.byStreet ? " +按街分解" : "");
     std::fflush(stdout);
     const auto t0 = std::chrono::steady_clock::now();
     const texas::BrResult r = texas::runBlueprintBR(tab, cfg);
@@ -4192,7 +4220,14 @@ int cmdBlueprintBr(int argc, char** argv) {
                 r.br0, r.se0, r.br1, r.se1);
     std::printf("  可利用度 BR0+BR1 = %+0.2f ± %.2f 筹码/手 = %+0.3f ± %.3f BB/手\n",
                 r.exploitChips, std::sqrt(r.se0 * r.se0 + r.se1 * r.se1), r.exploitBb, r.seBb);
-    std::printf("  G1 门 ≤ 0.500 BB/手: %s\n", r.exploitBb <= 0.5 ? "PASS" : "FAIL");
+    if (cfg.byStreet) {
+        static const char* kStreetName[4] = {"翻前", "翻牌", "转牌", "河牌"};
+        std::printf("  按终局街分解：");
+        for (int st = 0; st < 4; ++st)
+            std::printf("%s %+.3f  ", kStreetName[st], r.exploitByStreetBb[st]);
+        std::printf("BB/手\n");
+    }
+    std::printf("  G1 门 ≤ 0.150 BB/手（§9 收紧）: %s\n", r.exploitBb <= 0.15 ? "PASS" : "FAIL");
     return 0;
 }
 
@@ -4203,9 +4238,9 @@ struct DistillData {
 };
 
 void makeDistillSample(const texas::HUState& s, const texas::RegretTable& tab, int buckets,
-                       int raiseCap, texas::TeacherSample& ts) {
+                       int raiseCap, texas::TeacherSample& ts, int recall = 0) {
     float target[texas::kNumActions] = {};
-    texas::abstractToSlots(s, tab, buckets, raiseCap, target);
+    texas::abstractToSlots(s, tab, buckets, raiseCap, target, recall);
     texas::Obs obs;
     const float eq = static_cast<float>(texas::perfectEquity(s, s.toAct, 24));
     texas::encodeObservation(s, obs, eq);
@@ -4248,19 +4283,19 @@ texas::Move randomLegalMove(const texas::HUState& s, texas::Rng& rng) {
 // blueprint 自对弈 + 随机发牌/随机动作混合采样决策点（计划书 §4.1）。
 void generateDistillSamples(const texas::RegretTable& tab, int games, uint64_t seed,
                             int buckets, int raiseCap, float mixRandom, float bpTemp,
-                            DistillData& out) {
+                            DistillData& out, int recall = 0) {
     texas::Rng rng(seed);
     for (int g = 0; g < games; ++g) {
         texas::HUState s = texas::dealNewHand(rng);
         int steps = 0;
         while (!s.finished && steps++ < 80) {
             texas::TeacherSample ts;
-            makeDistillSample(s, tab, buckets, raiseCap, ts);
+            makeDistillSample(s, tab, buckets, raiseCap, ts, recall);
             out.bySeat[s.toAct].push_back(std::move(ts));
             const bool randomBranch = std::generate_canonical<double, 32>(rng) < mixRandom;
             const texas::Move mv = randomBranch
                 ? randomLegalMove(s, rng)
-                : texas::sampleBlueprintMove(s, tab, buckets, raiseCap, rng, bpTemp);
+                : texas::sampleBlueprintMove(s, tab, buckets, raiseCap, rng, bpTemp, recall);
             texas::applyMove(s, mv, rng);
         }
     }
@@ -4362,7 +4397,7 @@ FidelityResult measureFidelity(texas::nn::Actor actors[2], const DistillData& da
 
 // 从 --bp（目录或快照 .bin）读抽象配置，避免与训练时不一致。
 void resolveBlueprintPath(const std::string& bp, std::string& binPath, int& buckets,
-                          int& raiseCap, bool explicitB, bool explicitR) {
+                          int& raiseCap, int& recall, bool explicitB, bool explicitR) {
     BlueprintMeta m;
     bool haveMeta = false;
     binPath = bp;
@@ -4380,6 +4415,7 @@ void resolveBlueprintPath(const std::string& bp, std::string& binPath, int& buck
     if (haveMeta) {
         if (!explicitB) buckets = m.buckets;
         if (!explicitR) raiseCap = m.raiseCap;
+        recall = m.recall;
     }
 }
 
@@ -4408,8 +4444,9 @@ int cmdBlueprintDistill(int argc, char** argv) {
     const bool explicitR = argValue(argc, argv, "--raise-cap", nullptr) != nullptr;
     int buckets = argInt(argc, argv, "--buckets", texas::kDefaultBuckets);
     int raiseCap = argInt(argc, argv, "--raise-cap", texas::kDefaultRaiseCap);
+    int recall = 0;
     std::string binPath;
-    resolveBlueprintPath(bp, binPath, buckets, raiseCap, explicitB, explicitR);
+    resolveBlueprintPath(bp, binPath, buckets, raiseCap, recall, explicitB, explicitR);
 
     texas::RegretTable tab(texas::kAbstractStride);
     if (!tab.load(binPath)) {
@@ -4458,9 +4495,10 @@ int cmdBlueprintDistill(int argc, char** argv) {
                 games, holdout, mixRandom, bpTemp, static_cast<unsigned long long>(seed));
     std::fflush(stdout);
     DistillData trainData, holdData;
-    generateDistillSamples(tab, games, seed, buckets, raiseCap, mixRandom, bpTemp, trainData);
+    generateDistillSamples(tab, games, seed, buckets, raiseCap, mixRandom, bpTemp, trainData,
+                           recall);
     generateDistillSamples(tab, holdout, seed + 7919ULL, buckets, raiseCap, mixRandom, bpTemp,
-                           holdData);
+                           holdData, recall);
     std::printf("  样本: 座位0 %zu / 座位1 %zu；留出 %zu\n", trainData.bySeat[0].size(),
                 trainData.bySeat[1].size(), holdData.bySeat[0].size() + holdData.bySeat[1].size());
     if (trainData.bySeat[0].size() < 8 || trainData.bySeat[1].size() < 8) {
@@ -4557,8 +4595,9 @@ int cmdBlueprintEval(int argc, char** argv) {
     const bool explicitR = argValue(argc, argv, "--raise-cap", nullptr) != nullptr;
     int buckets = argInt(argc, argv, "--buckets", texas::kDefaultBuckets);
     int raiseCap = argInt(argc, argv, "--raise-cap", texas::kDefaultRaiseCap);
+    int recall = 0;
     std::string binPath;
-    resolveBlueprintPath(bp, binPath, buckets, raiseCap, explicitB, explicitR);
+    resolveBlueprintPath(bp, binPath, buckets, raiseCap, recall, explicitB, explicitR);
     texas::RegretTable tab(texas::kAbstractStride);
     if (!tab.load(binPath)) {
         std::printf("!! 读不到 blueprint 表: %s\n", binPath.c_str());
@@ -4598,9 +4637,9 @@ int cmdBlueprintEval(int argc, char** argv) {
             texas::Move mv;
             if (s.toAct == bpSeat) {
                 float abs[texas::kAbstractStride] = {};
-                if (texas::queryBlueprint(s, tab, buckets, raiseCap, abs)) ++trainedHits;
+                if (texas::queryBlueprint(s, tab, buckets, raiseCap, abs, recall)) ++trainedHits;
                 ++decisions;
-                mv = texas::sampleBlueprintMove(s, tab, buckets, raiseCap, rng, 1.0f);
+                mv = texas::sampleBlueprintMove(s, tab, buckets, raiseCap, rng, 1.0f, recall);
             } else {
                 mv = scriptMove(vs, s, rng);
             }
