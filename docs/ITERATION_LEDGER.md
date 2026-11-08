@@ -39,6 +39,7 @@
 - **快速环**：`blueprint-br` 在 500K 冒烟表上正常输出；训练日志列格式验证通过。
 - **外部**：无（口径轮）。
 - **结论**：**接受（口径）**。基线定为 −0.876 ± 0.259 / 4,588 手。
+- **commit**：`9db8abd`
 - **可复现**：`docs/CFR_BLUEPRINT_PLAN.md` §9.1/§10.6；`docs/ROBOPOKER_CFR_NOTES.md` §5。
 
 ### R2 — 2026-11-08 — 瘦 key 对照（已完结，**拒绝**）
@@ -64,6 +65,7 @@
   只会让抽象更粗、更易被剥削。
 - **后果**：按预设裁决，**表格 CFR 路线关闭**（不是“暂停待裁”）；不再做 R3（argmax/重解混合），
   表格 CFR 不再占用迭代预算。
+- **commit**：`9db8abd`
 - **可复现**：
   `./build_rl/perfecttexas blueprint-train --iters 60000000 --save-every 10000000 --out ~/models/r2/b256_slim --buckets 256 --key-slim 1 --seed 777`
   `./build_rl/perfecttexas blueprint-br --bp ~/models/r2/b256_slim --buckets 256 --key-slim 1 --samples 1000 --seed 424242 --by-street`
