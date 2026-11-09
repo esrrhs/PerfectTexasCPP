@@ -31,5 +31,11 @@ echo "[2/4] 锚点（机制崩坏检查）"
 echo "[3/4] 策略动作分布（漂移检查，T=0.5）"
 "$BIN" policy-stats --resume "$CAND" --hands 2000 --temp 0.5 | grep -E "SB 翻前开牌|BB 面对开牌|河牌"
 
-echo "[4/4] 外部状态决策事后损失（诊断，非指标）"
-"$BIN" slumbot-policy-eval --resume "$CAND" --csv "$CSV1" --csv "$CSV2" --temp 0.5 | sed -n '2p;5,7p'
+echo "[4/4] L1 离线闸门：12k 手外部状态上的「坏弃金额」（策略期望口径，见 tools/badfold_diag.py）"
+POL="${TMPDIR:-/tmp}/fastloop_pol_$$.csv"
+"$BIN" slumbot-policy-eval --resume "$CAND" --csv "$CSV1" --csv "$CSV2" --temp 0.5 \
+  --dump-policy "$POL" | sed -n '2p'
+python3 "$ROOT/tools/badfold_diag.py" --hands 3000 --label "$(basename "$CAND")" "$POL" \
+  | grep -E "0\.5-1x|1-1\.5x|合计"
+rm -f "$POL"
+echo "  基线：坏弃 0.492 BB/手（stn2，s1+s2 3,000 手；全 12k 为 0.398）"

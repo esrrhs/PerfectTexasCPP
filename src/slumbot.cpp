@@ -698,6 +698,32 @@ SlumbotResult playSlumbot(const nn::Actor actors[2], const SlumbotConfig& cfg) {
                 }
                 }
             }
+            // R38：SB 开牌尺寸压到 sbOpenTo。我们 SB 开 3.0~3.6BB，Slumbot 只
+            // 开 1.8BB；开牌越大，弃给 3-bet 的成本越高。
+            if (cfg.sbOpenTo > 0 && st.street == ST_PREFLOP && st.numRaises == 0 &&
+                st.toAct == 0 && (mv.kind == MK_RAISE || mv.kind == MK_ALLIN)) {
+                int to = cfg.sbOpenTo;
+                if (to > int(mv.to)) to = int(mv.to);
+                if (to < int(st.contrib[st.toAct]) + 1) to = int(st.contrib[st.toAct]) + 1;
+                if (to < int(mv.to)) {
+                    mv = makeRaise(st, to);
+                    ++res.sbOpenCapped;
+                }
+            }
+            // R38：面对 3-bet/4-bet 的防守纪律（外部实测：继续全亏，只有弃牌最省）。
+            // 覆盖两个座位：SB 开牌后被 3-bet（弃 −3.7 / 跟 −6.9 / 4-bet −9.2 BB），
+            // 以及 BB 3-bet 后被 4-bet（弃 −5.0 / 跟 −24.4 / 5-bet −77 BB）。
+            if (cfg.preflopFoldVs3betPct > 0.0f && st.street == ST_PREFLOP &&
+                st.numRaises >= 2 && mv.kind != MK_FOLD) {
+                int hole2[2] = {int(st.hole[st.toAct][0]), int(st.hole[st.toAct][1])};
+                int bd0[5] = {0, 0, 0, 0, 0};
+                if (handStrength(hole2, bd0, 0) < cfg.preflopFoldVs3betPct) {
+                    mv = Move{};
+                    mv.kind = MK_FOLD;
+                    mv.to = st.contrib[st.toAct];
+                    ++res.preflopVs3betFolds;
+                }
+            }
             // BB 3-bet 门槛：中等牌的 3-bet 在外面实测亏 2~4.5BB/手，改成跟注。
             if (cfg.bb3betMinPct > 0.0f && st.street == ST_PREFLOP &&
                 st.toAct == 1 && st.numRaises == 1 &&
@@ -735,6 +761,86 @@ SlumbotResult playSlumbot(const nn::Actor actors[2], const SlumbotConfig& cfg) {
                 mv.kind = MK_CALL;
                 mv.to = st.contrib[1 - st.toAct];
                     ++res.flopAggroCapped;
+                }
+            }
+            // R42：被 3-bet/4-bet 后不再加注，一律跟注（砍掉 4-bet→200BB 全下底池的起点）。
+            if (cfg.preflopNo4bet && st.street == ST_PREFLOP && st.numRaises >= 2 &&
+                (mv.kind == MK_RAISE || mv.kind == MK_ALLIN)) {
+                mv = Move{};
+                mv.kind = MK_CALL;
+                mv.to = st.contrib[1 - st.toAct];
+                ++res.preflopCappedToCall;
+            }
+            // R40：BB 面对单次开牌时把弃/跟加宽成 3-bet。外部 12k：弃 −1.00 / 跟 −1.19 /
+            // 3-bet −0.085 BB/手，3-bet 的弃牌率 49% + 摊牌权益基本打平，比弃/跟都便宜。
+            if (cfg.bb3betBelowPct > 0.0f && st.street == ST_PREFLOP &&
+                st.toAct == 1 && st.numRaises == 1 && isRaisePossible(st)) {
+                int hole2[2] = {int(st.hole[st.toAct][0]), int(st.hole[st.toAct][1])};
+                int bd0[5] = {0, 0, 0, 0, 0};
+                if (handStrength(hole2, bd0, 0) < cfg.bb3betBelowPct &&
+                    (mv.kind == MK_FOLD || mv.kind == MK_CALL)) {
+                    int to = cfg.bb3betTo > 0 ? cfg.bb3betTo
+                                              : 3 * int(st.lastRaiseTo);
+                    mv = makeRaise(st, to);
+                    ++res.bb3betWidened;
+                }
+            }
+            // R39：翻牌无注可跟时，弱牌不再自动下注（外部实测全范围 92.7% c-bet、EV −0.766）。
+            if (cfg.flopCheckPct > 0.0f && st.street == ST_FLOP &&
+                toCall(st, st.toAct) == 0 && (mv.kind == MK_RAISE || mv.kind == MK_ALLIN)) {
+                int hole[2] = {int(st.hole[st.toAct][0]), int(st.hole[st.toAct][1])};
+                int bd[5] = {0, 0, 0, 0, 0};
+                for (int k = 0; k < int(st.boardN); ++k) bd[k] = int(st.board[k]);
+                if (handStrength(hole, bd, int(st.boardN)) < cfg.flopCheckPct) {
+                    mv = Move{};
+                    mv.kind = MK_CHECK;
+                    mv.to = st.contrib[st.toAct];
+                    ++res.flopCheckCapped;
+                }
+            }
+            // R41：河牌无注可跟的诈唬按牌力压尺寸（12k 逐手对账：>1.5× 池的纯诈唬
+            // 改成过牌值 +0.157 BB/手，≤0.5× 池只有 +0.025 → 保留诈唬、砍掉大尺寸）。
+            if (cfg.riverBluffPct > 0.0f && st.street == ST_RIVER &&
+                toCall(st, st.toAct) == 0 && (mv.kind == MK_RAISE || mv.kind == MK_ALLIN)) {
+                int hole[2] = {int(st.hole[st.toAct][0]), int(st.hole[st.toAct][1])};
+                int bd[5] = {0, 0, 0, 0, 0};
+                for (int k = 0; k < 5; ++k) bd[k] = int(st.board[k]);
+                if (handStrength(hole, bd, 5) < cfg.riverBluffPct) {
+                    const int potBefore = st.pot();
+                    int target = int(cfg.riverBluffMaxRatio * float(potBefore));
+                    const int cur = int(mv.to) - int(st.contrib[st.toAct]);
+                    if (target < cur) {
+                        if (target <= 0) {
+                            mv = Move{};
+                            mv.kind = MK_CHECK;
+                            mv.to = st.contrib[st.toAct];
+                        } else {
+                            mv = makeRaise(st, int(st.contrib[st.toAct]) + target);
+                        }
+                        ++res.riverBluffCapped;
+                    }
+                }
+            }
+            // R44：转牌无注可跟的弱牌下注压尺寸（与 R41 同一条机制）。
+            if (cfg.turnBluffPct > 0.0f && st.street == ST_TURN &&
+                toCall(st, st.toAct) == 0 && (mv.kind == MK_RAISE || mv.kind == MK_ALLIN)) {
+                int hole[2] = {int(st.hole[st.toAct][0]), int(st.hole[st.toAct][1])};
+                int bd[5] = {0, 0, 0, 0, 0};
+                for (int k = 0; k < int(st.boardN); ++k) bd[k] = int(st.board[k]);
+                if (handStrength(hole, bd, int(st.boardN)) < cfg.turnBluffPct) {
+                    const int potBefore = st.pot();
+                    int target = int(cfg.turnBluffMaxRatio * float(potBefore));
+                    const int cur = int(mv.to) - int(st.contrib[st.toAct]);
+                    if (target < cur) {
+                        if (target <= 0) {
+                            mv = Move{};
+                            mv.kind = MK_CHECK;
+                            mv.to = st.contrib[st.toAct];
+                        } else {
+                            mv = makeRaise(st, int(st.contrib[st.toAct]) + target);
+                        }
+                        ++res.turnBluffCapped;
+                    }
                 }
             }
             // 全下纪律 guard：只保留顶范围跟注（部署剥削，不改变 actor）。

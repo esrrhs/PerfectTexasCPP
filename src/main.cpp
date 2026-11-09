@@ -178,6 +178,8 @@ void usage() {
         "  --maniac-prob F 一局里对手是「过度下注机器人」的概率（默认 0）\n"
         "                  （翻后 1.5~3 倍池超大尺寸开火含诈唬、宽跟，惩罚\n"
         "                   把大加注当坚果 + 用弱牌超池诈唬）\n"
+        "  --maniac-postflop-only  仅当 --maniac-prob>0 时有意义：maniac 的翻前\n"
+        "                  动作退回 solid，只在翻后提供「大注混空气」信号（R13）\n"
         "  --trapper-prob F 一局里对手是「陷阱机器人」的概率（默认 0）\n"
         "                  （强牌只跟注/过牌，河牌才发力；惩罚用中等牌建大池）\n"
         "  --tight-prob F  一局里对手是「紧全下机器人」的概率（默认 0）\n"
@@ -209,6 +211,10 @@ void usage() {
         "  --max-raises N  每街加注次数上限（默认 0 = 无上限，对齐 ACPC）\n"
         "  --oracle-coef F 开天眼稠密奖励的系数（默认 0.05，0 等于关掉）\n"
         "  --fold-regret-coef F 对「明显坏弃」的软惩罚系数（默认 0；训练期用开天眼 eq）\n"
+        "  --fold-aux-coef F 对「明显坏弃」的直接监督 CE 系数（默认 0；目标 = 过牌/跟注）\n"
+        "  --fold-aux-min-regret F 坏弃判据 eq-赔率 的阈值（默认 0.15）\n"
+        "  --badfold-fix-prob F 遇到明显坏弃时把动作改写成过牌/跟注的概率（引导探索，默认 0）\n"
+        "  --fold-aux-two-way 1 双向监督：同时把「eq < 赔率−阈值」的跟注标成弃牌（默认 0）\n"
         "  --oracle-exact  势函数胜率精确化：翻牌精确枚举 990 种、翻前默认 512 次抽样\n"
         "  --aux-equity-coef F 范围胜率信念头的回归系数（默认 0 = 关闭）\n"
         "  --opp-model-coef F 对手牌力建模头的回归系数（默认 0 = 关闭）\n"
@@ -260,6 +266,24 @@ void usage() {
         "  --river-cfr-min-pot N  只在底池 >= N 筹码的河牌决策上求解（0=全部）\n"
         "  --river-cfr-raises N   抽象树里首次下注后的加注次数（默认 1）\n"
         "  --river-cfr-no-allin   抽象树里去掉全下尺寸\n"
+        "  --preflop-fold-vs-3bet-pct P  翻前面对 3-bet/4-bet（numRaises>=2）时，\n"
+        "                  手牌对随机胜率低于 P 一律弃牌（默认 0=关闭；外部 18k 实测\n"
+        "                  SB 被 3-bet、BB 被 4-bet 的所有继续选项都是负 EV）\n"
+        "  --sb-open-to N    SB 首次开牌压到 N 筹码（默认 0=关闭；外部实测我们开\n"
+        "                  3.0~3.6BB，Slumbot 只开 1.8BB）\n"
+        "  --flop-check-pct P  翻牌无注可跟时，牌力百分位 < P 的牌从下注改成过牌\n"
+        "                  （默认 0=关闭；外部实测我们 c-bet 92.7%% vs Slumbot 59.9%%）\n"
+        "  --bb-3bet-below-pct P  BB 面对单次开牌时，牌力百分位 < P 的弃/跟改成 3-bet\n"
+        "                  （默认 0=关闭；外部实测 弃 −1.00 / 跟 −1.19 / 3-bet −0.085 BB）\n"
+        "  --bb-3bet-to N   上述加宽 3-bet 的目标尺寸（默认 0 = 3×跟注额）\n"
+        "  --river-bluff-pct P  河牌无注可跟且牌力百分位 < P 时，诈唬尺寸压在\n"
+        "                  ≤ ratio×底池（默认 0=关闭；外部 12k 逐手对账：大尺寸诈唬亏）\n"
+        "  --river-bluff-max-ratio R  上述被压到的目标尺寸（默认 0.5；0=改过牌）\n"
+        "  --preflop-no-4bet 1  翻前被 3-bet/4-bet 后一律改跟注（默认 0=关闭；\n"
+        "                  外部实测 4-bet 是 −84 BB/手全下底池的唯一起点）\n"
+        "  --turn-bluff-pct P  转牌无注可跟且牌力百分位 < P 时，下注压到 ≤ratio×底池\n"
+        "                  （默认 0=关闭；12k 逐手对账：弱牌下注压小的粗算净 +0.06）\n"
+        "  --turn-bluff-max-ratio R  上述被压到的目标尺寸（默认 0.6；0=改过牌）\n"
         "  --turn-cfr N      转牌 CFR+ 子博弈：同 --river-cfr 口径（对手范围 = 1128\n"
         "                  个组合），叶子 = 发河牌后 check-down 摊牌（河牌全枚举\n"
         "                  精确；≥1 人全下时整个叶子精确，双方有筹码时忽略河牌\n"
@@ -621,6 +645,9 @@ int cmdTrain(int argc, char** argv) {
     pcfg.anchorCoef = static_cast<float>(argDouble(argc, argv, "--anchor-coef", 0.0));
     pcfg.anchorMaxPot = static_cast<float>(argDouble(argc, argv, "--anchor-max-pot", 1500.0));
     pcfg.ruleCoef = static_cast<float>(argDouble(argc, argv, "--river-rule-coef", 0.0));
+    // R17：坏弃直接监督复用 ruleSlot 的 CE 项（见 rollout.cpp），系数相加。
+    const float foldAuxCoef = static_cast<float>(argDouble(argc, argv, "--fold-aux-coef", 0.0));
+    pcfg.ruleCoef += foldAuxCoef;
     const int teacherDecay = argInt(argc, argv, "--teacher-decay", 0);
     const float teacherCoef0 = pcfg.teacherCoef;
     const int teacherReplay = argInt(argc, argv, "--teacher-replay", 0);
@@ -723,6 +750,8 @@ int cmdTrain(int argc, char** argv) {
     rcfg.sharkProb = static_cast<float>(argDouble(argc, argv, "--shark-prob", 0.0));
     rcfg.spammerProb = static_cast<float>(argDouble(argc, argv, "--spammer-prob", 0.0));
     rcfg.maniacProb = static_cast<float>(argDouble(argc, argv, "--maniac-prob", 0.0));
+    // R13：maniac 只在翻后开火（翻前用 solid 动作），避免污染翻前节奏。
+    rcfg.maniacPostflopOnly = hasFlag(argc, argv, "--maniac-postflop-only");
     rcfg.potAdvWeight = static_cast<float>(argDouble(argc, argv, "--pot-adv-weight", 0.0));
     rcfg.rewardPower = static_cast<float>(argDouble(argc, argv, "--reward-power", 1.0));
     rcfg.rangerProb = static_cast<float>(argDouble(argc, argv, "--ranger-prob", 0.0));
@@ -764,11 +793,22 @@ int cmdTrain(int argc, char** argv) {
     // R12：坏弃软惩罚（默认关；只在训练期用开天眼 eq 算）。
     rcfg.foldRegretCoef =
         static_cast<float>(argDouble(argc, argv, "--fold-regret-coef", 0.0));
+    rcfg.foldAuxCoef = foldAuxCoef;
+    rcfg.foldAuxMinRegret =
+        static_cast<float>(argDouble(argc, argv, "--fold-aux-min-regret", 0.15));
+    rcfg.badFoldFixProb = static_cast<float>(argDouble(argc, argv, "--badfold-fix-prob", 0.0));
+    // R18：双向监督（1 = 同时把「eq < 赔率−阈值」的跟注标成弃牌）。
+    rcfg.foldAuxTwoWay = static_cast<float>(argDouble(argc, argv, "--fold-aux-two-way", 0.0));
     rcfg.oracleExact = hasFlag(argc, argv, "--oracle-exact");
     rcfg.equityIters = argInt(argc, argv, "--oracle-iters", rcfg.oracleExact ? 512 : 32);
     // 范围胜率特征：组合级计算（对手底牌采样 + 动作似然重加权 + 摊牌胜率）。
     rcfg.rangeEqSamples = argInt(argc, argv, "--range-eq", 0);
     rcfg.rangeEqIters = argInt(argc, argv, "--range-eq-iters", 48);
+    // R25：rangeEq 的对手似然改用 Slumbot 日志拟合的经验密度表（训练也生效，
+    // 与部署 `slumbot --range-model empirical` 同口径）。默认 policy（自指似然）。
+    if (argStr(argc, argv, "--range-model", "policy") == "empirical") {
+        texas::setEmpiricalRangeModel(true);
+    }
     // 范围搜索剥削者：对手座位按概率换成"用最新策略做河牌后验加权前瞻"的
     // 近似 BR。这是相对当前策略的近似 best response，用来压缩可利用空间。
     rcfg.searchOppProb = static_cast<float>(argDouble(argc, argv, "--search-opp-prob", 0.0));
@@ -936,6 +976,9 @@ int cmdTrain(int argc, char** argv) {
         a.showdowns += b.showdowns;
         a.allinDecisions += b.allinDecisions;
         a.folds += b.folds;
+        a.badFoldTargets += b.badFoldTargets;
+        a.badFoldFixes += b.badFoldFixes;
+        a.badCallTargets += b.badCallTargets;
         a.vsLatest += b.vsLatest;
         a.vsRecent += b.vsRecent;
         a.vsArchive += b.vsArchive;
@@ -1166,12 +1209,13 @@ int cmdTrain(int argc, char** argv) {
         std::printf(
             "  %6d %7d %7.1f %6.1f %6.1f %6.1f %8.4f %8.4f %7.3f %6.1e %7.2f | ret %.3f±%.3f"
             " val %.3f±%.3f c%.2f tea %.2f/%.2f/%.2f rce %.2f cr %.3f aux %.4f/%.3f %.2f/%.2f"
-            " opp %.4f/%.3f %.2f/%.2f\n",
+            " opp %.4f/%.3f %.2f/%.2f fax %lld/%lld/%lld\n",
             u, stats.games, winPct, sdPct, jamPct, foldPct, pg / 2, vl / 2, ent / 2, kl / 2,
             double(u) / secs, retMean / 2, retStd / 2, valMean / 2, valStd / 2, valCorr / 2,
             tea / 2, teaH / 2, teaM / 2, rtea / 2, rcrit / 2,
             auxMse / 2, auxMae / 2, auxPred / 2, auxLab / 2,
-            oppMse / 2, oppMae / 2, oppPred / 2, oppLab / 2);
+            oppMse / 2, oppMae / 2, oppPred / 2, oppLab / 2, stats.badFoldTargets,
+            stats.badFoldFixes, stats.badCallTargets);
         std::fflush(stdout);
 
         if (evalEvery > 0 && (u % evalEvery == 0 || u == updates)) {
@@ -2187,6 +2231,13 @@ int cmdSlumbotAnalyze(int argc, char** argv) {
         double sumEqFold = 0.0, sumOddsFold = 0.0;
     };
     FacingAgg facing[4][5];
+    // R14：对手翻后「开池下注」（没有待跟注时主动下注）的牌力结构。用开天眼
+    // 胜率看它的每个尺寸里到底有多少空气，给「面对大注该守多少」一个经验目标。
+    struct BotBetAgg {
+        int n = 0, air = 0, mid = 0, value = 0;
+        double sumEq = 0.0;
+    };
+    BotBetAgg botBet[4][5];
     struct PendingBet {
         bool valid = false;
         int street = -1;
@@ -2317,6 +2368,33 @@ int cmdSlumbotAnalyze(int argc, char** argv) {
                     if (m.kind == texas::MK_RAISE || m.kind == texas::MK_ALLIN) ++q.raises;
                 }
                 pendingBet.valid = false;
+            }
+            // R14：对手翻后开池下注的牌力审计（只在无待跟注时算「主动下注」，
+            // 加注不算）。eq 取开天眼，按 bet / 下注前底池 分桶。
+            if (st.toAct != mySeat && st.street >= texas::ST_FLOP &&
+                texas::toCall(st, st.toAct) == 0 &&
+                (m.kind == texas::MK_RAISE || m.kind == texas::MK_ALLIN)) {
+                const int potBefore = st.pot();
+                const int amount =
+                    (m.kind == texas::MK_ALLIN)
+                        ? texas::maxRaiseTo(st, st.toAct) - int(st.contrib[st.toAct])
+                        : int(m.to) - int(st.contrib[st.toAct]);
+                if (amount > 0 && potBefore > 0) {
+                    const double ratio = double(amount) / double(potBefore);
+                    const int sb = ratio < 0.5 ? 0 : (ratio < 1.0 ? 1 : (ratio < 1.5 ? 2
+                                                                   : (ratio < 3.0 ? 3 : 4)));
+                    const double eq = texas::perfectEquity(st, st.toAct, 160);
+                    BotBetAgg& bb = botBet[st.street][sb];
+                    ++bb.n;
+                    bb.sumEq += eq;
+                    if (eq < 0.35) {
+                        ++bb.air;
+                    } else if (eq > 0.60) {
+                        ++bb.value;
+                    } else {
+                        ++bb.mid;
+                    }
+                }
             }
             if (st.toAct == mySeat) {
                 const int street = st.street;
@@ -2522,6 +2600,25 @@ int cmdSlumbotAnalyze(int argc, char** argv) {
                             names[s], szNames[b], fa.n, fa.folds, fa.calls, fa.raises, mdf,
                             callPct * 100.0, contPct * 100.0, fa.badFolds, -fa.foldLoss,
                             fa.badCalls, -fa.callLoss);
+            }
+        }
+    }
+
+    // R14：对手翻后开池下注的牌力结构（开天眼）。air = eq<0.35、value = eq>0.60。
+    // 用来判断大注线里有多少纯诈唬 —— 如果 >1.5x 池的注里仍有可观空气占比，
+    // 那就说明现在的「面对大注几乎全弃」是防守不足，而不是对手只有坚果。
+    std::printf("\n  对手翻后开池下注的牌力结构（开天眼 eq）：\n");
+    std::printf("  %-8s %-8s %6s %7s %7s %7s %7s\n", "street", "size", "n", "air%", "mid%",
+                "value%", "meanEq");
+    {
+        const char* szNames2[5] = {"<0.5x", "0.5-1x", "1-1.5x", "1.5-3x", ">3x"};
+        for (int s = 1; s < 4; ++s) {
+            for (int b = 0; b < 5; ++b) {
+                const BotBetAgg& bb = botBet[s][b];
+                if (bb.n == 0) continue;
+                std::printf("  %-8s %-8s %6d %6.1f%% %6.1f%% %6.1f%% %7.3f\n", names[s], szNames2[b],
+                            bb.n, 100.0 * bb.air / bb.n, 100.0 * bb.mid / bb.n,
+                            100.0 * bb.value / bb.n, bb.sumEq / bb.n);
             }
         }
     }
@@ -3314,6 +3411,29 @@ int cmdSlumbotPolicyEval(int argc, char** argv) {
     const std::string dir = argStr(argc, argv, "--resume", "");
     const int maxHands = argInt(argc, argv, "--hands", 0);
     const float temp = static_cast<float>(argDouble(argc, argv, "--temp", 0.5));
+    // R16：把每个「面对下注」决策点的**候选举牌概率**导出成 CSV，用来离线估算
+    // L1 验收量（坏弃金额）——不需要再跑一遍外部对局，也不依赖对手分布。
+    const std::string dumpPolicy = argStr(argc, argv, "--dump-policy", "");
+    std::ofstream policyOut;
+    if (!dumpPolicy.empty()) {
+        policyOut.open(dumpPolicy);
+        policyOut << "hand,street,pot_before,need,ratio,eq,odds,p_fold,p_call,p_raise,"
+                     "ev_fold,ev_call,rq\n";
+    }
+    // R35c：「无注可跟」时的下注决策（河牌开池下注）也导出，用来量诈唬频率。
+    // R35a 证明河牌诈唬（eq<0.5）是最大单点漏点，这个 dump 让它在本地秒级可见。
+    const std::string dumpBets = argStr(argc, argv, "--dump-bets", "");
+    std::ofstream betOut;
+    if (!dumpBets.empty()) {
+        betOut.open(dumpBets);
+        betOut << "hand,street,pot,eq,hs,p_check,p_bet,bet_avg\n";
+    }
+    // R32：闸门必须能喂 rangeEq，否则 R21/R25 测到的是「关闭特征」路径。
+    const int rqSamples = argInt(argc, argv, "--range-eq", 0);
+    const int rqIters = argInt(argc, argv, "--range-eq-iters", 48);
+    if (argStr(argc, argv, "--range-model", "policy") == "empirical") {
+        texas::setEmpiricalRangeModel(true);
+    }
     if (csvs.empty() || dir.empty()) {
         std::printf("slumbot-policy-eval 需要 --resume DIR --csv FILE（可重复）\n");
         return 1;
@@ -3332,9 +3452,9 @@ int cmdSlumbotPolicyEval(int argc, char** argv) {
     for (int s = 0; s < 2; ++s) actors[s]->eval();
 
     // 某个固定局面上的策略概率。与 policyMove 同一条前向路径（T 温度、rangeEq
-    // 取部署默认 0.5）。
+    // 由调用方按回放状态算好传入；默认 0.5 = 中性，即 R21/R25 之前的关闭口径）。
     auto policyProbs = [&](const texas::HUState& st, const texas::LegalMove* lm, int n,
-                           float* probs) {
+                           float* probs, float rangeEq) {
         const int seat = st.toAct;
         torch::NoGradGuard ng;
         torch::Tensor nodeT = torch::zeros({1, texas::kNodeInput}, torch::kFloat32);
@@ -3353,7 +3473,8 @@ int cmdSlumbotPolicyEval(int argc, char** argv) {
             std::copy(af.begin(), af.end(), featT.data_ptr<float>() + i * texas::kActionInput);
             idT.data_ptr<int64_t>()[i] = lm[i].slot;
         }
-        torch::Tensor logits = actors[seat]->forward(nodeT, seqT, featT, sampleT, idT);
+        torch::Tensor rqT = torch::full({1}, rangeEq, torch::kFloat32);
+        torch::Tensor logits = actors[seat]->forward(nodeT, seqT, featT, sampleT, idT, rqT);
         const float* lp = logits.data_ptr<float>();
         float scaled[texas::kNumActions];
         for (int i = 0; i < texas::kNumActions; ++i) {
@@ -3435,6 +3556,10 @@ int cmdSlumbotPolicyEval(int argc, char** argv) {
     };
 
     int handsDone = 0, badReplay = 0, oppDecisions = 0;
+    // R32：回放中记录每个座位「最近一次决策」的动作前状态 + 槽位，供 rangeEq 重建
+    // 对手范围。采样用独立 RNG，避免改变 applyMove 的发牌随机序列。
+    texas::RangeObs lastAct[2];
+    texas::Rng rqRng(7);
     for (const std::string& path : csvs) {
         std::ifstream in(path);
         if (!in) {
@@ -3509,7 +3634,13 @@ int cmdSlumbotPolicyEval(int argc, char** argv) {
                     const int n = texas::legalMoves(st, lm);
                     if (n > 0) {
                         float probs[texas::kNumActions] = {};
-                        policyProbs(st, lm, n, probs);
+                        float rq = 0.5f;
+                        if (rqSamples > 0) {
+                            rq = texas::rangeEquityAt(st, mySeat, lastAct[1 - mySeat],
+                                                      &actors[1 - mySeat], rqSamples, rqIters,
+                                                      rqRng);
+                        }
+                        policyProbs(st, lm, n, probs, rq);
                         float pFold = 0.0f, pCall = 0.0f;
                         bool hasFold = false, hasCall = false;
                         for (int k = 0; k < n; ++k) {
@@ -3552,13 +3683,51 @@ int cmdSlumbotPolicyEval(int argc, char** argv) {
                                 ab->lossSq += loss * loss;
                                 ab->raiseMass += 1.0 - pFC;
                                 if (hitBest) ++ab->hits;
+                                if (policyOut) {
+                                    const int potBefore = pot - need;
+                                    policyOut
+                                        << handsDone << ',' << int(st.street) << ',' << potBefore
+                                        << ',' << need << ','
+                                        << (potBefore > 0 ? double(need) / double(potBefore) : 0.0)
+                                        << ',' << eq << ',' << double(need) / double(pot + need)
+                                        << ',' << pFold << ',' << pCall << ','
+                                        << (1.0f - pFC) << ',' << evFold << ',' << evCall << ','
+                                        << rq << '\n';
+                                }
                             }
                         } else {
                             ++total.skipped;
                             ++byStreet[int(st.street)].skipped;
+                            // R35c：河牌「无注可跟」（need==0）的下注决策，量诈唬频率。
+                            // p_bet = 所有非 弃牌/过牌 槽位的概率和（合法动作里没有弃牌）。
+                            if (betOut && need == 0 && st.street == texas::ST_RIVER) {
+                                float pBet = 0.0f;
+                                double betSize = 0.0;
+                                for (int k = 0; k < n; ++k) {
+                                    const int sl = lm[k].slot;
+                                    if (sl != texas::kSlotCheckCall) {
+                                        pBet += probs[sl];
+                                        betSize += double(probs[sl]) *
+                                                   double(lm[k].mv.to - st.contrib[mySeat]);
+                                    }
+                                }
+                                const double eq = exactEquity(mine, theirs, bd, 5);
+                                const float hs = texas::handStrength(
+                                    mine, bd, int(st.boardN));
+                                if (eq >= 0.0) {
+                                    betOut << handsDone << ',' << int(st.street) << ','
+                                           << st.pot() << ',' << eq << ',' << hs << ','
+                                           << (1.0f - pBet) << ',' << pBet << ','
+                                           << (pBet > 1e-6 ? betSize / double(pBet) : 0.0)
+                                           << '\n';
+                                }
+                            }
                         }
                     }
                 }
+                lastAct[st.toAct].pre = st;
+                lastAct[st.toAct].slot = texas::slotOfMove(st, m);
+                lastAct[st.toAct].valid = lastAct[st.toAct].slot >= 0;
                 texas::applyMove(st, m, rng);
                 if (st.finished) break;
             }
@@ -4567,6 +4736,21 @@ int cmdSlumbot(int argc, char** argv) {
     cfg.preflopAggroMaxRaises = argInt(argc, argv, "--preflop-aggro-max-raises", 2);
     cfg.bb3betMinPct = static_cast<float>(argDouble(argc, argv, "--bb-3bet-min-pct", 0.0));
     cfg.flopAggroPct = static_cast<float>(argDouble(argc, argv, "--flop-aggro-pct", 0.0));
+    cfg.sbOpenTo = argInt(argc, argv, "--sb-open-to", 0);
+    cfg.preflopFoldVs3betPct =
+        static_cast<float>(argDouble(argc, argv, "--preflop-fold-vs-3bet-pct", 0.0));
+    cfg.flopCheckPct = static_cast<float>(argDouble(argc, argv, "--flop-check-pct", 0.0));
+    cfg.bb3betBelowPct =
+        static_cast<float>(argDouble(argc, argv, "--bb-3bet-below-pct", 0.0));
+    cfg.bb3betTo = argInt(argc, argv, "--bb-3bet-to", 0);
+    cfg.riverBluffPct =
+        static_cast<float>(argDouble(argc, argv, "--river-bluff-pct", 0.0));
+    cfg.riverBluffMaxRatio =
+        static_cast<float>(argDouble(argc, argv, "--river-bluff-max-ratio", 0.5));
+    cfg.preflopNo4bet = argInt(argc, argv, "--preflop-no-4bet", 0) != 0;
+    cfg.turnBluffPct = static_cast<float>(argDouble(argc, argv, "--turn-bluff-pct", 0.0));
+    cfg.turnBluffMaxRatio =
+        static_cast<float>(argDouble(argc, argv, "--turn-bluff-max-ratio", 0.6));
     cfg.rangeEqSamples = argInt(argc, argv, "--range-eq", 0);
     cfg.rangeEqIters = argInt(argc, argv, "--range-eq-iters", 48);
     cfg.rangeModel =
@@ -4610,12 +4794,16 @@ int cmdSlumbot(int argc, char** argv) {
     const double adjSeBb100 = r.adjustedStderr / double(texas::kBigBlind) * 100.0;
     std::printf(
         "\nslumbot 结果: %d/%d 手完成（中止 %d，错误 %d，河牌大注 %d，全下 guard %d，"
-        "翻前限攻 %d，翻牌限攻 %d，BB 3-bet 限攻 %d，rangeEq 决策 %d，转牌求解 %d，"
-        "河牌求解 %d）\n"
+        "翻前限攻 %d，翻牌限攻 %d，BB 3-bet 限攻 %d，SB 开牌压尺寸 %d，"
+        "翻前弃 3bet/4bet %d，翻牌改过牌 %d，BB 加宽 3-bet %d，河牌诈唬压尺寸 %d，"
+        "翻前 4-bet 改跟 %d，转牌弱下注压尺寸 %d，"
+        "rangeEq 决策 %d，转牌求解 %d，河牌求解 %d）\n"
                 "  净收益 %+lld 筹码 | %+0.1f ± %.1f 筹码/手 | %+0.1f ± %.1f bb/100 | "
                 "胜 %d 负 %d 平 %d | %.1f 手/s\n",
                 r.hands, r.attempted, r.attempted - r.hands, r.errors, r.riverOverbets,
                 r.allinGuardFolds, r.preflopAggroCapped, r.flopAggroCapped, r.bb3betCapped,
+                r.sbOpenCapped, r.preflopVs3betFolds, r.flopCheckCapped, r.bb3betWidened,
+                r.riverBluffCapped, int(r.preflopCappedToCall), r.turnBluffCapped,
                 r.rangeEqDecisions, r.turnCfrDecisions, r.riverCfrDecisions, r.winnings, per,
                 r.chipsStderr, per / double(texas::kBigBlind) * 100.0, seBb100, r.wins, r.losses,
                 r.pushes, double(r.hands) / std::max(secs, 1e-6));

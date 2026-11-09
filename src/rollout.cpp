@@ -36,6 +36,8 @@ enum RoleType : uint8_t {
     ROLE_SEARCH = 6,
     ROLE_SOLID = 8,
     ROLE_FOLDER = 9,
+    // 评估用：翻后大注诈唬者（R19 诊断：`--vs bluffer` 直接量「我们被空气大注剥削多少」）
+    ROLE_BLUFFER = 18,
     // 尖自对局：对手座位用**当前策略**按部署温度（默认 0.1）提取动作。
     // 训练行为策略仍是采样（T=1），但对手是部署时的尖版本，逼策略学会
     // 防住"不留送分动作"的精确打法。
@@ -2188,6 +2190,83 @@ Move maniacAgentMove(const HUState& s, Rng& rng) {
     return out;
 }
 
+// R13：校准版「翻后大注诈唬」对手。翻前完全复用 solid（R11 的失败主因是
+// maniac 的宽开/高频反加把翻前节奏带跑），翻后只加一条信号：强牌按
+// 0.75~1.5 倍池下注、空气（eq<0.35）按 1.5~3 倍池下注，其余过牌；面对下注
+// 时强牌大加注、其余按赔率宽跟。目标是给「大尺寸 = 坚果」的先验降权，
+// 而不污染翻前。
+Move blufferAgentMove(const HUState& s, Rng& rng) {
+    if (s.street == ST_PREFLOP) return solidAgentMove(s, rng);
+
+    LegalMove mv[kNumActions];
+    const int n = legalMoves(s, mv);
+    if (n == 0) return Move{};
+
+    const int me = s.toAct;
+    const int need = toCall(s, me);
+    const int pot = s.pot();
+    const float eq = equityVsRandom(s, me, 24);
+    std::uniform_real_distribution<float> u(0.0f, 1.0f);
+
+    auto checkCall = [&](Move& out) {
+        for (int i = 0; i < n; ++i) {
+            if (mv[i].slot == kSlotCheckCall) {
+                out = mv[i].mv;
+                return true;
+            }
+        }
+        return false;
+    };
+    auto fold = [&](Move& out) {
+        for (int i = 0; i < n; ++i) {
+            if (mv[i].slot == kSlotFold) {
+                out = mv[i].mv;
+                return true;
+            }
+        }
+        return false;
+    };
+    auto raiseTo = [&](int to, Move& out) {
+        if (!isRaisePossible(s)) return false;
+        out = makeRaise(s, to);
+        return out.kind == MK_RAISE || out.kind == MK_ALLIN;
+    };
+    const int myContrib = int(s.contrib[me]);
+
+    Move out{};
+    if (need == 0) {
+        if (eq > 0.72f && u(rng) < 0.55f) {
+            const int to =
+                myContrib + std::max<int>(kBigBlind, int((0.75f + 0.75f * u(rng)) * pot));
+            if (raiseTo(to, out)) return out;
+        }
+        // 空气大注：eq<0.32 且 30% 概率，尺寸 1.5~3 倍池。这是本对手提供的
+        // 唯一新信号——「大注线里有空气」。空气占其下注组合的比例按设计约
+        // 30%，略高于 Slumbot 实测的 14–28%（R14），再不偏离太多。
+        if (eq < 0.32f && u(rng) < 0.30f) {
+            const int to =
+                myContrib + std::max<int>(kBigBlind, int((1.5f + 1.5f * u(rng)) * pot));
+            if (raiseTo(to, out)) return out;
+        }
+        checkCall(out);
+        return out;
+    }
+
+    // 面对下注：强牌 35% 大加注，其余按赔率宽跟（与 solid 同口径）。
+    if (eq > 0.80f && u(rng) < 0.35f) {
+        const int to = myContrib + std::max<int>(kBigBlind, int(2.0f * pot));
+        if (raiseTo(to, out)) return out;
+    }
+    const float odds = float(need) / float(pot + need);
+    if (eq > odds * 1.02f) {
+        checkCall(out);
+        return out;
+    }
+    if (fold(out)) return out;
+    checkCall(out);
+    return out;
+}
+
 void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const RolloutConfig& cfg,
                     std::array<std::vector<Transition>, 2>& out, RolloutStats& stats) {
     torch::NoGradGuard noGrad;  // 采样只做前向，不需要建图
@@ -2284,6 +2363,9 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
     } else if (cfg.forceRangerSeat >= 0) {
         forcedSeat = cfg.forceRangerSeat;
         forcedRole = ROLE_RANGER;
+    } else if (cfg.forceBlufferSeat >= 0) {
+        forcedSeat = cfg.forceBlufferSeat;
+        forcedRole = ROLE_BLUFFER;
     } else if (cfg.forceCfrSeat >= 0) {
         forcedSeat = cfg.forceCfrSeat;
         forcedRole = ROLE_CFR;
@@ -2720,20 +2802,72 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
             // 所以赔率用 play 之后的底池计算。
             int foldNeed = 0;
             float foldEq = 0.0f;
-            const bool wantFoldRegret = cfg.foldRegretCoef > 0.0f &&
-                                        played.kind == MK_FOLD && toCall(g.st, seat) > 0;
+            const bool wantFoldRegret =
+                (cfg.foldRegretCoef > 0.0f || cfg.foldAuxCoef > 0.0f ||
+                 cfg.badFoldFixProb > 0.0f) &&
+                played.kind == MK_FOLD && toCall(g.st, seat) > 0;
             if (wantFoldRegret) {
                 foldNeed = toCall(g.st, seat);
                 foldEq = equityFor(g, seat, cfg.equityIters, cfg.oracleExact);
+                // R17c：引导探索。eq 与赔率在弃牌前后都成立（弃牌不改底池），
+                // 所以这里可以先用动作前底池判 gap，再决定要不要改写动作。
+                const float oddsPre = float(foldNeed) / float(g.st.pot() + foldNeed);
+                if (cfg.badFoldFixProb > 0.0f && foldEq - oddsPre >= cfg.foldAuxMinRegret &&
+                    uu(rng) < cfg.badFoldFixProb) {
+                    for (const ActionOption& a : t.actions) {
+                        if (a.slot != kSlotCheckCall) continue;
+                        float probsFix[kNumActions];
+                        maskedSoftmaxTemp(pLogits + i * kNumActions, kNumActions, 1.0f, probsFix);
+                        played = a.mv;
+                        t.action = a.slot;
+                        t.logp = std::log(std::max(1e-12f, probsFix[a.slot]));
+                        ++stats.badFoldFixes;
+                        break;
+                    }
+                }
+            }
+            // R18：双向监督的反向分支。跟注决策用动作前 eq 与赔率比较，eq 明显
+            // 低于赔率时把「弃牌」写进 ruleSlot，与坏弃标签共用同一个 CE。
+            int callNeed = 0;
+            float callEq = 0.0f;
+            const bool wantCallLabel =
+                cfg.foldAuxTwoWay > 0.0f && played.kind == MK_CALL && toCall(g.st, seat) > 0;
+            if (wantCallLabel) {
+                callNeed = toCall(g.st, seat);
+                callEq = equityFor(g, seat, cfg.equityIters, cfg.oracleExact);
             }
             play(g, seat, played);
-            if (wantFoldRegret) {
+            if (wantFoldRegret && played.kind == MK_FOLD) {
                 const float potNow = float(g.st.pot());
                 const float odds = float(foldNeed) / (potNow + float(foldNeed));
-                const float regret = foldEq - odds - 0.15f;
-                if (regret > 0.0f) {
-                    t.reward -= cfg.foldRegretCoef * regret *
+                const float gap = foldEq - odds;
+                if (cfg.foldRegretCoef > 0.0f && gap > 0.15f) {
+                    t.reward -= cfg.foldRegretCoef * (gap - 0.15f) *
                                 (potNow + float(foldNeed)) / float(kStartingStack);
+                }
+                // R17：把「明显坏弃」的决策点直接标成规则教师目标（过牌/跟注），
+                // CE 由 learner 的 ruleCoef 项施加（main 把两个系数相加）。
+                if (cfg.foldAuxCoef > 0.0f && gap >= cfg.foldAuxMinRegret) {
+                    for (const ActionOption& a : t.actions) {
+                        if (a.slot == kSlotCheckCall) {
+                            t.ruleSlot = a.slot;
+                            ++stats.badFoldTargets;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (wantCallLabel) {
+                // 跟注后底池已含我方补注，赔率 = need / pot(now)。
+                const float odds = float(callNeed) / float(g.st.pot());
+                if (callEq - odds <= -cfg.foldAuxMinRegret) {
+                    for (const ActionOption& a : t.actions) {
+                        if (a.slot == kSlotFold) {
+                            t.ruleSlot = a.slot;
+                            ++stats.badCallTargets;
+                            break;
+                        }
+                    }
                 }
             }
             ++stats.decisions;
@@ -2825,6 +2959,18 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         }
     };
 
+    auto runBluffer = [&](int seat, const std::vector<int>& idx) {
+        (void)seat;
+        for (int gi : idx) {
+            GameCtx& g = gs[static_cast<size_t>(gi)];
+            const Move mv = blufferAgentMove(g.st, rng);
+            play(g, seat, mv);
+            if (mv.kind == MK_FOLD) ++stats.folds;
+            if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
+            if (g.st.terminal()) finishGame(g);
+        }
+    };
+
     auto runTight = [&](int seat, const std::vector<int>& idx) {
         (void)seat;
         for (int gi : idx) {
@@ -2865,7 +3011,8 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         (void)seat;
         for (int gi : idx) {
             GameCtx& g = gs[static_cast<size_t>(gi)];
-            const Move mv = maniacAgentMove(g.st, rng);
+            const Move mv = cfg.maniacPostflopOnly ? blufferAgentMove(g.st, rng)
+                                                   : maniacAgentMove(g.st, rng);
             play(g, seat, mv);
             if (mv.kind == MK_FOLD) ++stats.folds;
             if (mv.kind == MK_ALLIN) ++stats.allinDecisions;
@@ -3267,6 +3414,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
             std::vector<int> rangerIdx;
             std::vector<int> cfrIdx;
             std::vector<int> folderIdx;
+            std::vector<int> blufferIdx;
             std::vector<int> bigIdx;
             std::vector<int> sOppIdx;
             const bool useBig =
@@ -3300,6 +3448,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
                     case ROLE_MANIAC: maniacIdx.push_back(i); break;
                     case ROLE_RANGER: rangerIdx.push_back(i); break;
                     case ROLE_CFR: cfrIdx.push_back(i); break;
+                    case ROLE_BLUFFER: blufferIdx.push_back(i); break;
                     case ROLE_FOLDER: folderIdx.push_back(i); break;
                     default: ruleIdx.push_back(i); break;
                 }
@@ -3464,6 +3613,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
             runManiac(seat, maniacIdx);
             runRanger(seat, rangerIdx);
             runOppCfr(seat, cfrIdx);
+            runBluffer(seat, blufferIdx);
             runFolder(seat, folderIdx);
         }
     }

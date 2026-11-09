@@ -87,6 +87,39 @@ struct SlumbotConfig {
     int riverCfrMinPot = 0;
     int riverCfrMaxRaises = 1;
     bool riverCfrAllin = true;
+    // R38：SB 首次开牌的目标尺寸（筹码；0 = 关闭）。外部 12k 实测：我们 SB
+    // 开牌集中在 3.0~3.6BB，而 Slumbot 只加到 1.8BB。SB 被 3-bet 弃牌时直接
+    // 损失开牌额，开牌越大，弃牌成本越高（1,404 手 3-bet 底池合计 −0.449 BB/手）。
+    int sbOpenTo = 0;
+    // R38：面对 3-bet / 4-bet（翻前 numRaises >= 2）的继续门槛，两个座位都适用。
+    // 外部 12k 实测：SB 被 3-bet 后 弃 −3.7 / 跟 −6.9 / 4-bet −9.2 BB/手；
+    // BB 被 4-bet 后 弃 −5.0 / 跟 −24.4 / 5-bet −77 BB/手 → 除顶端范围外继续全是亏的。
+    // 手牌「对随机胜率」>= pct 才继续，否则弃牌。
+    float preflopFoldVs3betPct = 0.0f;
+    // R39：翻牌无注可跟（need==0）时的高频下注限制。外部 12k 实测：SB 开牌被跟后
+    // 我们翻牌 c-bet 92.7%（EV −0.766 BB/手），同口径 Slumbot 只 c-bet 59.9%。
+    // 牌力百分位 < pct 时把下注改成过牌（0 = 关闭）。
+    float flopCheckPct = 0.0f;
+    // R40：BB 面对开牌（numRaises==1）时的加宽 3-bet。外部 12k 实测：BB 弃 −1.00 /
+    // 跟 −1.19 / 3-bet −0.085 BB/手 → 用弃/跟的牌去 3-bet 是唯一便宜选项。
+    // 牌力百分位 < pct 时把弃牌/跟注改成 3-bet（0 = 关闭）。
+    float bb3betBelowPct = 0.0f;
+    int bb3betTo = 0;  // 加宽 3-bet 的目标尺寸（筹码；0 = 取 3×跟注额）
+    // R41：河牌「无注可跟」的诈唬尺寸上限。外部 12k 逐手精确对账（我们与对手底牌全知）：
+    // 河牌下注 779 手里 eq<0.50 的 417 手，改成过牌可回收 +0.286 BB/手；其中
+    // >1.5× 池的 50 手单独值 +0.157，而 ≤0.5× 池只有 +0.025（几乎中性）。
+    // 即「诈唬可以打，但别用大尺寸」：手牌百分位 < pct 时把下注压到 ≤ ratio×底池。
+    float riverBluffPct = 0.0f;      // 0 = 关闭
+    float riverBluffMaxRatio = 0.5f; // 压到的目标尺寸（占下注前底池）
+    // R42：翻前被 3-bet/4-bet 后不再加注（4-bet/5-bet 一律改跟注）。外部 12k 实测：
+    // SB 被 3-bet 后 4-bet −9.24 vs 跟 −6.89；而 4-bet 是 200BB 全下底池的唯一起点
+    // （4bet+ 打到河牌的 36 手 −84 BB/手，合计 −0.239 BB/手）→ 不加注就整段消失。
+    bool preflopNo4bet = false;
+    // R44：转牌「无注可跟」的弱牌下注尺寸上限（R41 机制外推到转牌）。12k 逐手对账：
+    // 转牌 2,301 次开池下注里 1,330 次 eq<0.5，全部压到 ≤0.6× 池的粗算净 +0.06 BB/手
+    // （弱牌 +0.186、价值 −0.125；有强度门槛时可只取弱牌那部分）。
+    float turnBluffPct = 0.0f;
+    float turnBluffMaxRatio = 0.6f;
 };
 
 struct SlumbotResult {
@@ -97,6 +130,13 @@ struct SlumbotResult {
     int preflopAggroCapped = 0;  // 翻前进攻上限触发次数（诊断用）
     int bb3betCapped = 0;        // BB 中等牌 3-bet 改成跟注的次数（诊断用）
     int flopAggroCapped = 0;     // 翻牌进攻上限触发次数（诊断用）
+    int sbOpenCapped = 0;        // R38：SB 开牌尺寸被压小的次数（诊断用）
+    int preflopVs3betFolds = 0;  // R38：SB 面对 3-bet 被改成弃牌的次数（诊断用）
+    int flopCheckCapped = 0;     // R39：翻牌下注被改成过牌的次数（诊断用）
+    int bb3betWidened = 0;       // R40：BB 弃/跟被改成 3-bet 的次数（诊断用）
+    int riverBluffCapped = 0;    // R41：河牌诈唬尺寸被压小的次数（诊断用）
+    int preflopCappedToCall = 0; // R42：翻前 3-bet/4-bet 后加注被改成跟注的次数
+    int turnBluffCapped = 0;     // R44：转牌弱牌下注被压小的次数（诊断用）
     int rangeEqDecisions = 0;    // 真实算过 rangeEq 的决策数（诊断用）
     int turnCfrDecisions = 0;    // 转牌子博弈求解器接管的决策数（诊断用）
     int riverCfrDecisions = 0;   // 河牌子博弈求解器接管的决策数（诊断用）

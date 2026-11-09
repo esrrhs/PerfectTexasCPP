@@ -268,6 +268,7 @@ EvalResult evalShowdownVs(const EvalTeam& team, const std::string& opp, int game
     int ruleSeat = -1, randomSeat = -1, proSeat = -1, searchSeat = -1, solidSeat = -1;
     int rangerSeat = -1;
     int cfrSeat = -1;
+    int blufferSeat = -1;
     if (opp == "rule") ruleSeat = 1;
     else if (opp == "random") randomSeat = 1;
     else if (opp == "pro") proSeat = 1;
@@ -275,6 +276,7 @@ EvalResult evalShowdownVs(const EvalTeam& team, const std::string& opp, int game
     else if (opp == "ranger") rangerSeat = 1;
     else if (opp == "cfr") cfrSeat = 1;
     else if (opp == "search") searchSeat = 1;
+    else if (opp == "bluffer") blufferSeat = 1;
     else {
         std::printf("evalShowdownVs: 未知对手 %s\n", opp.c_str());
         return EvalResult{};
@@ -303,6 +305,7 @@ EvalResult evalShowdownVs(const EvalTeam& team, const std::string& opp, int game
         cfg.forceSearchSeat = (searchSeat >= 0) ? oppSeat : -1;
         cfg.forceSolidSeat = (solidSeat >= 0) ? oppSeat : -1;
         cfg.forceRangerSeat = (rangerSeat >= 0) ? oppSeat : -1;
+        cfg.forceBlufferSeat = (blufferSeat >= 0) ? oppSeat : -1;
         cfg.forceCfrSeat = (cfrSeat >= 0) ? oppSeat : -1;
         cfg.watchedSeat = 1 - oppSeat;
         cfg.handScoresByGame = &passScores[static_cast<size_t>(pass)];

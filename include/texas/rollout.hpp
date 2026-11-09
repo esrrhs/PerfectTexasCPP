@@ -127,6 +127,10 @@ struct RolloutConfig {
     // 下注也大加注、合理价格宽跟。外部复盘显示策略把"大加注"当坚果（把
     // 葫芦弃给 4 倍加注）又会用 4.5% 胜率的牌超池诈唬，两个方向都要纠正。
     float maniacProb = 0.0f;
+    // R13：把 maniac 的「过度下注」限制在翻后，翻前完全用 solid 的动作。
+    // R11 失败的主因是 maniac 的宽开/高频反加把翻前节奏带跑（BB 3-bet 从
+    // 14.5% 漂到 44.6%）；这里只保留「翻后 1.5~3 倍池混空气」这一条教学信号。
+    bool maniacPostflopOnly = false;
     // 「读范围」机器人：跟注/弃牌用**条件胜率**（假设我们的范围 = 当前牌面
     // 上最强 keep 比例的组件），而不是其余脚本的 equityVsRandom。README #107
     // 指出其余脚本全是范围盲的，策略因此把"原始胜率 > 赔率就跟"学成了默认
@@ -161,6 +165,18 @@ struct RolloutConfig {
     // R12：对「明显坏弃」加软惩罚（只在训练期、双方底牌已知时算）。
     // 每个弃牌决策扣 coef * max(0, eq - 赔率 - 0.15) * 底池/起始筹码。
     float foldRegretCoef = 0.0f;
+    // R17：坏弃的直接监督。eq - 赔率 >= foldAuxMinRegret 的弃牌决策，把
+    // 「过牌/跟注」写进 ruleSlot，由 learner 的 CE 项把概率质量压过去。
+    // 与 R12 的区别：R12 走优势/回报，R17 直接改策略分布。
+    float foldAuxCoef = 0.0f;
+    float foldAuxMinRegret = 0.15f;
+    // R17c：引导探索。遇到「明显坏弃」时按这个概率把动作在执行层改成过牌/跟注，
+    // 让这条动作真正进入轨迹并由真实回报给出优势（不经 CE，不会被优势标准化吸收）。
+    float badFoldFixProb = 0.0f;
+    // R18：双向监督。R17 的 CE 只把「坏弃」标成跟注，没有反向标签；打开后
+    // 把 eq - 赔率 <= -foldAuxMinRegret 的跟注决策标成弃牌，两个方向共用同一个
+    // CE（main 把 foldAuxCoef 加进 ruleCoef）。默认 0 = 保持 R17 单向行为。
+    float foldAuxTwoWay = 0.0f;
     int equityIters = 32;          // 开天眼胜率的抽样次数
     // 精确势函数胜率（A/B 用）：翻牌也精确枚举 C(45,2)=990 种，翻前用
     // equityIters（--oracle-exact 时默认 512）。转牌/河牌本来就精确。
@@ -200,6 +216,7 @@ struct RolloutConfig {
     int forceSearchSeat = -1;      // 评估用：强制某个座位打"搜索机器人"（教师 argmax）
     int forceSolidSeat = -1;       // 评估用：强制某个座位打"跟注型稳健机器人"
     int forceRangerSeat = -1;      // 评估用：强制某个座位打"读范围机器人"
+    int forceBlufferSeat = -1;     // 评估用：强制某个座位打"翻后大注诈唬者"
     int forceCfrSeat = -1;         // 评估用：强制某个座位打"河牌 CFR 对手"
     int searchSamples = 16;        // 搜索机器人对隐藏牌平均的样本数
     int searchStyles = 3;          // 搜索机器人用的教师续演风格数
@@ -349,6 +366,9 @@ struct RolloutStats {
     long long showdowns = 0;
     long long allinDecisions = 0;
     long long folds = 0;
+    long long badFoldTargets = 0;  // R17：被标成「应当跟注」的坏弃决策数
+    long long badFoldFixes = 0;    // R17c：被引导成跟注的坏弃决策数
+    long long badCallTargets = 0;  // R18：被标成「应当弃牌」的坏跟决策数
     // 本批里各类对手实际出现的手数（按局计，不含被强制的评估局）
     int vsLatest = 0;
     int vsRecent = 0;
