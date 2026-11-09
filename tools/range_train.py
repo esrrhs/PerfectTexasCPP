@@ -112,7 +112,7 @@ class Bilinear:
             setattr(self, k, v.copy())
 
     def fit(self, ctx, strength, target, val, epochs=60, batch=128, lr=3e-4, l2=3e-3,
-            patience=8, verbose=True):
+            patience=8, verbose=True, weights=None):
         n = ctx.shape[0]
         rng = np.random.default_rng(123)
         params = {"U": self.U, "V": self.V, "b": self.b}
@@ -130,12 +130,17 @@ class Bilinear:
             for st in range(0, n, batch):
                 bi = idx[st:st + batch]
                 c, s, t = ctx[bi], strength[bi], target[bi]
+                w = None if weights is None else weights[bi]
                 u = c @ self.U
                 z = u @ self.V.T + self.ws * s + self.b
                 lsm = log_softmax(z)
                 p = np.exp(lsm)
-                tot += -float(np.sum(t * lsm))
-                g = (p - t) / len(bi)
+                if w is None:
+                    tot += -float(np.sum(t * lsm))
+                    g = (p - t) / len(bi)
+                else:
+                    tot += -float(np.sum(t * lsm * w[:, None]))
+                    g = (p - t) * (w / w.sum())[:, None]
                 gU = c.T @ (g @ self.V) + l2 * self.U
                 gV = g.T @ u + l2 * self.V
                 gb = g.sum(axis=0)
@@ -257,6 +262,8 @@ def main():
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--street-balance", action="store_true",
+                    help="训练集按街等质量加权（河牌/转牌样本少，避免被翻前淹没）")
     args = ap.parse_args()
 
     d = load(args.files)
@@ -298,9 +305,22 @@ def main():
     ps = softmax(sm.logits(np.zeros_like(ctx[te]), strength[te]))
 
     model = Bilinear(CTX_DIM, NCLASS, rank=args.rank, seed=args.seed)
+    sw = None
+    if args.street_balance:
+        cnt = np.bincount(d["street"][tr], minlength=4).astype(np.float64)
+        sw = np.zeros(len(d), dtype=np.float32)
+        for s in range(4):
+            m = d["street"] == s
+            if cnt[s] > 0:
+                sw[m] = np.float32(1.0 / cnt[s])
+        sw = sw / sw[tr].mean()
+        print("街权重: " + "  ".join(
+            f"{STREET_NAMES[s]}={float(sw[d['street'] == s][0]):.2f}"
+            for s in range(4) if cnt[s] > 0))
     print(f"\n训练低秩双线性模型（rank={args.rank}）")
     model.fit(ctx[tr], strength[tr], target[tr],
-              (ctx[va], strength[va], target[va]), epochs=args.epochs)
+              (ctx[va], strength[va], target[va]), epochs=args.epochs,
+              weights=None if sw is None else sw[tr])
 
     p = softmax(model.logits(ctx[te], strength[te]))
     ptbl = table_predict(d, tr, te)
