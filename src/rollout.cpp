@@ -2716,7 +2716,26 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
                 if (to > cap) to = cap;
                 if (to > int(played.to)) played.to = static_cast<int16_t>(to);
             }
+            // R12：坏弃软惩罚。eq 取动作前的开天眼胜率；弃牌不改变底池，
+            // 所以赔率用 play 之后的底池计算。
+            int foldNeed = 0;
+            float foldEq = 0.0f;
+            const bool wantFoldRegret = cfg.foldRegretCoef > 0.0f &&
+                                        played.kind == MK_FOLD && toCall(g.st, seat) > 0;
+            if (wantFoldRegret) {
+                foldNeed = toCall(g.st, seat);
+                foldEq = equityFor(g, seat, cfg.equityIters, cfg.oracleExact);
+            }
             play(g, seat, played);
+            if (wantFoldRegret) {
+                const float potNow = float(g.st.pot());
+                const float odds = float(foldNeed) / (potNow + float(foldNeed));
+                const float regret = foldEq - odds - 0.15f;
+                if (regret > 0.0f) {
+                    t.reward -= cfg.foldRegretCoef * regret *
+                                (potNow + float(foldNeed)) / float(kStartingStack);
+                }
+            }
             ++stats.decisions;
             if (played.kind == MK_ALLIN) ++stats.allinDecisions;
             if (played.kind == MK_FOLD) ++stats.folds;

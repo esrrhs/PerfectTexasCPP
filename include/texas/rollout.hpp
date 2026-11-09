@@ -158,6 +158,9 @@ struct RolloutConfig {
     float archiveProb = 0.30f;     // 抽历史对手时，抽 archive 而不是 recent 的比例
     bool oracleReward = true;      // 开天眼稠密奖励
     float oracleCoef = 0.05f;
+    // R12：对「明显坏弃」加软惩罚（只在训练期、双方底牌已知时算）。
+    // 每个弃牌决策扣 coef * max(0, eq - 赔率 - 0.15) * 底池/起始筹码。
+    float foldRegretCoef = 0.0f;
     int equityIters = 32;          // 开天眼胜率的抽样次数
     // 精确势函数胜率（A/B 用）：翻牌也精确枚举 C(45,2)=990 种，翻前用
     // equityIters（--oracle-exact 时默认 512）。转牌/河牌本来就精确。
