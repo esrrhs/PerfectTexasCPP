@@ -2165,6 +2165,16 @@ int cmdSlumbotAnalyze(int argc, char** argv) {
     // 后翻牌：对手面对我们最近一次下注/加注的反应，按"下注额/下注前底池"分桶。
     // 外部日志里只测过翻前尺寸，后翻牌的尺寸——弃牌率曲线一直是空白。
     PreAgg postSize[4][4];
+    // R10 防诈唬基线：面对下注时，实际跟注频率 vs MDF = pot/(pot+bet)。
+    // 尺寸桶按「跟注额 / 下注前底池」分：<0.5、0.5-1、1-1.5、1.5-3、>3。
+    struct FacingAgg {
+        int n = 0, folds = 0, calls = 0, raises = 0;
+        int badFolds = 0, badCalls = 0;
+        double foldLoss = 0.0, callLoss = 0.0;
+        double sumMdf = 0.0;
+        double sumEqFold = 0.0, sumOddsFold = 0.0;
+    };
+    FacingAgg facing[4][5];
     struct PendingBet {
         bool valid = false;
         int street = -1;
@@ -2328,6 +2338,32 @@ int cmdSlumbotAnalyze(int argc, char** argv) {
                 add(agg[street]);
                 add(byPot[potBucket(pot)]);
                 add(byPotSeat[mySeat][potBucket(pot)]);
+                if (need > 0) {
+                    const int potBefore = pot - need;
+                    const double ratio = potBefore > 0 ? double(need) / double(potBefore) : 0.0;
+                    const int sb = ratio < 0.5 ? 0 : (ratio < 1.0 ? 1 : (ratio < 1.5 ? 2
+                                                                   : (ratio < 3.0 ? 3 : 4)));
+                    FacingAgg& fa = facing[street][sb];
+                    ++fa.n;
+                    fa.sumMdf += potBefore > 0 ? double(potBefore) / double(pot) : 0.0;
+                    if (m.kind == texas::MK_FOLD) {
+                        ++fa.folds;
+                        fa.sumEqFold += eq;
+                        fa.sumOddsFold += odds;
+                        if (eq > odds + 0.10) {
+                            ++fa.badFolds;
+                            fa.foldLoss += eq * double(pot + need) - double(need);
+                        }
+                    } else if (m.kind == texas::MK_CALL) {
+                        ++fa.calls;
+                        if (eq < odds - 0.10) {
+                            ++fa.badCalls;
+                            fa.callLoss += (odds - eq) * double(pot + need);
+                        }
+                    } else {
+                        ++fa.raises;
+                    }
+                }
                 if (mySeat == 0 && street == 0 && st.numRaises == 0) {
                     if (m.kind == texas::MK_CALL) {
                         openLimpHand = true;
@@ -2436,6 +2472,29 @@ int cmdSlumbotAnalyze(int argc, char** argv) {
     }
     std::printf("  合计：坏弃 %d 个（事后 EV 损失 %+0.0f 筹码），坏跟 %d 个（%+0.0f 筹码）\n",
                 totalBadFolds, -totalFoldLoss, totalBadCalls, -totalCallLoss);
+
+    // R10：面对下注时实际继续频率 vs MDF。MDF = pot/(pot+bet)，
+    // 理论要求「跟注+加注」至少占 MDF，否则对手用任意两张诈唬就能盈利。
+    std::printf("\n  面对下注：实际频率 vs MDF（尺寸 = 跟注额 / 下注前底池）\n");
+    std::printf("  %-8s %-8s %6s %6s %6s %6s | %7s %7s %7s | %6s %9s %6s %9s\n", "street",
+                "size", "dec", "fold", "call", "raise", "MDF", "call%", "cont%", "bFold", "loss",
+                "bCall", "loss");
+    {
+        const char* szNames[5] = {"<0.5x", "0.5-1x", "1-1.5x", "1.5-3x", ">3x"};
+        for (int s = 0; s < 4; ++s) {
+            for (int b = 0; b < 5; ++b) {
+                const FacingAgg& fa = facing[s][b];
+                if (fa.n == 0) continue;
+                const double mdf = fa.sumMdf / fa.n;
+                const double callPct = double(fa.calls) / fa.n;
+                const double contPct = double(fa.calls + fa.raises) / fa.n;
+                std::printf("  %-8s %-8s %6d %6d %6d %6d | %7.3f %6.1f%% %6.1f%% | %6d %9.0f %6d %9.0f\n",
+                            names[s], szNames[b], fa.n, fa.folds, fa.calls, fa.raises, mdf,
+                            callPct * 100.0, contPct * 100.0, fa.badFolds, -fa.foldLoss,
+                            fa.badCalls, -fa.callLoss);
+            }
+        }
+    }
 
     // 同一批决策按底池分桶（决策时的底池，不是终局底池）。
     const char* potNames[5] = {"0-300", "300-600", "600-1500", "1500-4000", ">4000"};

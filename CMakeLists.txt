@@ -54,3 +54,7 @@ enable_testing()
 add_executable(perfecttexas_tests tests/test_main.cpp)
 target_link_libraries(perfecttexas_tests PRIVATE perfecttexas_core)
 add_test(NAME perfecttexas_tests COMMAND perfecttexas_tests)
+
+# R10 离线范围数据集（自对局 + 全组合策略似然后验作为标签）。
+add_executable(ptx_range_data tools/range_dataset.cpp)
+target_link_libraries(ptx_range_data PRIVATE perfecttexas_core)
