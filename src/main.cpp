@@ -3411,6 +3411,17 @@ int cmdSlumbotPolicyEval(int argc, char** argv) {
     const std::string dir = argStr(argc, argv, "--resume", "");
     const int maxHands = argInt(argc, argv, "--hands", 0);
     const float temp = static_cast<float>(argDouble(argc, argv, "--temp", 0.5));
+    // 与 `slumbot` 线上部署同名的剥削开关。默认 0 = 关闭，因此不传参时
+    // policyProbs 的输出与修改前逐位一致。
+    const float flopCheckPct = static_cast<float>(argDouble(argc, argv, "--flop-check-pct", 0.0));
+    const float turnBluffPct = static_cast<float>(argDouble(argc, argv, "--turn-bluff-pct", 0.0));
+    const float turnBluffMaxRatio =
+        static_cast<float>(argDouble(argc, argv, "--turn-bluff-max-ratio", 0.0));
+    const float riverBluffPct = static_cast<float>(argDouble(argc, argv, "--river-bluff-pct", 0.0));
+    const float riverBluffMaxRatio =
+        static_cast<float>(argDouble(argc, argv, "--river-bluff-max-ratio", 0.0));
+    const float preflopFoldVs3betPct =
+        static_cast<float>(argDouble(argc, argv, "--preflop-fold-vs-3bet-pct", 0.0));
     // R16：把每个「面对下注」决策点的**候选举牌概率**导出成 CSV，用来离线估算
     // L1 验收量（坏弃金额）——不需要再跑一遍外部对局，也不依赖对手分布。
     const std::string dumpPolicy = argStr(argc, argv, "--dump-policy", "");
@@ -3481,6 +3492,84 @@ int cmdSlumbotPolicyEval(int argc, char** argv) {
             scaled[i] = (temp == 1.0f) ? lp[i] : lp[i] / temp;
         }
         texas::ppo::maskedSoftmax(scaled, texas::kNumActions, probs);
+
+        // 部署剥削开关：条件与 src/slumbot.cpp 对选定 mv 的覆盖完全一致
+        // （街、numRaises、need==0、handStrength 阈值都照抄），这里只是把
+        // 「被覆盖动作」的概率质量整体搬到 slumbot 会改成的那一个动作上。
+        // 全部开关默认 0，关闭时这段不执行，概率与原来逐位相同。
+        {
+            const int needNow = texas::toCall(st, seat);
+            int hole[2] = {int(st.hole[seat][0]), int(st.hole[seat][1])};
+            int ccSlot = -1, foldSlot = -1;
+            for (int k = 0; k < n; ++k) {
+                if (lm[k].slot == texas::kSlotCheckCall) ccSlot = lm[k].slot;
+                else if (lm[k].slot == texas::kSlotFold) foldSlot = lm[k].slot;
+            }
+            auto isRaise = [](const texas::Move& mv) {
+                return mv.kind == texas::MK_RAISE || mv.kind == texas::MK_ALLIN;
+            };
+            // 与 slumbot 的 river/turn 诈唬限尺寸同义：只处理「超过 target 的下注」，
+            // target<=0 → 过牌；target>0 → 搬到最接近 target 的合法加注槽
+            // （对应 makeRaise(contrib+target)）。
+            auto capBluffMass = [&](float maxRatio) {
+                const int contrib = int(st.contrib[seat]);
+                const int target = int(maxRatio * float(st.pot()));
+                int dest = ccSlot;
+                if (target > 0) {
+                    int bestSlot = -1, bestDiff = 0;
+                    for (int k = 0; k < n; ++k) {
+                        if (!isRaise(lm[k].mv)) continue;
+                        int d = int(lm[k].mv.to) - contrib - target;
+                        if (d < 0) d = -d;
+                        if (bestSlot < 0 || d < bestDiff) {
+                            bestSlot = lm[k].slot;
+                            bestDiff = d;
+                        }
+                    }
+                    if (bestSlot >= 0) dest = bestSlot;
+                }
+                float mass = 0.0f;
+                for (int k = 0; k < n; ++k) {
+                    if (!isRaise(lm[k].mv)) continue;
+                    if (int(lm[k].mv.to) - contrib > target) {
+                        mass += probs[lm[k].slot];
+                        probs[lm[k].slot] = 0.0f;
+                    }
+                }
+                if (dest >= 0) probs[dest] += mass;
+            };
+            if (preflopFoldVs3betPct > 0.0f && st.street == texas::ST_PREFLOP &&
+                st.numRaises >= 2 && foldSlot >= 0) {
+                int bd0[5] = {0, 0, 0, 0, 0};
+                if (texas::handStrength(hole, bd0, 0) < preflopFoldVs3betPct) {
+                    for (int a = 0; a < texas::kNumActions; ++a) probs[a] = 0.0f;
+                    probs[foldSlot] = 1.0f;
+                }
+            }
+            int bd[5] = {0, 0, 0, 0, 0};
+            for (int k = 0; k < int(st.boardN); ++k) bd[k] = int(st.board[k]);
+            if (flopCheckPct > 0.0f && st.street == texas::ST_FLOP && needNow == 0 &&
+                ccSlot >= 0 && texas::handStrength(hole, bd, int(st.boardN)) < flopCheckPct) {
+                float mass = 0.0f;
+                for (int k = 0; k < n; ++k) {
+                    if (!isRaise(lm[k].mv)) continue;
+                    mass += probs[lm[k].slot];
+                    probs[lm[k].slot] = 0.0f;
+                }
+                probs[ccSlot] += mass;
+            }
+            if (turnBluffPct > 0.0f && st.street == texas::ST_TURN && needNow == 0 &&
+                texas::handStrength(hole, bd, int(st.boardN)) < turnBluffPct) {
+                capBluffMass(turnBluffMaxRatio);
+            }
+            if (riverBluffPct > 0.0f && st.street == texas::ST_RIVER && needNow == 0) {
+                int bd5[5] = {0, 0, 0, 0, 0};
+                for (int k = 0; k < 5; ++k) bd5[k] = int(st.board[k]);
+                if (texas::handStrength(hole, bd5, 5) < riverBluffPct) {
+                    capBluffMass(riverBluffMaxRatio);
+                }
+            }
+        }
         return true;
     };
 
@@ -3548,6 +3637,14 @@ int cmdSlumbotPolicyEval(int argc, char** argv) {
         double raiseMass = 0.0;
     };
     Agg total, byStreet[5], byBucket[5];
+    // 剥削开关只作用于「无注可跟」的决策（见 slumbot.cpp 的 need==0 条件），
+    // 这部分不在上面的弃/跟事后损失口径里。开关打开时额外输出它的平均下注
+    // 质量，用来确认开关确实接上了（关闭时不打印，输出与原来一致）。
+    struct NoCallAgg {
+        int n = 0;
+        double betMass = 0.0;
+    };
+    NoCallAgg noCallByStreet[5];
     const int potEdge[4] = {300, 600, 1500, 4000};
     auto bucketOf = [&](int pot) {
         int b = 0;
@@ -3698,6 +3795,17 @@ int cmdSlumbotPolicyEval(int argc, char** argv) {
                         } else {
                             ++total.skipped;
                             ++byStreet[int(st.street)].skipped;
+                            if (need == 0) {
+                                float pBet = 0.0f;
+                                for (int k = 0; k < n; ++k) {
+                                    if (lm[k].slot != texas::kSlotCheckCall) {
+                                        pBet += probs[lm[k].slot];
+                                    }
+                                }
+                                NoCallAgg& na = noCallByStreet[int(st.street)];
+                                ++na.n;
+                                na.betMass += double(pBet);
+                            }
                             // R35c：河牌「无注可跟」（need==0）的下注决策，量诈唬频率。
                             // p_bet = 所有非 弃牌/过牌 槽位的概率和（合法动作里没有弃牌）。
                             if (betOut && need == 0 && st.street == texas::ST_RIVER) {
@@ -3757,6 +3865,19 @@ int cmdSlumbotPolicyEval(int argc, char** argv) {
     std::printf("  按底池：\n");
     const char* potNames[5] = {"0-300", "300-600", "600-1500", "1500-4000", ">4000"};
     for (int b = 0; b < 5; ++b) show(potNames[b], byBucket[b]);
+    if (flopCheckPct > 0.0f || turnBluffPct > 0.0f || riverBluffPct > 0.0f ||
+        preflopFoldVs3betPct > 0.0f) {
+        std::printf("  无注可跟下注质量（剥削开关口径，p_bet 越高越爱下注）：\n");
+        for (int s = 1; s <= 3; ++s) {
+            const NoCallAgg& a = noCallByStreet[s];
+            if (a.n <= 0) {
+                std::printf("  %-9s dec=    0\n", streetNames[s - 1]);
+            } else {
+                std::printf("  %-9s dec=%5d | 平均下注概率 %.3f\n", streetNames[s - 1], a.n,
+                            a.betMass / double(a.n));
+            }
+        }
+    }
     return 0;
 }
 
