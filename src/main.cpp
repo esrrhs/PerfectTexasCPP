@@ -2125,6 +2125,14 @@ int cmdSlumbotAnalyze(int argc, char** argv) {
     const int dumpPotHi = argInt(argc, argv, "--dump-pot-hi", 1 << 30);
     const int dumpLimit = argInt(argc, argv, "--dump-limit", 20);
     const std::string dumpBig = argStr(argc, argv, "--dump-big", "");  // push|calloff|fold
+    // R11 误差结构诊断：把每个「面对下注」的决策点导出成 CSV，供离线比较
+    // 「实际动作」与「只按牌力+赔率的规则」。eq 是开天眼胜率（事后视角）。
+    const std::string dumpFacing = argStr(argc, argv, "--dump-facing", "");
+    std::ofstream facingOut;
+    if (!dumpFacing.empty()) {
+        facingOut.open(dumpFacing);
+        facingOut << "hand,street,seat,pot_before,need,ratio,eq,odds,action,cat,hole,board\n";
+    }
     int dumped = 0;
 
     struct StreetAgg {
@@ -2362,6 +2370,24 @@ int cmdSlumbotAnalyze(int argc, char** argv) {
                         }
                     } else {
                         ++fa.raises;
+                    }
+                    if (facingOut) {
+                        int cat = -1;
+                        if (st.boardN >= 3) {
+                            texas::Card all[7];
+                            all[0] = mine[0];
+                            all[1] = mine[1];
+                            for (int k = 0; k < st.boardN; ++k) all[2 + k] = st.board[k];
+                            cat = texas::handCategoryOf(texas::evaluateBest(all, 2 + st.boardN));
+                        }
+                        const char act = (m.kind == texas::MK_FOLD) ? 'f'
+                                          : (m.kind == texas::MK_CALL) ? 'c'
+                                                                       : 'r';
+                        facingOut << handsSeen << ',' << street << ',' << mySeat << ',' << potBefore
+                                  << ',' << need << ',' << ratio << ',' << eq << ',' << odds << ','
+                                  << act << ',' << cat << ',' << texas::cardToString(mine[0])
+                                  << texas::cardToString(mine[1]) << ',' << texas::boardToString(st)
+                                  << '\n';
                     }
                 }
                 if (mySeat == 0 && street == 0 && st.numRaises == 0) {
