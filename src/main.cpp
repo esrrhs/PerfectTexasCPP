@@ -2179,7 +2179,7 @@ int cmdSlumbotAnalyze(int argc, char** argv) {
     std::ofstream facingOut;
     if (!dumpFacing.empty()) {
         facingOut.open(dumpFacing);
-        facingOut << "hand,street,seat,pot_before,need,ratio,eq,odds,action,cat,hole,board\n";
+        facingOut << "hand,street,seat,pot_before,need,ratio,eq,odds,hs,action,cat,hole,board\n";
     }
     int dumped = 0;
 
@@ -2465,9 +2465,13 @@ int cmdSlumbotAnalyze(int argc, char** argv) {
                         const char act = (m.kind == texas::MK_FOLD) ? 'f'
                                           : (m.kind == texas::MK_CALL) ? 'c'
                                                                        : 'r';
+                        int bdHs[5] = {0, 0, 0, 0, 0};
+                        for (int k = 0; k < int(st.boardN); ++k) bdHs[k] = int(st.board[k]);
+                        const double hs = texas::handStrength(mine, bdHs, int(st.boardN));
                         facingOut << handsSeen << ',' << street << ',' << mySeat << ',' << potBefore
                                   << ',' << need << ',' << ratio << ',' << eq << ',' << odds << ','
-                                  << act << ',' << cat << ',' << texas::cardToString(mine[0])
+                                  << hs << ',' << act << ','
+                                  << cat << ',' << texas::cardToString(mine[0])
                                   << texas::cardToString(mine[1]) << ',' << texas::boardToString(st)
                                   << '\n';
                     }
@@ -3808,7 +3812,9 @@ int cmdSlumbotPolicyEval(int argc, char** argv) {
                             }
                             // R35c：河牌「无注可跟」（need==0）的下注决策，量诈唬频率。
                             // p_bet = 所有非 弃牌/过牌 槽位的概率和（合法动作里没有弃牌）。
-                            if (betOut && need == 0 && st.street == texas::ST_RIVER) {
+                            // R52：翻牌/转牌的开池决策同样导出（开关 `--flop-check-pct` /
+                            // `--turn-bluff-pct` 判据是 handStrength，必须看 hs 才能标定翻转集）。
+                            if (betOut && need == 0) {
                                 float pBet = 0.0f;
                                 double betSize = 0.0;
                                 for (int k = 0; k < n; ++k) {
