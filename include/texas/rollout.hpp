@@ -159,6 +159,9 @@ struct RolloutConfig {
     bool oracleReward = true;      // 开天眼稠密奖励
     float oracleCoef = 0.05f;
     int equityIters = 32;          // 开天眼胜率的抽样次数
+    // 精确势函数胜率（A/B 用）：翻牌也精确枚举 C(45,2)=990 种，翻前用
+    // equityIters（--oracle-exact 时默认 512）。转牌/河牌本来就精确。
+    bool oracleExact = false;
     // 范围胜率特征（rangeEq）：每个决策点采样的对手底牌组合数。0 = 关闭。
     // >0 时按对手最近一次动作的策略似然做贝叶斯重加权，再算我方 vs 对手
     // 范围的摊牌胜率——这是组合级计算，网络自己无法从标量特征完成。

@@ -170,7 +170,9 @@ int showdownWinner(const HUState& s);
 
 // "开天眼"：双方底牌与公共牌全可见时的精确胜率（平局半胜）。
 // 转牌/河牌精确枚举，翻牌前与翻牌用 iters 次抽样。
-double perfectEquity(const HUState& s, int p, int iters = 64);
+// exactFlop=true 时翻牌也精确枚举（C(45,2)=990 种，约 90us/次），用于消掉
+// 势函数胜率在翻牌街的抽样噪声（--oracle-exact）。
+double perfectEquity(const HUState& s, int p, int iters = 64, bool exactFlop = false);
 
 // 把动作转成可读文本，如 "fold" / "call 6" / "raise 18" / "allin 200"。
 std::string moveToString(const HUState& s, const Move& m);

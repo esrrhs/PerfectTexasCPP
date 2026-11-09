@@ -85,9 +85,9 @@ struct GameCtx {
 
 // 一条街内底池不会改变胜率（发牌只在街道切换时发生），所以开天眼胜率按
 // boardN 缓存。seat 1 的胜率严格等于 1 - seat 0（平局双方各算半胜）。
-float equityFor(GameCtx& g, int seat, int iters) {
+float equityFor(GameCtx& g, int seat, int iters, bool exactFlop) {
     if (g.eqStamp != g.st.boardN) {
-        g.eq0 = float(perfectEquity(g.st, 0, iters));
+        g.eq0 = float(perfectEquity(g.st, 0, iters, exactFlop));
         g.eqStamp = g.st.boardN;
     }
     return (seat == 0) ? g.eq0 : 1.0f - g.eq0;
@@ -2449,7 +2449,8 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         }
 
         for (int seat = 0; seat < 2; ++seat) {
-            g.phi[seat] = phiOf(g.st, seat, equityFor(g, seat, cfg.equityIters));
+            g.phi[seat] = phiOf(g.st, seat,
+                                equityFor(g, seat, cfg.equityIters, cfg.oracleExact));
         }
         g.active = true;
     }
@@ -2531,7 +2532,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
         for (int64_t i = 0; i < B; ++i) {
             GameCtx& g = gs[static_cast<size_t>(idx[static_cast<size_t>(i)])];
             Transition& t = tmp[static_cast<size_t>(i)];
-            const float eq = equityFor(g, seat, cfg.equityIters);
+            const float eq = equityFor(g, seat, cfg.equityIters, cfg.oracleExact);
             Obs obs;
             encodeObservation(g.st, obs, eq);
             t.node = obs.node;
@@ -2721,7 +2722,7 @@ void collectRollout(const ModelSet& latest, const HistoricalPool* pool, const Ro
             if (played.kind == MK_FOLD) ++stats.folds;
 
             if (cfg.oracleReward) {
-                const float eq = equityFor(g, seat, cfg.equityIters);
+                const float eq = equityFor(g, seat, cfg.equityIters, cfg.oracleExact);
                 const float phi = phiOf(g.st, seat, eq);
                 t.reward += cfg.oracleCoef * (phi - g.phi[seat]);
                 g.phi[seat] = phi;

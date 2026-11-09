@@ -350,7 +350,7 @@ int payoff(const HUState& s, int p) {
     return (w == p) ? pot - int(s.total[p]) : -int(s.total[p]);
 }
 
-double perfectEquity(const HUState& s, int p, int iters) {
+double perfectEquity(const HUState& s, int p, int iters, bool exactFlop) {
     const int boardN = s.boardN;
     const Card h0[2] = {static_cast<Card>(s.hole[0][0]), static_cast<Card>(s.hole[0][1])};
     const Card h1[2] = {static_cast<Card>(s.hole[1][0]), static_cast<Card>(s.hole[1][1])};
@@ -371,22 +371,38 @@ double perfectEquity(const HUState& s, int p, int iters) {
     Card board[5];
     for (int i = 0; i < boardN; ++i) board[i] = static_cast<Card>(s.board[i]);
 
-    // 转牌/河牌能精确枚举（44 / 1 种），翻牌前与翻牌用抽样。
-    if (boardN >= 4) {
-        double acc = 0.0;
-        int cnt = 0;
+    // 转牌/河牌能精确枚举（44 / 1 种）；翻牌默认抽样，exactFlop 时精确枚举
+    // C(45,2)=990 种（约 90us）。翻牌前一律抽样：精确枚举 C(48,5)=1.7M 次
+    // 评估约 0.3s/手，不能放进训练循环。
+    if (boardN >= 4 || (exactFlop && boardN == 3)) {
         if (boardN == 5) {
             Card a[7] = {h0[0], h0[1], board[0], board[1], board[2], board[3], board[4]};
             Card b[7] = {h1[0], h1[1], board[0], board[1], board[2], board[3], board[4]};
             const double eq0 = equityFromScores(evaluate7(a), evaluate7(b));
             return (p == 0) ? eq0 : 1.0 - eq0;
         }
-        for (int i = 0; i < nRest; ++i) {
-            board[4] = rest[i];
+        double acc = 0.0;
+        int cnt = 0;
+        auto addBoard = [&]() {
             Card a[7] = {h0[0], h0[1], board[0], board[1], board[2], board[3], board[4]};
             Card b[7] = {h1[0], h1[1], board[0], board[1], board[2], board[3], board[4]};
             acc += equityFromScores(evaluate7(a), evaluate7(b));
             ++cnt;
+        };
+        if (5 - boardN == 1) {
+            for (int i = 0; i < nRest; ++i) {
+                board[4] = rest[i];
+                addBoard();
+            }
+        } else {
+            // 翻牌：两张未来公牌，无序枚举 C(nRest,2)
+            for (int i = 0; i < nRest; ++i) {
+                board[3] = rest[i];
+                for (int j = i + 1; j < nRest; ++j) {
+                    board[4] = rest[j];
+                    addBoard();
+                }
+            }
         }
         const double eq0 = acc / cnt;
         return (p == 0) ? eq0 : 1.0 - eq0;

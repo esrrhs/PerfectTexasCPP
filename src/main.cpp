@@ -208,6 +208,7 @@ void usage() {
         "  --archive N     历史池的归档容量，满了隔一个丢一个（默认 16）\n"
         "  --max-raises N  每街加注次数上限（默认 0 = 无上限，对齐 ACPC）\n"
         "  --oracle-coef F 开天眼稠密奖励的系数（默认 0.05，0 等于关掉）\n"
+        "  --oracle-exact  势函数胜率精确化：翻牌精确枚举 990 种、翻前默认 512 次抽样\n"
         "  --aux-equity-coef F 范围胜率信念头的回归系数（默认 0 = 关闭）\n"
         "  --opp-model-coef F 对手牌力建模头的回归系数（默认 0 = 关闭）\n"
         "  --range-eq N    范围胜率特征：每个决策采样 N 个对手组合，按对手最近动作\n"
@@ -759,7 +760,8 @@ int cmdTrain(int argc, char** argv) {
     rcfg.oracleReward = !hasFlag(argc, argv, "--no-oracle");
     rcfg.criticOracleExtra = !hasFlag(argc, argv, "--critic-info-set");
     rcfg.oracleCoef = static_cast<float>(argDouble(argc, argv, "--oracle-coef", 0.05));
-    rcfg.equityIters = argInt(argc, argv, "--oracle-iters", 32);
+    rcfg.oracleExact = hasFlag(argc, argv, "--oracle-exact");
+    rcfg.equityIters = argInt(argc, argv, "--oracle-iters", rcfg.oracleExact ? 512 : 32);
     // 范围胜率特征：组合级计算（对手底牌采样 + 动作似然重加权 + 摊牌胜率）。
     rcfg.rangeEqSamples = argInt(argc, argv, "--range-eq", 0);
     rcfg.rangeEqIters = argInt(argc, argv, "--range-eq-iters", 48);
@@ -849,6 +851,9 @@ int cmdTrain(int argc, char** argv) {
     if (pcfg.oppModelCoef > 0.0f) {
         std::printf("  opp model head: coef=%.3f（不完全信息 -> 对手牌力百分位）\n",
                     pcfg.oppModelCoef);
+    }
+    if (rcfg.oracleExact) {
+        std::printf("  oracle-exact: 翻牌精确枚举 990 种，翻前 %d 次抽样\n", rcfg.equityIters);
     }
     if (rcfg.rangeEqSamples > 0) {
         std::printf("  rangeEq: samples=%d iters=%d（组合级后验范围胜率，作为输入特征）\n",
