@@ -14,3 +14,4 @@ ckpt/
 ckpt_*/
 *.pt
 .workbuddy/
+.trae/
