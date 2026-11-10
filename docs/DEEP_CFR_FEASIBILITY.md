@@ -66,6 +66,20 @@
 （表压到 10⁵、遍历提到 10¹⁰）；③ 实现「蓝图先验 + 翻后重解 + 访问数混合」的完整管线。
 项目已有 `blueprint-train`/`blueprint-br`/`rivercfr`/`turncfr` 砖块，缺的是 key 配方与重解集成。
 
+**代码就绪度（2026-11-10 读码评估）**：四块砖均在，求解器**已接受外部范围**
+（`riverCfrSolve`/`turnCfrSolve` 的 `oppRange`/`ownRange` 参数，`rivercfr.hpp:69`/`turncfr.hpp:66`），
+接入蓝图先验改动量中等。三处缺口：
+1. **牌桶聚类**：现为标量牌力百分位 + 听牌修正（`strength.hpp:180` `postflopBucket`），
+   非 robopoker 的 potential-aware 分布式聚类（EMD/k-means）。key 位布局 `blueprint.cpp:30-46`
+   （牌桶 8bit/座位/底池桶 5bit/街/街内序列/跨街召回），改聚类主要动 `cardBucketOf`，key 布局可复用。
+2. **重解部署管线（完全不存在）**：现有 `rivercfr`/`turncfr` 调用方用**自身网络似然**推范围
+   （`rollout.cpp:660` `riverRangeFor`/`turnRangeFor`，自指先验，外部已证负）；
+   无「蓝图平均策略 → 重解根范围 → 按访问数与蓝图混合」的集成。这是主要新代码。
+3. **turn 叶子估值**：现仅 check-down 近似（`turncfr.cpp:475`，忽略河牌下注街）；
+   critic 价值头叶子只在注释（`turncfr.hpp:10`），`TurnCfrConfig` 无该项、未实现。
+MCCFR 核心已是标准 external sampling + CFR+/RM+ + 遍历者交替 + 线性加权平均（`blueprint.hpp:130-192`），
+与 robopoker 同口径，**训练核心改动量小**；聚类与混合管线为主要工作量。
+
 ---
 
 ## 3. 路线 B：Deep CFR / ReBeL（云 GPU，上限最高）
